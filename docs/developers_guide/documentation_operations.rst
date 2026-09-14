@@ -73,7 +73,7 @@ The workflow
 ``deploy``
    On push to ``master``: asserts the artifact was built from the pushed
    commit, deploys it to the docs origin project with
-   ``vercel deploy --prebuilt --prod``, then runs
+   ``vercel deploy --prebuilt --prod --archive=tgz``, then runs
    ``scripts/docs/smoke_test.py`` against the origin alias and against
    ``https://www.optiland.org/docs/`` (with retries while CDN caches
    refresh). A failed build never reaches deployment; the previous production
