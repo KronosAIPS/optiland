@@ -437,7 +437,9 @@ class SurfaceGroup:
                 "required. Add surfaces with lens.add_surface(...)."
             )
         z = self.positions[1:]
-        return be.max(z) - be.min(z)
+        # max(z) - min(z). be.max/be.min detach to Python scalars under torch,
+        # which would cut the total_track operand out of the autograd graph.
+        return be.nanmax(z) + be.nanmax(-z)
 
     @property
     def global_z_span(self):

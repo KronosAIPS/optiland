@@ -223,6 +223,32 @@ class TestTorchOptimizers:
             assert "Loss" not in captured.out
 
 
+@pytest.mark.parametrize("optimizer_class", [TorchAdamOptimizer, TorchSGDOptimizer])
+def test_optimizer_enforces_total_track_limit(optimizer_class):
+    """
+    Regression: under torch, total_track was a Python float, so the operand
+    carried no gradient and torch optimizers could not shorten the system.
+    """
+    lens = CookeTriplet()
+    initial_track = float(be.to_numpy(lens.total_track))
+
+    problem = OptimizationProblem()
+    problem.add_variable(
+        lens, "thickness", surface_number=6, min_val=30.0, max_val=50.0
+    )
+    problem.add_operand(
+        operand_type="total_track",
+        max_val=initial_track - 2.0,
+        weight=1.0,
+        input_data={"optic": lens},
+    )
+
+    optimizer = optimizer_class(problem)
+    optimizer.optimize(n_steps=50, lr=1e-2, disp=False)
+
+    assert float(be.to_numpy(lens.total_track)) < initial_track - 1.0
+
+
 class TestTorchOptimizerScaledSpace:
     """
     Tests that verify the Torch optimizers work in scaled parameter space,
