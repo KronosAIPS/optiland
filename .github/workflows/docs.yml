@@ -2,9 +2,9 @@ name: Docs
 
 # Builds, validates and deploys the Sphinx documentation.
 #
-# - Pull requests: full build + validation, screenshots, and a Vercel preview
-#   deployment for branches of this repository (forks get build + validation
-#   only; production secrets are never exposed to forks).
+# - Pull requests: full build + validation and a Vercel preview deployment for
+#   branches of this repository. Forks and Dependabot PRs get build +
+#   validation only, because GitHub withholds Actions secrets from both.
 # - Push to master: the validated artifact is deployed to the dedicated docs
 #   Vercel project (the origin behind https://www.optiland.org/docs/), then
 #   smoke-tested through both the origin alias and the first-party route.
@@ -122,47 +122,14 @@ jobs:
             docs/_build/validation.json
           if-no-files-found: warn
 
-  screenshots:
-    name: Screenshots
-    needs: build
-    if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: docs-site
-          path: site
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-      - name: Serve the built site
-        run: |
-          (cd site/static && python3 -m http.server 8000 >/dev/null 2>&1 &)
-          sleep 2
-      - name: Capture representative pages
-        run: |
-          npx --yes playwright@1.47.2 install --with-deps chromium
-          mkdir -p shots
-          shot() { npx --yes playwright@1.47.2 screenshot --browser chromium --viewport-size="$2" ${3:+--color-scheme=$3} --full-page --wait-for-timeout=1500 "http://localhost:8000/$1" "shots/$4.png"; }
-          shot "index.html"                  "1440,900"  light "landing-light-desktop"
-          shot "index.html"                  "1440,900"  dark  "landing-dark-desktop"
-          shot "quickstart.html"             "390,844"   light "quickstart-light-mobile"
-          shot "api/api_optic.html"          "1440,900"  dark  "api-dark-desktop"
-          shot "examples/Tutorial_1a_Optiland_for_Beginners.html" "1440,900" light "notebook-light-desktop"
-          shot "search.html?q=aberration"    "1440,900"  light "search-light-desktop"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: docs-screenshots
-          path: shots
-          if-no-files-found: warn
-
   preview:
     name: Preview deployment
     needs: build
+    # Forks and Dependabot runs get no Actions secrets, so they cannot deploy.
     if: >-
       github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     environment:
       name: docs-preview

@@ -62,14 +62,11 @@ The workflow
    ``scripts/docs/validate_build.py``, package with
    ``scripts/docs/prepare_vercel_output.py``, upload the ``docs-site``
    artifact.
-``screenshots``
-   Renders representative pages (landing light/dark, quickstart on a phone
-   viewport, an API page, a notebook, search) with Playwright and uploads
-   them as the ``docs-screenshots`` artifact for review. Non-blocking.
 ``preview``
-   For pull requests from branches of this repository: deploys the validated
-   artifact as a Vercel preview and smoke-tests it. Forks never receive
-   secrets; they still get the full build and validation.
+   For pull requests from branches of this repository, except Dependabot's:
+   deploys the validated artifact as a Vercel preview and smoke-tests it.
+   GitHub passes no secrets to forks or to Dependabot runs; those pull
+   requests still get the full build and validation.
 ``deploy``
    On push to ``master``: asserts the artifact was built from the pushed
    commit, deploys it to the docs origin project with
