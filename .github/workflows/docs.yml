@@ -3,8 +3,8 @@ name: Docs
 # Builds, validates and deploys the Sphinx documentation.
 #
 # - Pull requests: full build + validation and a Vercel preview deployment for
-#   branches of this repository (forks get build + validation only; production
-#   secrets are never exposed to forks).
+#   branches of this repository. Forks and Dependabot PRs get build +
+#   validation only, because GitHub withholds Actions secrets from both.
 # - Push to master: the validated artifact is deployed to the dedicated docs
 #   Vercel project (the origin behind https://www.optiland.org/docs/), then
 #   smoke-tested through both the origin alias and the first-party route.
@@ -125,9 +125,11 @@ jobs:
   preview:
     name: Preview deployment
     needs: build
+    # Forks and Dependabot runs get no Actions secrets, so they cannot deploy.
     if: >-
       github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]'
     runs-on: ubuntu-latest
     environment:
       name: docs-preview
