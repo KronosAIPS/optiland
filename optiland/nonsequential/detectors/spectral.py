@@ -275,3 +275,4 @@ class SpectralDetector(BaseDetector):
             self.num_pixels_y * self.num_pixels_x * self._n_lambda
         )
         self._num_rays_hit = 0
+        self.invalidate_frame()

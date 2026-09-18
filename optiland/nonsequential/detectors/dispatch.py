@@ -34,49 +34,65 @@ if TYPE_CHECKING:
 def intersect_detectors(
     rays: NSQRayBundle,
     detectors: list[BaseDetector],
-) -> tuple[object, object, np.ndarray]:
+) -> tuple[object, object, object, object]:
     """Find the nearest detector intersection for every ray.
 
-    Only the *dispatch* (which detector, and whether it beats the nearest
-    component) is decided in NumPy -- that choice is a discrete visibility
-    event with no gradient anyway. The returned ``t_min``/``hit_normals``
-    stay attached to the active backend's autograd graph (a no-op detail
-    under NumPy).
+    A running minimum over the detector list, in the active backend's own
+    operations: the winning detector's index and its ``absorb`` flag are
+    carried alongside the distance in arrays of the same library and device
+    as the ray state, so the dispatch never leaves the device. The index is
+    an integer array and the absorb flag a boolean one, so no gradient can
+    flow through the choice of detector; ``t_min``/``hit_normals`` stay
+    attached to the autograd graph, because the splatted landing position
+    is ``origin + t * direction`` and detaching ``t`` silently drops the
+    ``direction * dt/dtheta`` term from every spatial loss.
 
     Args:
         rays: Current ray bundle.
         detectors: ``scene.detectors``.
 
     Returns:
-        ``(t_min, hit_normals, detector_indices)`` where ``t_min`` and
-        ``hit_normals`` are backend arrays and ``detector_indices`` is a
-        NumPy int32 array (``-1`` where no detector was hit).
+        ``(t_min, hit_normals, detector_indices, absorbs)``: backend arrays,
+        with ``detector_indices`` an integer array holding ``-1`` where no
+        detector was hit, and ``absorbs`` the hit detector's ``absorb``
+        flag (``True`` where nothing was hit -- the caller only consults it
+        where a detector actually was).
     """
-    N = rays.num_rays
-    t_min = be.ones(N) * be.inf
-    t_min_np = np.full(N, np.inf, dtype=np.float64)
-    hit_normals = be.zeros((N, 3))
-    det_indices = np.full(N, -1, dtype=np.int32)
+    from optiland.nonsequential.ray_bundle import (  # noqa: PLC0415
+        backend_bool_full,
+        backend_int_full,
+    )
+
+    n = rays.num_rays
+    t_min = be.ones(n) * be.inf
+    hit_normals = be.zeros((n, 3))
+    det_indices = backend_int_full((n,), -1, like=rays.x, bits=32)
+    absorbs = backend_bool_full((n,), True, like=rays.alive)
 
     for i, det in enumerate(detectors):
         t_d, normals_d, hit_d = det.intersect(rays)
-        t_d_np = to_numpy(t_d).astype(np.float64)
-        hit_d_np = to_numpy(hit_d).astype(bool)
-        better_np = hit_d_np & (t_d_np < t_min_np)
-        better = be.array(better_np)
+        better = hit_d & (t_d < t_min)
 
         t_min = be.where(better, t_d, t_min)
         hit_normals = be.where(better[:, None], normals_d, hit_normals)
-        t_min_np = np.where(better_np, t_d_np, t_min_np)
-        det_indices = np.where(better_np, i, det_indices)
+        det_indices = be.where(
+            better, backend_int_full((n,), i, like=rays.x, bits=32), det_indices
+        )
+        absorbs = be.where(
+            better, backend_bool_full((n,), det.absorb, like=rays.alive), absorbs
+        )
 
-    return t_min, hit_normals, det_indices
+    return t_min, hit_normals, det_indices, absorbs
 
 
 def detector_absorb_mask(
     det_idx: np.ndarray, detectors: list[BaseDetector]
 ) -> np.ndarray:
     """Per-ray absorb flag of the detector each ray hit (D-10 ``absorb``).
+
+    Retained for callers that hold a host-side detector index; the trace
+    loop no longer uses it, because :func:`intersect_detectors` now carries
+    the flag alongside the index without leaving the device.
 
     Args:
         det_idx: Per-ray index into ``detectors`` of the nearest-hit
@@ -89,6 +105,7 @@ def detector_absorb_mask(
         reported as ``True`` (irrelevant -- the caller only consults this
         where a detector was actually hit).
     """
+    det_idx = to_numpy(det_idx)
     if len(detectors) == 0:
         return np.ones_like(det_idx, dtype=bool)
     absorb_per_detector = np.array([bool(d.absorb) for d in detectors], dtype=bool)

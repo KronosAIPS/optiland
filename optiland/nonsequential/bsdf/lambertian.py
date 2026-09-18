@@ -12,8 +12,9 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 import optiland.backend as be
-from optiland.backend.utils import to_numpy
 from optiland.nonsequential.bsdf.base import BaseBSDF
+from optiland.nonsequential.components.sampling_support import detached
+from optiland.nonsequential.ray_bundle import backend_bool_full
 from optiland.nonsequential.rng import EventSlot
 
 if TYPE_CHECKING:
@@ -80,44 +81,47 @@ class LambertianBSDF(BaseBSDF):
             reflectance_value for every ray (the lobe redistributes energy
             within whichever hemisphere it lands in, it does not remove it).
         """
-        # Sampling is inherently stochastic/detached -- use numpy throughout
-        normals_np = np.asarray(to_numpy(normals), dtype=np.float64)
+        # The sampled direction is detached -- it is a stochastic choice, not
+        # a differentiable function of the normal -- but it is detached with
+        # detach(), not by copying the normal to the host: the whole lobe is
+        # elementwise arithmetic that runs wherever the ray state lives.
+        normals_be = detached(normals)
 
         if self.transmissive_fraction > 0.0:
-            u_lobe = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH))
-            transmitted_np = u_lobe < self.transmissive_fraction
-            hemisphere_np = np.where(transmitted_np[:, None], -normals_np, normals_np)
+            u_lobe = rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH)
+            transmitted = u_lobe < self.transmissive_fraction
+            hemisphere = be.where(transmitted[:, None], -normals_be, normals_be)
         else:
-            transmitted_np = np.zeros(normals_np.shape[0], dtype=bool)
-            hemisphere_np = normals_np
+            transmitted = backend_bool_full(
+                (normals_be.shape[0],), False, like=normals_be
+            )
+            hemisphere = normals_be
 
-        r1 = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_U1))
-        r2 = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_U2))
+        r1 = rng.uniform(ray_id, bounce, EventSlot.BSDF_U1)
+        r2 = rng.uniform(ray_id, bounce, EventSlot.BSDF_U2)
 
         # Malley's method
-        phi = 2.0 * np.pi * r1
-        cos_theta = np.sqrt(r2)
-        sin_theta = np.sqrt(1.0 - r2)
+        phi = 2.0 * be.pi * r1
+        cos_theta = be.sqrt(r2)
+        sin_theta = be.sqrt(1.0 - r2)
 
-        lx = sin_theta * np.cos(phi)
-        ly = sin_theta * np.sin(phi)
+        lx = sin_theta * be.cos(phi)
+        ly = sin_theta * be.sin(phi)
         lz = cos_theta
 
-        t_vec, b_vec = _orthonormal_basis(hemisphere_np)
+        t_vec, b_vec = _orthonormal_basis(hemisphere)
 
         scattered = (
-            lx[:, None] * t_vec + ly[:, None] * b_vec + lz[:, None] * hemisphere_np
+            lx[:, None] * t_vec + ly[:, None] * b_vec + lz[:, None] * hemisphere
         )
         norms = (scattered * scattered).sum(axis=1, keepdims=True) ** 0.5
         scattered = scattered / norms
 
-        # Convert back to backend array type (detached; no grad required)
-        scattered_be = be.array(scattered.astype(np.float64))
         # be.ones * reflectance_value preserves the autograd graph when
         # reflectance_value is a torch Tensor with requires_grad=True.
         weights_be = be.ones(num_rays) * self.reflectance_value
 
-        return scattered_be, weights_be, be.array(transmitted_np)
+        return scattered, weights_be, transmitted
 
     def reflectance(
         self,
@@ -139,7 +143,7 @@ class LambertianBSDF(BaseBSDF):
 
 
 def _orthonormal_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Build two tangent vectors perpendicular to n (numpy, for detached sampling).
+    """Build two tangent vectors perpendicular to n, beside n.
 
     Uses the branchless construction of Duff et al., *Building an Orthonormal
     Basis, Revisited* (JCGT 2017). The denominator ``sign + n_z`` has
@@ -163,10 +167,10 @@ def _orthonormal_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
     nx, ny, nz = n[:, 0], n[:, 1], n[:, 2]
 
-    sign = np.copysign(1.0, nz)
+    sign = be.copysign(be.ones_like(nz), nz)
     a = -1.0 / (sign + nz)
     b = nx * ny * a
 
-    t_vec = np.stack([1.0 + sign * nx * nx * a, sign * b, -sign * nx], axis=1)
-    b_vec = np.stack([b, sign + ny * ny * a, -ny], axis=1)
+    t_vec = be.stack([1.0 + sign * nx * nx * a, sign * b, -sign * nx], axis=1)
+    b_vec = be.stack([b, sign + ny * ny * a, -ny], axis=1)
     return t_vec, b_vec

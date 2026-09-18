@@ -74,6 +74,30 @@ def backend_int_full(shape, fill_value: int, like=None, bits: int = 64):
     return np.full(tuple(shape), int(fill_value), dtype=dtype)
 
 
+def backend_bool_full(shape, fill_value: bool, like=None):
+    """Return a boolean array filled with ``fill_value``.
+
+    Built with the same array library, and on the same device, as ``like``.
+    ``be.ones_like``/``be.zeros_like`` carry the backend's working *float*
+    precision, which a mask must not.
+
+    Args:
+        shape: Output shape.
+        fill_value: Boolean fill value.
+        like: Array whose library and device the result follows.
+
+    Returns:
+        A boolean array/tensor of ``shape``.
+    """
+    if be.is_torch_tensor(like):
+        import torch  # noqa: PLC0415
+
+        return torch.full(
+            tuple(shape), bool(fill_value), dtype=torch.bool, device=like.device
+        )
+    return np.full(tuple(shape), bool(fill_value), dtype=bool)
+
+
 def backend_masked_fill(table, mask, value: int):
     """Write ``value`` into every entry of ``table`` where ``mask`` is True.
 

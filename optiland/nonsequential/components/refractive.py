@@ -13,12 +13,18 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 import optiland.backend as be
-from optiland.backend.utils import to_numpy
 from optiland.nonsequential import _tol
 from optiland.nonsequential.components.base import BaseComponent
 from optiland.nonsequential.components.coating_support import (
     evaluate_transmissive_coating,
     reject_polarized_coating,
+)
+from optiland.nonsequential.components.ledger import LedgerBooking
+from optiland.nonsequential.components.sampling_support import (
+    detached as _detached,
+)
+from optiland.nonsequential.components.sampling_support import (
+    scatter_branch,
 )
 from optiland.nonsequential.materials.nsq_material import medium_stack_id
 from optiland.nonsequential.ray_bundle import (
@@ -26,6 +32,7 @@ from optiland.nonsequential.ray_bundle import (
     MEDIUM_STACK_MAX_DEPTH,
     MEDIUM_STACK_OVERFLOW_RAISES,
     MediumStackOverflowError,
+    backend_bool_full,
     backend_gather_slot,
     backend_int_full,
     backend_masked_fill,
@@ -46,7 +53,7 @@ if TYPE_CHECKING:
     from optiland.nonsequential.rng import NSQRng
 
 
-class RefractiveComponent(BaseComponent):
+class RefractiveComponent(BaseComponent, LedgerBooking):
     """Refractive optical element (lens, prism, window).
 
     At each interface, Fresnel splitting uses the detached-sample /
@@ -115,6 +122,7 @@ class RefractiveComponent(BaseComponent):
         """
         reject_polarized_coating(coating, surface_name=name)
         self.coating = coating
+        self.reset_ledger()
         super().__init__(
             cs,
             geometry,
@@ -270,7 +278,11 @@ class RefractiveComponent(BaseComponent):
         T_used = be.where(tir, be.zeros_like(T_used), T_used)
 
         # --- Detached-sample / attached-weight ---
-        R_np = to_numpy(R_used).astype(np.float64)
+        # The decision is detached with detach(), not by copying the value
+        # to the host: a branch probability is a number the sampler must
+        # not differentiate through, which is a graph property, not a
+        # question of which memory it lives in.
+        R_det = _detached(R_used)
 
         if forced_branch is not None:
             # Bounded-splitting orchestration (PR11, NumPy forward engine
@@ -280,8 +292,9 @@ class RefractiveComponent(BaseComponent):
             # unaffected: T_used is already forced to 0 there, so a forced
             # "transmit" branch on a TIR ray correctly carries zero flux
             # rather than raising or fabricating a wave that cannot exist.
-            do_reflect_np = np.full_like(R_np, forced_branch == "reflect", dtype=bool)
-            do_reflect = be.array(do_reflect_np)
+            do_reflect = backend_bool_full(
+                tir.shape, forced_branch == "reflect", like=tir
+            )
             weight = be.where(do_reflect, R_used, T_used)
         else:
             # Importance-biased branch probability: generalises
@@ -290,12 +303,10 @@ class RefractiveComponent(BaseComponent):
             # estimator stays unbiased for any p in (0, 1) -- only the
             # variance changes. reflect_prob="fresnel" reproduces the
             # original weight formula exactly.
-            r_det = be.array(R_np)
-            p_be = resolve_reflect_prob(sampling, r_det) if sampling else r_det
-            p_np = np.clip(to_numpy(p_be).astype(np.float64), 1e-12, 1.0 - 1e-12)
-            u = to_numpy(rng.uniform(ray_id_key, bounce_key, EventSlot.FRESNEL_BRANCH))
-            do_reflect_np = (u < p_np) | to_numpy(tir).astype(bool)
-            do_reflect = be.array(do_reflect_np)
+            p_be = resolve_reflect_prob(sampling, R_det) if sampling else R_det
+            p_det = be.clip(_detached(p_be), 1e-12, 1.0 - 1e-12)
+            u = rng.uniform(ray_id_key, bounce_key, EventSlot.FRESNEL_BRANCH)
+            do_reflect = (u < p_det) | tir
 
             # Throughput weight: forward value is 1.0 in expectation; carries
             # gradients through R/T. Generalizes the plain-Fresnel
@@ -307,12 +318,22 @@ class RefractiveComponent(BaseComponent):
             # expectation, with the shortfall R+T<1 taken up by the
             # deterministic T weight rather than a separate absorption draw.
             # For TIR rays weight stays 1.0 (full reflection is deterministic).
-            p_det = be.array(p_np)  # detached copy used as denominator
             weight_reflect = R_used / (p_det + _tol.tiny_for(p_det))
             weight_transmit = T_used / (1.0 - p_det + _tol.tiny_for(p_det))
             weight = be.where(do_reflect, weight_reflect, weight_transmit)
             # TIR: weight is exactly 1
             weight = be.where(tir, be.ones_like(weight), weight)
+
+        # Ch. 10 (10.1) and (10.2), booked together because they share the
+        # same incoming weight. What the surface absorbs is w(1 - R - T),
+        # which a lossy coating makes non-zero and a bare Fresnel interface
+        # leaves at zero; what the estimator neither passed on nor booked is
+        # w(R + T - weight), zero for the plain-Fresnel choice p = R and for
+        # TIR, non-zero under importance biasing. The two sum to
+        # w(1 - weight), the whole change in flux, so nothing is counted
+        # twice and nothing is left over.
+        self.book_loss(rays.flux, 1.0 - R_used - T_used, hit_mask)
+        self.book_residual(rays.flux, R_used + T_used - weight, hit_mask)
 
         # Apply weight to flux for hit rays
         rays.flux = rays.flux * be.where(hit_mask, weight, be.ones_like(weight))
@@ -396,12 +417,15 @@ class RefractiveComponent(BaseComponent):
         push = non_ambient & ~pop
         overflow = push & (depth >= MEDIUM_STACK_MAX_DEPTH)
 
-        if MEDIUM_STACK_OVERFLOW_RAISES and be.any(overflow):
-            # The one host read left in this block, and the only Python
-            # branch on ray data: turning the overflow into a raise requires
-            # reducing a per-ray mask to a bool. With
-            # MEDIUM_STACK_OVERFLOW_RAISES = False the push saturates and
-            # the event is counted below instead, leaving no read at all.
+        # Turning an overflow into a raise means reducing a per-ray mask to
+        # a Python bool. That is free while the stack is a host array, and a
+        # device synchronisation once it is not -- so on a device the push
+        # saturates (the ray keeps the medium it had) and the event is
+        # counted below with the other stack inconsistencies, which is what
+        # MEDIUM_STACK_OVERFLOW_RAISES = False already asked for. A device
+        # kernel cannot raise; it can only count.
+        raises = MEDIUM_STACK_OVERFLOW_RAISES and not be.is_torch_tensor(stack)
+        if raises and be.any(overflow):
             raise MediumStackOverflowError(
                 f"Medium stack exceeded MEDIUM_STACK_MAX_DEPTH="
                 f"{MEDIUM_STACK_MAX_DEPTH} at surface "
@@ -460,27 +484,13 @@ class RefractiveComponent(BaseComponent):
                 bounce_key,
             )
             # Route only a scatter_fraction of the hit rays through the BSDF;
-            # the rest keep the refracted direction computed above. The
-            # branch is drawn from a detached probability, matching the
-            # Fresnel split -- and, like the Fresnel split, carries a
-            # compensating attached weight so d(flux)/d(scatter_fraction) is
-            # correct rather than silently zero. Epsilon-clamped denominator
-            # for the same reason as the Fresnel branch: scatter_fraction=1
-            # (or 0) exactly would otherwise divide by zero for the ~1e-6
-            # fraction of draws the clamp itself puts on the "wrong" side.
-            sf_det = float(np.clip(to_numpy(self.scatter_fraction), 1e-6, 1.0 - 1e-6))
-            u_scatter = to_numpy(
-                rng.uniform(ray_id_key, bounce_key, EventSlot.SCATTER_BRANCH)
+            # the rest keep the refracted direction computed above.
+            scatters, sf_gate = scatter_branch(
+                self.scatter_fraction, hit_mask, rng, ray_id_key, bounce_key
             )
-            scatters_np = to_numpy(hit_mask).astype(bool) & (u_scatter < sf_det)
-            scatters = be.array(scatters_np)
-
-            sf = self.scatter_fraction
-            weight_scatter_branch = sf / sf_det
-            weight_nonscatter_branch = (1.0 - sf) / (1.0 - sf_det)
-            sf_gate = be.where(
-                scatters, weight_scatter_branch, weight_nonscatter_branch
-            )
+            # A detached decision with a compensating weight: unbiased, but
+            # not weight-preserving on this realisation.
+            self.book_residual(rays.flux, 1.0 - sf_gate, hit_mask)
             rays.flux = rays.flux * be.where(hit_mask, sf_gate, be.ones_like(sf_gate))
 
             scatter_col = scatters[:, None]
@@ -490,6 +500,9 @@ class RefractiveComponent(BaseComponent):
             rays.M = new_dirs[:, 1]
             rays.N = new_dirs[:, 2]
             bsdf_gate = be.where(scatters, bsdf_weights, be.ones_like(bsdf_weights))
+            # A lobe's weight is a fraction of the incident flux, so what it
+            # does not return is absorbed at the surface.
+            self.book_loss(rays.flux, 1.0 - bsdf_gate, hit_mask)
             rays.flux = rays.flux * bsdf_gate
 
             # D-4: a scattered ray's medium is decided by its own lobe's
@@ -497,7 +510,7 @@ class RefractiveComponent(BaseComponent):
             # that draw only describes what happens to a ray that does NOT
             # enter the BSDF lobe. Re-resolves n_current/k_current for
             # exactly the scattered rays.
-            bsdf_in_medium2 = be.array(bsdf_transmitted)
+            bsdf_in_medium2 = bsdf_transmitted
             rays.n_current = be.where(
                 scatters, be.where(bsdf_in_medium2, n2, n1), rays.n_current
             )

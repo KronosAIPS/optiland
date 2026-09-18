@@ -96,6 +96,15 @@ class Diagnostics:
             Russian roulette, including bounded-splitting budget
             culling. Unbiased in expectation; large values mean the
             per-trace estimator is noisy, not necessarily wrong.
+        coating_loss_flux_fraction: Fraction of ``total_flux_in`` removed by
+            a mirror below unit reflectance or by a lossy coating -- the
+            theory's coating bin. A physical loss, reported so a coating
+            audit does not have to be run as a second trace.
+        sampling_residual_flux_fraction: ``Phi_samp / Phi_emit``, signed.
+            Zero mean by construction, falling as the square root of the ray
+            count; it is reported rather than warned on, because what
+            matters is that it shrinks with ray count, which one trace
+            cannot show.
         flux_conservation_error: Copied from
             :attr:`~optiland.nonsequential.tracer.SimulationResult.flux_conservation_error`
             for convenience -- see that field's docstring.
@@ -123,6 +132,8 @@ class Diagnostics:
 
     depth_truncated_flux_fraction: float = 0.0
     rr_killed_flux_fraction: float = 0.0
+    coating_loss_flux_fraction: float = 0.0
+    sampling_residual_flux_fraction: float = 0.0
     flux_conservation_error: float = 0.0
     unreached_geometry: tuple[str, ...] = ()
     detectors: tuple[DetectorDiagnostic, ...] = field(default_factory=tuple)
@@ -201,6 +212,10 @@ class Diagnostics:
             f"  depth_truncated_flux_fraction: "
             f"{self.depth_truncated_flux_fraction:.4%}",
             f"  rr_killed_flux_fraction:       {self.rr_killed_flux_fraction:.4%}",
+            f"  coating_loss_flux_fraction:    "
+            f"{self.coating_loss_flux_fraction:.4%}",
+            f"  sampling_residual_fraction:    "
+            f"{self.sampling_residual_flux_fraction:+.4%}",
             f"  flux_conservation_error:       {self.flux_conservation_error:.4%}",
             f"  unreached_geometry:            "
             f"{list(self.unreached_geometry) if self.unreached_geometry else 'none'}",
@@ -305,6 +320,8 @@ def build_diagnostics(
     split_budget_saturated: bool,
     detector_results: dict[str, object],
     medium_stack_underflows: int = 0,
+    coating_loss: float = 0.0,
+    sampling_residual: float = 0.0,
 ) -> Diagnostics:
     """Assemble a :class:`Diagnostics` from one trace's bookkeeping.
 
@@ -326,6 +343,8 @@ def build_diagnostics(
             ``scene.detectors`` order.
         medium_stack_underflows: Total medium-stack pop-on-empty events
             across the trace (see :class:`Diagnostics`).
+        coating_loss: Flux removed by mirrors and lossy coatings [W].
+        sampling_residual: The trace's ``Phi_samp`` [W], signed.
 
     Returns:
         The assembled diagnostics.
@@ -341,10 +360,14 @@ def build_diagnostics(
     )
     depth_frac = total_flux_depth_killed / total_flux_in if total_flux_in > 0 else 0.0
     rr_frac = total_flux_rr_killed / total_flux_in if total_flux_in > 0 else 0.0
+    coat_frac = coating_loss / total_flux_in if total_flux_in > 0 else 0.0
+    samp_frac = sampling_residual / total_flux_in if total_flux_in > 0 else 0.0
 
     return Diagnostics(
         depth_truncated_flux_fraction=depth_frac,
         rr_killed_flux_fraction=rr_frac,
+        coating_loss_flux_fraction=coat_frac,
+        sampling_residual_flux_fraction=samp_frac,
         flux_conservation_error=flux_conservation_error,
         unreached_geometry=unreached,
         detectors=detector_diags,

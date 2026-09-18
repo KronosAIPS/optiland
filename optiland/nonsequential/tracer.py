@@ -31,17 +31,42 @@ class SimulationResult:
         num_rays_flux_killed: Rays killed for falling below flux threshold.
         num_rays_depth_killed: Rays killed for exceeding max_depth.
         total_flux_in: Total flux launched by all sources [W].
-        total_flux_detected: Total flux recorded on all detectors [W].
+        total_flux_detected: Total flux recorded on all detectors [W],
+            transmissive ones included -- it is what every detector read.
+        total_flux_tapped: The part of ``total_flux_detected`` read by
+            transmissive (``absorb=False``) detectors [W]. Those detectors
+            sample the beam and let it continue, so the same watt is booked
+            again wherever it finally leaves the trace; the conservation
+            identity uses ``total_flux_detected - total_flux_tapped``.
         total_flux_absorbed: Flux absorbed by AbsorbingComponents [W].
+        total_flux_coating: Flux removed by a mirror below unit reflectance
+            or by a coating whose reflectance and transmittance do not sum
+            to one [W] -- the theory's coating bin
+            (``docs/theory/10_ledger_and_diagnostics.md`` 10.1). Distinct
+            from ``total_flux_absorbed``, which is whole-ray absorption at
+            an AbsorbingComponent, so a coating audit can be read per
+            surface without confusing it with a light trap.
         total_flux_bulk_absorbed: Flux lost to Beer-Lambert bulk absorption
             while travelling through an absorbing medium (k > 0),
             e.g. tinted glass -- distinct from ``total_flux_absorbed``,
             which is surface (AbsorbingComponent) absorption only [W].
         total_flux_escaped: Flux carried by escaped rays [W].
-        total_flux_lost: Flux lost to flux/depth kill [W].
+        total_flux_lost: Flux lost to flux/depth kill [W]. Reported for
+            continuity; the identity below books the roulette half of it
+            inside ``total_flux_sampling_residual`` instead, together with
+            the boost handed to the rays that survived.
+        total_flux_sampling_residual: The theory's ``Phi_samp``
+            (``docs/theory/10_ledger_and_diagnostics.md`` 10.2) [W]: the
+            weight that the variance-reduction machinery -- Russian
+            roulette, the detached Fresnel and scatter branches -- removed
+            from or added to the trace on this particular realisation. Its
+            expectation is zero and its magnitude falls as the square root
+            of the ray count; a residual that does not shrink with ray
+            count is a weight-update bug, not sampling noise.
         flux_conservation_error:
-            ``|flux_in - detected - absorbed - bulk_absorbed - escaped
-            - lost| / flux_in``.
+            ``|flux_in - (detected - tapped) - absorbed - coating
+            - bulk_absorbed - escaped - depth_killed - sampling_residual|
+            / flux_in``.
         trace_time_sec: Wall-clock time for the trace [s].
         ray_paths: Optional per-ray event log dict (``{"events":
             structured_array}``), populated when ``record_paths`` is
@@ -60,10 +85,13 @@ class SimulationResult:
     num_rays_depth_killed: int = 0
     total_flux_in: float = 0.0
     total_flux_detected: float = 0.0
+    total_flux_tapped: float = 0.0
     total_flux_absorbed: float = 0.0
+    total_flux_coating: float = 0.0
     total_flux_bulk_absorbed: float = 0.0
     total_flux_escaped: float = 0.0
     total_flux_lost: float = 0.0
+    total_flux_sampling_residual: float = 0.0
     flux_conservation_error: float = 0.0
     trace_time_sec: float = 0.0
     ray_paths: dict | None = None
