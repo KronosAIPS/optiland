@@ -166,10 +166,12 @@ class RefractiveComponent(BaseComponent):
         """
         # Every RNG draw in this call is keyed to the ray's identity as of
         # this specific interaction event -- captured before any of the
-        # in-place mutations below (including the bounce increment) change
-        # rays.bounce out from under us.
-        ray_id_key = to_numpy(rays.ray_id)
-        bounce_key = to_numpy(rays.bounce)
+        # mutations below (including the bounce increment) rebind
+        # rays.bounce out from under us. The keys are handed to the RNG in
+        # whatever array type the bundle holds: the generator works in the
+        # active backend, so nothing is copied to the host to key a draw.
+        ray_id_key = rays.ray_id
+        bounce_key = rays.bounce
 
         # Missed rays carry t = inf; zero it for the differentiable position
         # update so the masked-out be.where branch cannot inject a
@@ -274,7 +276,7 @@ class RefractiveComponent(BaseComponent):
             r_det = be.array(R_np)
             p_be = resolve_reflect_prob(sampling, r_det) if sampling else r_det
             p_np = np.clip(to_numpy(p_be).astype(np.float64), 1e-12, 1.0 - 1e-12)
-            u = rng.uniform(ray_id_key, bounce_key, EventSlot.FRESNEL_BRANCH)
+            u = to_numpy(rng.uniform(ray_id_key, bounce_key, EventSlot.FRESNEL_BRANCH))
             do_reflect_np = (u < p_np) | to_numpy(tir).astype(bool)
             do_reflect = be.array(do_reflect_np)
 
@@ -422,7 +424,9 @@ class RefractiveComponent(BaseComponent):
             # (or 0) exactly would otherwise divide by zero for the ~1e-6
             # fraction of draws the clamp itself puts on the "wrong" side.
             sf_det = float(np.clip(to_numpy(self.scatter_fraction), 1e-6, 1.0 - 1e-6))
-            u_scatter = rng.uniform(ray_id_key, bounce_key, EventSlot.SCATTER_BRANCH)
+            u_scatter = to_numpy(
+                rng.uniform(ray_id_key, bounce_key, EventSlot.SCATTER_BRANCH)
+            )
             scatters_np = to_numpy(hit_mask).astype(bool) & (u_scatter < sf_det)
             scatters = be.array(scatters_np)
 

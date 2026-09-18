@@ -126,9 +126,11 @@ class ReflectiveComponent(BaseComponent):
                 to ``RefractiveComponent``'s Fresnel branch.
         """
         # Captured before any mutation below (including the bounce
-        # increment at the end of this method) changes rays.bounce.
-        ray_id_key = to_numpy(rays.ray_id)
-        bounce_key = to_numpy(rays.bounce)
+        # increment at the end of this method) rebinds rays.bounce. Handed
+        # to the RNG as they are: the generator works in the active
+        # backend, so keying a draw copies nothing to the host.
+        ray_id_key = rays.ray_id
+        bounce_key = rays.bounce
 
         # Missed rays carry t = inf; zero it before the position update so the
         # masked-out be.where branch cannot backpropagate 0 * inf = NaN into
@@ -180,7 +182,9 @@ class ReflectiveComponent(BaseComponent):
             # zero. See RefractiveComponent.interact for the epsilon-clamp
             # rationale.
             sf_det = float(np.clip(to_numpy(self.scatter_fraction), 1e-6, 1.0 - 1e-6))
-            u_scatter = rng.uniform(ray_id_key, bounce_key, EventSlot.SCATTER_BRANCH)
+            u_scatter = to_numpy(
+                rng.uniform(ray_id_key, bounce_key, EventSlot.SCATTER_BRANCH)
+            )
             scatters_np = to_numpy(hit_mask).astype(bool) & (u_scatter < sf_det)
             scatters = be.array(scatters_np)
 

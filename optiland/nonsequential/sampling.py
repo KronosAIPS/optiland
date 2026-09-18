@@ -123,7 +123,7 @@ def russian_roulette(
         return flux, alive, killed_mask
 
     survive_prob_np = np.clip(flux_np / max(threshold, 1e-300), _RR_SURVIVE_FLOOR, 1.0)
-    u = rng.uniform(ray_id, bounce, EventSlot.RR)
+    u = to_numpy(rng.uniform(ray_id, bounce, EventSlot.RR))
     survive_np = u < survive_prob_np
     killed_mask = candidate_np & ~survive_np
 

@@ -15,13 +15,17 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import optiland.backend as be
+from optiland.backend.utils import to_numpy
 from optiland.nonsequential.rng import (
     EventSlot,
     NSQRng,
     _pcg32_advance,
     _pcg32_output,
     _pcg32_seed,
+    _pcg32_uint32_reference,
     pcg32_uint32,
+    pcg32_uniform,
 )
 
 # ---------------------------------------------------------------------------
@@ -275,3 +279,124 @@ class TestCrossBackendAgreement:
         # Identical random decisions -> identical irradiance map, up to the
         # documented float-arithmetic tolerance between backends.
         np.testing.assert_allclose(np_data, torch_data, rtol=1e-6, atol=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# The backend-generic limb path against the host reference
+#
+# The generator runs as int64 limb arithmetic in whichever array backend is
+# active. These tests are the proof that moving it there changed no bit of
+# the stream: a million draws per key, compared as 32-bit integers rather
+# than as floats, on both backends, against the NumPy uint64 reference
+# implementation kept in the module for exactly this purpose.
+# ---------------------------------------------------------------------------
+
+_BITWISE_NUM_RAYS = 1_000_000
+
+# (seed, bounce, event_slot, offset): a plain first draw, a mid-trace
+# branch draw, a deep-bounce draw, and a rejection-sampler sub-draw under a
+# seed whose top bit is set (the wraparound the module explicitly permits).
+_BITWISE_KEYS = [
+    (0, 0, EventSlot.SOURCE_U1, 0),
+    (7, 3, EventSlot.FRESNEL_BRANCH, 0),
+    (12345, 17, EventSlot.BSDF_U2, 0),
+    (2**63 + 1, 1, EventSlot.RR, 5),
+]
+
+
+@pytest.mark.parametrize(
+    ("seed", "bounce_value", "event_slot", "offset"), _BITWISE_KEYS
+)
+def test_limb_path_is_bit_identical_to_host_reference(
+    seed, bounce_value, event_slot, offset
+):
+    """Both backends reproduce the host uint32 stream with zero mismatches."""
+    ray_id = np.arange(_BITWISE_NUM_RAYS, dtype=np.int64)
+    bounce = np.full(_BITWISE_NUM_RAYS, bounce_value, dtype=np.int32)
+    reference = _pcg32_uint32_reference(
+        seed, ray_id, bounce, event_slot, offset
+    ).astype(np.int64)
+
+    numpy_bits = to_numpy(pcg32_uint32(seed, ray_id, bounce, event_slot, offset))
+    assert numpy_bits.shape == (_BITWISE_NUM_RAYS,)
+    assert int(np.count_nonzero(numpy_bits != reference)) == 0
+
+    torch = pytest.importorskip("torch")
+    be.set_backend("torch")
+    be.set_precision("float64")
+    try:
+        torch_bits = to_numpy(
+            pcg32_uint32(
+                seed,
+                torch.from_numpy(ray_id),
+                torch.from_numpy(bounce),
+                event_slot,
+                offset,
+            )
+        )
+    finally:
+        be.set_backend("numpy")
+    assert torch_bits.shape == (_BITWISE_NUM_RAYS,)
+    assert int(np.count_nonzero(torch_bits != reference)) == 0
+
+
+def test_uniform_is_the_same_double_as_the_host_reference():
+    """At float64 the uint32 -> [0, 1) conversion is exact, so the doubles match."""
+    ray_id = np.arange(100_000, dtype=np.int64)
+    bounce = np.full(100_000, 2, dtype=np.int32)
+    reference = (
+        _pcg32_uint32_reference(99, ray_id, bounce, EventSlot.SCATTER_BRANCH).astype(
+            np.float64
+        )
+        / 2.0**32
+    )
+
+    drawn = to_numpy(pcg32_uniform(99, ray_id, bounce, EventSlot.SCATTER_BRANCH))
+    assert drawn.dtype == np.float64
+    np.testing.assert_array_equal(drawn, reference)
+
+
+def test_torch_draw_makes_no_host_transfer(monkeypatch):
+    """Nothing in a Torch draw copies a ray array back to the host.
+
+    Every route off the device is made to raise: the backend's own
+    ``to_numpy`` boundary utility, and the tensor methods that force a
+    synchronising copy.
+    """
+    torch = pytest.importorskip("torch")
+
+    import optiland.backend.utils as backend_utils
+
+    be.set_backend("torch")
+    be.set_precision("float64")
+    try:
+        rng = NSQRng(seed=19)
+        ray_id = torch.arange(4096, dtype=torch.int64)
+        bounce = torch.full((4096,), 2, dtype=torch.int32)
+        # Draw once unguarded so the jump-ahead tables are already built for
+        # this backend: the test is about the draw, not about first use.
+        expected = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_U1))
+
+        def _forbidden(*args, **kwargs):
+            raise AssertionError("the draw copied data to the host")
+
+        monkeypatch.setattr(backend_utils, "to_numpy", _forbidden)
+        monkeypatch.setattr(torch.Tensor, "numpy", _forbidden, raising=False)
+        monkeypatch.setattr(torch.Tensor, "cpu", _forbidden, raising=False)
+        monkeypatch.setattr(torch.Tensor, "tolist", _forbidden, raising=False)
+        monkeypatch.setattr(torch.Tensor, "item", _forbidden, raising=False)
+
+        # The trap is armed: any of these routes off the device now raises.
+        with pytest.raises(AssertionError):
+            ray_id.cpu()
+        with pytest.raises(AssertionError):
+            backend_utils.to_numpy(ray_id)
+
+        drawn = rng.uniform(ray_id, bounce, EventSlot.BSDF_U1)
+        is_tensor = isinstance(drawn, torch.Tensor)
+
+        monkeypatch.undo()
+        assert is_tensor
+        np.testing.assert_array_equal(to_numpy(drawn), expected)
+    finally:
+        be.set_backend("numpy")

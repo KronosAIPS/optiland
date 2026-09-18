@@ -77,7 +77,7 @@ def _cull_to_budget(
     keep_prob = max(headroom / n, _BUDGET_CULL_SURVIVE_FLOOR) if n > 0 else 1.0
     ray_id_np = to_numpy(spawned.ray_id)
     bounce_np = to_numpy(spawned.bounce)
-    u = rng.uniform(ray_id_np, bounce_np, EventSlot.RR, offset=1)
+    u = to_numpy(rng.uniform(ray_id_np, bounce_np, EventSlot.RR, offset=1))
     keep_np = u < keep_prob
     culled_np = ~keep_np
 
@@ -400,8 +400,8 @@ class ArrayBackend(TracerBackend):
                         rr_threshold_fraction,
                         flux_per_ray,
                         self.rng,
-                        to_numpy(rays.ray_id),
-                        to_numpy(rays.bounce),
+                        rays.ray_id,
+                        rays.bounce,
                     )
                     if rr_killed_np.any():
                         num_rays_flux_killed += int(rr_killed_np.sum())
