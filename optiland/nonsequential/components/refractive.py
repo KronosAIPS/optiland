@@ -179,15 +179,11 @@ class RefractiveComponent(BaseComponent):
         ray_id_key = rays.ray_id
         bounce_key = rays.bounce
 
-        # Missed rays carry t = inf; zero it for the differentiable position
-        # update so the masked-out be.where branch cannot inject a
-        # 0 * inf = NaN into the backward pass.
-        t = be.where(hit_mask, t, be.zeros_like(t))
-
-        # Advance hit rays to intersection point
-        rays.x = be.where(hit_mask, rays.x + t * rays.L, rays.x)
-        rays.y = be.where(hit_mask, rays.y + t * rays.M, rays.y)
-        rays.z = be.where(hit_mask, rays.z + t * rays.N, rays.z)
+        # Advance hit rays to the intersection point. Rebuilt in this
+        # surface's own frame from the advance and the residual the
+        # intersection was solved with, not p + t*d -- see
+        # BaseComponent.advance_to_hit.
+        self.advance_to_hit(rays, t, hit_mask)
 
         dirs = be.stack([rays.L, rays.M, rays.N], axis=1)
         wl = rays.wavelength  # µm

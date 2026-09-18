@@ -133,15 +133,9 @@ class ReflectiveComponent(BaseComponent):
         ray_id_key = rays.ray_id
         bounce_key = rays.bounce
 
-        # Missed rays carry t = inf; zero it before the position update so the
-        # masked-out be.where branch cannot backpropagate 0 * inf = NaN into
-        # the ray directions.
-        t = be.where(hit_mask, t, be.zeros_like(t))
-
-        # Advance to hit point
-        rays.x = be.where(hit_mask, rays.x + t * rays.L, rays.x)
-        rays.y = be.where(hit_mask, rays.y + t * rays.M, rays.y)
-        rays.z = be.where(hit_mask, rays.z + t * rays.N, rays.z)
+        # Advance to the hit point, rebuilt in this surface's own frame --
+        # see BaseComponent.advance_to_hit.
+        self.advance_to_hit(rays, t, hit_mask)
 
         dirs = be.stack([rays.L, rays.M, rays.N], axis=1)
 
