@@ -474,9 +474,10 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         # Apply BSDF scatter if present (compute for all rays, use where to select)
         if bsdf_ir.kind != "none":
             # Compute BSDF for all N rays; where-select only hit rays
+            lobe_in_dirs = be.stack([rays.L, rays.M, rays.N], axis=1)
             bsdf_dirs, bsdf_weights, bsdf_transmitted = self.bsdf.sample(
                 rays.num_rays,
-                be.stack([rays.L, rays.M, rays.N], axis=1),
+                lobe_in_dirs,
                 normals,
                 rays.wavelength,
                 rng,
@@ -500,9 +501,17 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             rays.M = new_dirs[:, 1]
             rays.N = new_dirs[:, 2]
             bsdf_gate = be.where(scatters, bsdf_weights, be.ones_like(bsdf_weights))
-            # A lobe's weight is a fraction of the incident flux, so what it
-            # does not return is absorbed at the surface.
-            self.book_loss(rays.flux, 1.0 - bsdf_gate, hit_mask)
+            # What the lobe did not return is a surface loss when the weight
+            # is a physical fraction of the incident flux, and a surface loss
+            # plus a zero-mean event residual when it is a sampling weight --
+            # BaseBSDF.weight_is_albedo says which.
+            albedo_gate = bsdf_gate
+            if not self.bsdf.weight_is_albedo:
+                albedo = self.bsdf.reflectance(
+                    lobe_in_dirs, normals, rays.wavelength
+                )
+                albedo_gate = be.where(scatters, albedo, be.ones_like(albedo))
+            self.book_lobe(rays.flux, bsdf_gate, albedo_gate, hit_mask)
             rays.flux = rays.flux * bsdf_gate
 
             # D-4: a scattered ray's medium is decided by its own lobe's

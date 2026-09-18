@@ -189,13 +189,18 @@ class ReflectiveComponent(BaseComponent, LedgerBooking):
             rays.flux = rays.flux * be.where(hit_mask, sf_gate, be.ones_like(sf_gate))
 
             new_dirs = be.where(scatters[:, None], bsdf_dirs, new_dirs)
-            # A lobe's weight is a fraction of the incident flux (BaseBSDF:
-            # "relative flux weights in [0, 1]"), so what it does not return
-            # is absorbed at the surface.
+            # What the lobe did not return is a surface loss when the weight
+            # is a physical fraction of the incident flux, and a surface
+            # loss plus a zero-mean event residual when it is a sampling
+            # weight -- BaseBSDF.weight_is_albedo says which.
             bsdf_gate = be.where(
                 scatters, bsdf_weights, be.ones_like(bsdf_weights)
             )
-            self.book_loss(rays.flux, 1.0 - bsdf_gate, hit_mask)
+            albedo_gate = bsdf_gate
+            if not self.bsdf.weight_is_albedo:
+                albedo = self.bsdf.reflectance(dirs, normals, rays.wavelength)
+                albedo_gate = be.where(scatters, albedo, be.ones_like(albedo))
+            self.book_lobe(rays.flux, bsdf_gate, albedo_gate, hit_mask)
             rays.flux = rays.flux * bsdf_gate
 
         rays.L = new_dirs[:, 0]

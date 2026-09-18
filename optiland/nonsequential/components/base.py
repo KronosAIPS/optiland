@@ -517,6 +517,40 @@ def _resident_transform(component) -> tuple:
     return be.array(translation), be.array(rot)
 
 
+def resident_table(owner, name: str, values):
+    """A constant lookup table of ``owner``'s, uploaded to the backend once.
+
+    Bin edges, a tabulated inverse CDF, a measured BSDF grid: all of them
+    are configuration, not ray data. They are built once from the object's
+    own parameters and never change during a trace, so the arithmetic that
+    reads them has no reason to leave the device -- but only if the table is
+    there too, which is what this uploads and keeps
+    (``docs/theory/12_gpu_mapping.md`` R-12-8, the rule
+    :func:`_resident_transform` follows for a placement).
+
+    The cache is keyed on the backend configuration, so an object reused
+    across a NumPy trace and a Torch one gets the right array each time.
+
+    Args:
+        owner: The object the table belongs to; the cache lives on it.
+        name: Key for this table on this object.
+        values: The table, as NumPy values.
+
+    Returns:
+        The table as an array of the active backend, in its working dtype
+        and on its device.
+    """
+    key = _backend_key()
+    if getattr(owner, "_be_tables_key", None) != key:
+        owner._be_tables = {}
+        owner._be_tables_key = key
+    cached = owner._be_tables.get(name)
+    if cached is None:
+        cached = be.array(np.asarray(values, dtype=np.float64))
+        owner._be_tables[name] = cached
+    return cached
+
+
 def _backend_key() -> tuple:
     """What a cached backend array depends on: the backend, its precision and its device."""
     name = be.get_backend()

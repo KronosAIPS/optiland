@@ -18,6 +18,7 @@ from optiland.nonsequential.components.base import (
     advance_to_hit_in_frame,
     coordinate_magnitude,
     offset_origin_from_surface,
+    resident_table,
 )
 
 if TYPE_CHECKING:
@@ -85,64 +86,6 @@ def _flat_index_like(buffer, flat_np):
             return flat_np.to(device=buffer.device, dtype=torch.long)
         return torch.from_numpy(flat_np).to(device=buffer.device, dtype=torch.long)
     return flat_np
-
-
-def floor_to_int(x):
-    """Floor ``x`` to an integer array of the same library and device.
-
-    The bin a hit lands in is a discrete function of the landing position,
-    so it never carries a gradient -- but it does not have to be computed
-    on the host either, and computing it there is a device-to-host copy per
-    detector per bounce.
-
-    Args:
-        x: Continuous pixel coordinate, shape (N,).
-
-    Returns:
-        ``floor(x)`` as an int64 array/tensor beside ``x``.
-    """
-    if is_torch_tensor(x):
-        import torch  # noqa: PLC0415
-
-        return torch.floor(x).to(torch.int64)
-    return np.floor(x).astype(np.int64)
-
-
-def int_to_float_like(idx, like):
-    """Cast an integer index array back to ``like``'s float dtype.
-
-    Args:
-        idx: Integer array/tensor.
-        like: Array/tensor whose dtype and device to match.
-
-    Returns:
-        ``idx`` as a float array/tensor beside ``like``.
-    """
-    if is_torch_tensor(idx):
-        return idx.to(dtype=like.dtype)
-    return idx.astype(np.float64)
-
-
-def clamp_int(idx, lo: int, hi: int):
-    """Clamp an integer index array into ``[lo, hi]``.
-
-    ``be.clip``/``be.maximum`` push both operands through ``array()``, which
-    carries the working float precision -- so an integer clamp written with
-    them comes back as floats. ``be.where`` does not.
-
-    Args:
-        idx: Integer array/tensor.
-        lo: Lower bound, inclusive.
-        hi: Upper bound, inclusive.
-
-    Returns:
-        The clamped indices, still integer.
-    """
-    if is_torch_tensor(idx):
-        import torch  # noqa: PLC0415
-
-        return torch.clamp(idx, lo, hi)
-    return np.clip(idx, lo, hi)
 
 
 def _accumulate_into(buffer, flat_np, contribution) -> None:
@@ -232,8 +175,8 @@ class BaseDetector(ABC):
         self.name = name
         self.absorb = bool(absorb)
         self._frame = None
-        self._tables: dict[str, object] = {}
-        self._tables_key = None
+        self._be_tables: dict[str, object] = {}
+        self._be_tables_key = None
         # The two parts of the last solved hit distance, for a transmissive
         # detector's hit-point rebuild -- see intersect(). Transient
         # per-bounce scratch, rewritten by every intersect() call and
@@ -243,39 +186,19 @@ class BaseDetector(ABC):
     def table(self, name: str, values):
         """A constant lookup table of this detector's, resident on the backend.
 
-        Bin edges, bin centres and the like are scene data, not ray data:
-        they are built once from the detector's own configuration and never
-        change during a trace. A binning arithmetic written against them
-        therefore has no reason to leave the device -- but only if the table
-        is there too, which is what this uploads and keeps
-        (``docs/theory/12_gpu_mapping.md`` R-12-8, the same rule
-        :meth:`frame` follows for the placement).
-
-        The cache is keyed on the backend configuration, so a detector
-        reused across a NumPy trace and a Torch one gets the right array
-        each time, and it is dropped by :meth:`reset`.
+        Bin edges, bin centres and the like are scene data, not ray data, so
+        the binning arithmetic that reads them stays where the ray state is
+        -- see :func:`~optiland.nonsequential.components.base
+        .resident_table`. The cache is dropped by :meth:`reset`.
 
         Args:
             name: Key for this table on this detector.
-            values: The table, as a NumPy array of float64 values.
+            values: The table, as NumPy values.
 
         Returns:
-            The table as an array of the active backend, in its working
-            dtype and on its device.
+            The table as an array of the active backend.
         """
-        from optiland.nonsequential.components.base import (  # noqa: PLC0415
-            _backend_key,
-        )
-
-        key = _backend_key()
-        if self._tables_key != key:
-            self._tables = {}
-            self._tables_key = key
-        cached = self._tables.get(name)
-        if cached is None:
-            cached = be.array(np.asarray(values, dtype=np.float64))
-            self._tables[name] = cached
-        return cached
+        return resident_table(self, name, values)
 
     def frame(self):
         """This detector's global->local transform, as backend arrays.
@@ -298,8 +221,8 @@ class BaseDetector(ABC):
     def invalidate_frame(self) -> None:
         """Drop the cached transform and tables; the next trace rebuilds them."""
         self._frame = None
-        self._tables = {}
-        self._tables_key = None
+        self._be_tables = {}
+        self._be_tables_key = None
 
     def intersect(
         self, rays: NSQRayBundle

@@ -13,7 +13,13 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential._tally import masked_count
-from optiland.nonsequential._utils import as_detached_param, to_numpy
+from optiland.nonsequential._utils import (
+    as_detached_param,
+    clamp_int,
+    floor_to_int,
+    int_to_float_like,
+    to_numpy,
+)
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
@@ -21,9 +27,6 @@ from optiland.nonsequential.detectors.base import (
     BaseDetector,
     _accumulate_into,
     _new_flat_accumulator,
-    clamp_int,
-    floor_to_int,
-    int_to_float_like,
 )
 from optiland.nonsequential.results.spectral_result import SpectralResult
 

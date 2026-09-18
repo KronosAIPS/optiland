@@ -12,9 +12,12 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 import optiland.backend as be
-from optiland.backend.utils import to_numpy
 from optiland.nonsequential import _tol
+from optiland.nonsequential._utils import clamp_int
 from optiland.nonsequential.bsdf.base import BaseBSDF
+from optiland.nonsequential.components.base import resident_table
+from optiland.nonsequential.components.sampling_support import detached
+from optiland.nonsequential.ray_bundle import backend_bool_full
 from optiland.nonsequential.rng import EventSlot
 
 if TYPE_CHECKING:
@@ -107,6 +110,43 @@ class HarveyShackBSDF(BaseBSDF):
         self._cdf_grid = cdf / cdf[-1] if cdf[-1] > 0.0 else np.linspace(0, 1, cdf.size)
         self._beta_grid = beta
 
+    def _inverse_cdf(self, u):
+        """Radial offset for a uniform draw, from the tabulated inverse CDF.
+
+        The table is monotone in the CDF, so the lookup is one
+        ``searchsorted`` and one linear interpolation between the bracketing
+        grid points -- the same arithmetic ``numpy.interp`` performs, in the
+        active backend and on the table uploaded beside the ray state rather
+        than on a host copy of the draws.
+
+        A flat stretch of the CDF (an interval the lobe puts no weight in)
+        has a zero span; the fraction is taken as zero there, which returns
+        the lower grid point, as an interpolation between two equal
+        abscissae must.
+
+        Args:
+            u: Uniform draws in [0, 1), shape (N,).
+
+        Returns:
+            The radial direction-cosine offset for each draw, shape (N,).
+        """
+        cdf = resident_table(self, "cdf", self._cdf_grid)
+        beta = resident_table(self, "beta", self._beta_grid)
+        j = clamp_int(
+            be.searchsorted(cdf, u, side="right") - 1, 0, self._cdf_grid.size - 2
+        )
+        c0 = cdf[j]
+        c1 = cdf[j + 1]
+        span = c1 - c0
+        positive = span > 0
+        frac = be.where(
+            positive,
+            (u - c0) / be.where(positive, span, be.ones_like(span)),
+            be.zeros_like(span),
+        )
+        b0 = beta[j]
+        return b0 + frac * (beta[j + 1] - b0)
+
     @property
     def total_integrated_scatter(self) -> float:
         """Fraction of incident power scattered by this surface, in [0, 1].
@@ -158,7 +198,9 @@ class HarveyShackBSDF(BaseBSDF):
         negligible, which drove surface throughput to ~1e-7 of the incident
         flux and made the model behave as a black absorber.
 
-        Sampling is detached (numpy); weights are plain scalars.
+        Sampling is detached, and stays on whichever array library and
+        device the ray state is on: the inverse-CDF table is uploaded once
+        and read with a device-side ``searchsorted``.
 
         Args:
             num_rays: Number of rays.
@@ -175,57 +217,63 @@ class HarveyShackBSDF(BaseBSDF):
         if self._beta_grid is None:
             self._build_tables()
 
-        n_np = np.asarray(to_numpy(normals), dtype=np.float64)
-        d_np = np.asarray(to_numpy(incident_dirs), dtype=np.float64)
+        # The lobe is a stochastic choice, so it is detached -- but with
+        # detach(), not by copying the normal and the direction to the host.
+        # Every line below is elementwise arithmetic that runs wherever the
+        # ray state lives.
+        n_be = detached(normals)
+        d_be = detached(incident_dirs)
 
         # Specular reflection: d - 2(d.n)n
-        cos_i = (d_np * n_np).sum(axis=1, keepdims=True)
-        d_spec = d_np - 2.0 * cos_i * n_np
+        cos_i = (d_be * n_be).sum(axis=1, keepdims=True)
+        d_spec = d_be - 2.0 * cos_i * n_be
 
         # Per-ray reflective-vs-transmissive lobe draw: the reference
-        # ray the ABg blur is centred on. d_np itself (unrefracted) is
+        # ray the ABg blur is centred on. d_be itself (unrefracted) is
         # already a unit vector; only d_spec needs the below norm-guard.
         if self.transmissive_fraction > 0.0:
-            u_lobe = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH))
-            transmitted_np = u_lobe < self.transmissive_fraction
+            u_lobe = rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH)
+            transmitted = u_lobe < self.transmissive_fraction
+            d_ref = be.where(transmitted[:, None], d_be, d_spec)
         else:
-            transmitted_np = np.zeros(n_np.shape[0], dtype=bool)
-        d_ref = np.where(transmitted_np[:, None], d_np, d_spec)
+            transmitted = backend_bool_full((n_be.shape[0],), False, like=n_be)
+            d_ref = d_spec
 
         # Rays that hit nothing carry zero direction and normal, so the
         # reference vector is zero. Guard the normalisation: a NaN here
         # propagates into the returned weights for every ray.
         d_ref_norm = (d_ref * d_ref).sum(axis=1, keepdims=True) ** 0.5
         # Zero-length-vector rejection: k ulps of 1 (a direction is O(1)),
-        # not a bare 1e-12 -- docs/theory/08_precision.md sec 8.7. This
-        # module always runs on host float64 (to_numpy above), so the floor
-        # is the float64 one regardless of the active backend precision.
-        norm_floor = 8 * _tol.ulp(np.ones_like(d_ref_norm))
-        valid = d_ref_norm[:, 0] > norm_floor[:, 0]
-        d_ref = np.divide(
-            d_ref, d_ref_norm, out=np.zeros_like(d_ref), where=d_ref_norm > norm_floor
-        )
+        # not a bare 1e-12 -- docs/theory/08_precision.md sec 8.7. Taken in
+        # the working dtype, so a float32 trace gets the float32 floor.
+        norm_floor = 8 * _tol.ulp(be.ones_like(d_ref_norm))
+        usable = d_ref_norm > norm_floor
+        valid = usable[:, 0]
+        safe_norm = be.where(usable, d_ref_norm, be.ones_like(d_ref_norm))
+        d_ref = be.where(usable, d_ref / safe_norm, be.zeros_like(d_ref))
 
         from optiland.nonsequential.bsdf.lambertian import (  # noqa: PLC0415
             _orthonormal_basis,
         )
 
-        t_vec, b_vec = _orthonormal_basis(n_np)
+        t_vec, b_vec = _orthonormal_basis(n_be)
 
         # Reference direction expressed in the local tangent frame.
         beta0_x = (d_ref * t_vec).sum(axis=1)
         beta0_y = (d_ref * b_vec).sum(axis=1)
-        ref_normal_sign = np.sign((d_ref * n_np).sum(axis=1))
-        ref_normal_sign[ref_normal_sign == 0.0] = 1.0
+        raw_sign = be.sign((d_ref * n_be).sum(axis=1))
+        ref_normal_sign = be.where(
+            raw_sign == 0.0, be.ones_like(raw_sign), raw_sign
+        )
 
         # Radial offset from the tabulated inverse CDF; azimuth uniform.
-        u_radial = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_U1))
-        u_azimuth = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_U2))
-        delta = np.interp(u_radial, self._cdf_grid, self._beta_grid)
-        psi = 2.0 * np.pi * u_azimuth
+        u_radial = rng.uniform(ray_id, bounce, EventSlot.BSDF_U1)
+        u_azimuth = rng.uniform(ray_id, bounce, EventSlot.BSDF_U2)
+        delta = self._inverse_cdf(u_radial)
+        psi = 2.0 * be.pi * u_azimuth
 
-        beta_x = beta0_x + delta * np.cos(psi)
-        beta_y = beta0_y + delta * np.sin(psi)
+        beta_x = beta0_x + delta * be.cos(psi)
+        beta_y = beta0_y + delta * be.sin(psi)
 
         # An offset can land outside the unit disk, i.e. on the wrong side of
         # the reference ray's own hemisphere. Those samples are not
@@ -234,31 +282,31 @@ class HarveyShackBSDF(BaseBSDF):
         # lobe.
         beta_sq = beta_x**2 + beta_y**2
         reachable = (beta_sq < 1.0) & valid
-        normal_comp = np.sqrt(np.clip(1.0 - beta_sq, 0.0, None))
+        normal_comp = be.sqrt(be.maximum(1.0 - beta_sq, be.zeros_like(beta_sq)))
 
         scattered = (
             beta_x[:, None] * t_vec
             + beta_y[:, None] * b_vec
-            + (ref_normal_sign * normal_comp)[:, None] * n_np
+            + (ref_normal_sign * normal_comp)[:, None] * n_be
         )
-        scattered = np.where(reachable[:, None], scattered, d_ref)
+        scattered = be.where(reachable[:, None], scattered, d_ref)
 
         norms = (scattered * scattered).sum(axis=1, keepdims=True) ** 0.5
-        norms_floor = 8 * _tol.ulp(np.ones_like(norms))
-        scattered = np.divide(
-            scattered, norms, out=np.zeros_like(scattered), where=norms > norms_floor
+        norms_ok = norms > 8 * _tol.ulp(be.ones_like(norms))
+        scattered = be.where(
+            norms_ok,
+            scattered / be.where(norms_ok, norms, be.ones_like(norms)),
+            be.zeros_like(scattered),
         )
 
         # Full flux: the lobe redistributes energy rather than removing it.
         # The physical scatter level is applied via ``scatter_fraction``,
         # for which :attr:`total_integrated_scatter` is the natural value.
-        flux_weights = np.where(reachable, 1.0, 0.0)
-
-        return (
-            be.array(scattered.astype(np.float64)),
-            be.array(flux_weights),
-            be.array(transmitted_np),
+        flux_weights = be.where(
+            reachable, be.ones_like(beta_sq), be.zeros_like(beta_sq)
         )
+
+        return scattered, flux_weights, transmitted
 
     def reflectance(
         self,

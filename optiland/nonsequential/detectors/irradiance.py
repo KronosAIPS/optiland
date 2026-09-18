@@ -14,7 +14,13 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.backend.utils import to_numpy
-from optiland.nonsequential._utils import as_float, as_param
+from optiland.nonsequential._utils import (
+    as_float,
+    as_param,
+    clamp_int,
+    floor_to_int,
+    int_to_float_like,
+)
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
@@ -23,9 +29,6 @@ from optiland.nonsequential.detectors.base import (
     BaseDetector,
     _accumulate_into,
     _new_flat_accumulator,
-    clamp_int,
-    floor_to_int,
-    int_to_float_like,
 )
 from optiland.nonsequential.results.irradiance_map import IrradianceMap
 

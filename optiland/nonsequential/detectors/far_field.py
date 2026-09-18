@@ -13,7 +13,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential._tally import Tally, masked_count, masked_sum
-from optiland.nonsequential._utils import to_numpy
+from optiland.nonsequential._utils import clamp_int, to_numpy
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
@@ -21,7 +21,6 @@ from optiland.nonsequential.detectors.base import (
     BaseDetector,
     _accumulate_into,
     _new_flat_accumulator,
-    clamp_int,
 )
 from optiland.nonsequential.results.far_field_pattern import FarFieldPattern
 
