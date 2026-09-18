@@ -89,6 +89,19 @@ DEFAULT_ACCEPT_K = 16
 # accepted t, so the ulp is never taken at magnitude 0.
 _MAGNITUDE_FLOOR = 1.0
 
+# k_delta of docs/theory/07_geometry.md R-07-6 and section 7.7 (cure 2), in
+# units of the unit roundoff u: the secondary ray's origin is offset off the
+# surface by delta = k_delta * u * |p|_inf. Section 7.7 quotes k_delta = 32.
+# One ulp spans 2u at the magnitude it is taken at, so the same bound written
+# in ulps is delta = (k_delta / 2) * ulp(|p|_inf) = 16 ulp -- the same 16 the
+# accept threshold uses, which is what makes the two complementary: the
+# offset moves the new origin to the edge of the band the threshold rejects,
+# so a ray leaving a surface is outside that band by construction and a ray
+# still inside it is rejected. Raising one without the other would either
+# blind the engine to a near surface (threshold) or displace the ray
+# measurably (offset).
+DEFAULT_OFFSET_K_DELTA = 32
+
 # ulp(1) at float64 -- the reference radicand_floor() scales against.
 _ULP1_F64 = 2.220446049250313e-16
 
@@ -151,6 +164,56 @@ def accept_t_min(
     else:
         mag = np.maximum(np.abs(np.asarray(origin_magnitude)), _MAGNITUDE_FLOOR)
     return k * ulp(mag)
+
+
+def origin_offset(
+    origin_magnitude: ScalarOrArrayT, k_delta: int = DEFAULT_OFFSET_K_DELTA
+) -> ScalarOrArrayT:
+    """Distance to push a secondary ray's origin off the surface it leaves.
+
+    Cure 2 of docs/theory/07_geometry.md section 7.7, required by R-07-6:
+    ``o' = p +/- delta * n_geom`` with ``delta = k_delta * u * |p|_inf``, the
+    sign taken from the hemisphere the outgoing ray leaves into. It is the
+    complement of :func:`accept_t_min`, not a substitute: the threshold
+    rejects a root that is still inside the position's error ball, while the
+    offset moves the origin out of that ball so a root never forms there in
+    the first place.
+
+    The threshold alone is not enough for a ray that leaves at a grazing
+    angle. The rebuilt hit point can land half an ulp on the wrong side of
+    the surface, and a ray leaving at ``alpha`` from the surface plane
+    re-crosses it after ``delta_perp / sin(alpha)`` -- a path length the
+    threshold sees, not the perpendicular error it was sized for. At one
+    millidegree inside the critical angle of an N-BK7/air interface the exit
+    is 0.36 degrees from grazing, which multiplies the residual by 159 and
+    lifts it above ``k`` ulps. The offset removes the amplification instead
+    of chasing it with a larger ``k``.
+
+    ``delta_shape``, the per-primitive term for the error of the
+    intersection itself, is zero here: the hit point is rebuilt in the
+    surface's own frame (:meth:`BaseComponent.advance_to_hit`), which was
+    measured at at most 0.4 ulp of the ray's coordinate over every leg
+    length from 0 to 1e6 mm, so the coordinate term already bounds it.
+
+    Args:
+        origin_magnitude: A representative coordinate magnitude of the hit
+            point, per ray, in the working backend/dtype. Floored at 1.0 mm
+            like :func:`accept_t_min`, so a hit at the coordinate origin
+            still gets a non-zero offset.
+        k_delta: Multiple of the unit roundoff. Default
+            :data:`DEFAULT_OFFSET_K_DELTA`.
+
+    Returns:
+        The offset distance [mm], same backend/dtype as the input, always
+        non-negative -- the caller applies the sign.
+    """
+    if is_tensor(origin_magnitude):
+        import torch  # noqa: PLC0415
+
+        mag = torch.clamp(torch.abs(origin_magnitude).detach(), min=_MAGNITUDE_FLOOR)
+    else:
+        mag = np.maximum(np.abs(np.asarray(origin_magnitude)), _MAGNITUDE_FLOOR)
+    return (k_delta / 2.0) * ulp(mag)
 
 
 def tiny_for(dtype_or_array: Any) -> float:

@@ -70,4 +70,15 @@ def test_rigid_transform_leaves_detector_map_unchanged():
     d0 = r0.detectors["D1"].irradiance
     d1 = r1.detectors["D1"].irradiance
     np.testing.assert_allclose(d0, d1, rtol=1e-9, atol=1e-15)
-    assert r0.total_flux_detected == r1.total_flux_detected
+    # Not bitwise equal, and cannot be: two of the engine's geometric
+    # tolerances are proportional to the ray's own coordinate magnitude --
+    # the self-intersection accept threshold (R-07-5) and the secondary-ray
+    # origin offset (R-07-6), both k ulps of |p|_inf. Moving the whole scene
+    # to a larger coordinate therefore scales both, and the offset is a
+    # displacement, so the trajectory itself moves in its last bits. The
+    # invariance that must hold is invariance to within the working
+    # precision: measured, the two totals differ by 1 ulp of the detected
+    # flux.
+    np.testing.assert_allclose(
+        r0.total_flux_detected, r1.total_flux_detected, rtol=1e-12, atol=0.0
+    )

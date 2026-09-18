@@ -523,3 +523,10 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             # scatter_fraction > 0 on a volume boundary can drift the stack
             # out of sync with n_current (diagnostic-only; n1/n2 stay
             # correct either way).
+
+        # R-07-6: the outgoing ray starts a conservative distance clear of
+        # this surface, on the side it leaves into. Last, so the direction
+        # it is signed by is the final one -- a BSDF lobe above may have
+        # replaced the specular/refracted direction, and a transmissive
+        # lobe leaves on the other side from a reflective one.
+        self.offset_from_surface(rays, n_geom, hit_mask)

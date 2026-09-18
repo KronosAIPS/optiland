@@ -304,6 +304,58 @@ class BaseComponent(ABC):
         rays.y = be.where(hit_mask, y_g, rays.y)
         rays.z = be.where(hit_mask, z_g, rays.z)
 
+    def offset_from_surface(
+        self, rays: NSQRayBundle, n_geom: np.ndarray, hit_mask: np.ndarray
+    ) -> None:
+        """Push an outgoing ray's origin off the surface it has just left.
+
+        Cure 2 of ``docs/theory/07_geometry.md`` section 7.7, required by
+        R-07-6 and not previously implemented. Called at the end of an
+        interaction, after the outgoing direction is known: the origin moves
+        by ``delta`` (:func:`optiland.nonsequential._tol.origin_offset`)
+        along the geometric normal, signed into the hemisphere the outgoing
+        ray leaves into.
+
+        Why the accept threshold does not cover this on its own. The
+        rebuilt hit point lands within about half an ulp of the surface,
+        but on either side of it -- measured over a plane interface, 8119
+        of 16384 rays landed on the side they were leaving, at up to 0.38
+        ulp of their 10 mm coordinate. A ray leaving at ``alpha`` above the
+        surface plane then re-crosses the surface after a *path length*
+        ``delta_perp / sin(alpha)``. The threshold is a path length, so the
+        ``1 / sin(alpha)`` is free amplification: at 0.36 degrees from
+        grazing (an N-BK7/air exit one millidegree inside the critical
+        angle) a 4e-16 mm residual becomes a 6.5e-14 mm root, above the
+        2.8e-14 mm threshold, and the surface accepts the ray it just
+        released. With the origin offset the ray starts ``delta`` clear of
+        the surface on the correct side, so no root forms at all.
+
+        The offset is applied for every hit ray, reflected or transmitted,
+        and is signed per ray: it therefore also covers a second surface
+        that shares this one's plane, and any later grazing exit, not only
+        the case that exposed it.
+
+        Args:
+            rays: Ray bundle, updated in place. Positions must already be
+                at the hit point and directions must already be the
+                outgoing ones.
+            n_geom: Geometric (unflipped) surface normal in the global
+                frame, shape (N, 3) -- R-07-9: offsets use the geometric
+                normal, never an interpolated one.
+            hit_mask: Rays that interacted with this component, shape (N,).
+        """
+        dot = rays.L * n_geom[:, 0] + rays.M * n_geom[:, 1] + rays.N * n_geom[:, 2]
+        delta = _tol.origin_offset(coordinate_magnitude(rays))
+        # Sign from the outgoing hemisphere. A direction exactly in the
+        # surface plane (dot == 0) never re-crosses it -- the geometries
+        # reject a parallel ray on the denominator test -- so either sign
+        # is safe there; +1 keeps the expression branch-free.
+        signed = be.where(dot < 0, -delta, delta)
+        step = be.where(hit_mask, signed, be.zeros_like(signed))
+        rays.x = rays.x + step * n_geom[:, 0]
+        rays.y = rays.y + step * n_geom[:, 1]
+        rays.z = rays.z + step * n_geom[:, 2]
+
     @abstractmethod
     def interact(
         self,

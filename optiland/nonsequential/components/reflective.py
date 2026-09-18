@@ -118,8 +118,11 @@ class ReflectiveComponent(BaseComponent, LedgerBooking):
                 scatter branch below runs at all is decided from
                 ``bsdf_ir.kind != "none"`` (verified by the caller to match
                 ``self.bsdf``), not from ``self.bsdf is not None``.
-            n_geom: Unused -- a mirror never transmits, so it never needs
-                to determine which medium a ray is entering.
+            n_geom: Geometric (unflipped) surface normal in the global
+                frame, shape (N, 3). Not used to choose a medium -- a
+                mirror never transmits -- but it is the direction the
+                outgoing origin is offset along (R-07-6; see
+                :meth:`BaseComponent.offset_from_surface`).
             sampling: Unused -- a mirror has no Fresnel reflect/transmit
                 branch to importance-bias; its reflectance is
                 applied as a deterministic flux weight, not a stochastic
@@ -201,3 +204,9 @@ class ReflectiveComponent(BaseComponent, LedgerBooking):
 
         # n_current unchanged (reflection stays in same medium)
         rays.bounce = be.where(hit_mask, rays.bounce + 1, rays.bounce)
+
+        # R-07-6: push the reflected (or scattered) origin clear of the
+        # mirror on the side it leaves into -- see
+        # BaseComponent.offset_from_surface. Signed per ray from the final
+        # direction, so a BSDF lobe's direction is the one that decides it.
+        self.offset_from_surface(rays, n_geom, hit_mask)
