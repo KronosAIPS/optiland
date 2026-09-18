@@ -22,6 +22,17 @@ MEDIUM_STACK_MAX_DEPTH = 8
 # Sentinel medium id for "no medium" / unused stack slots.
 MEDIUM_STACK_EMPTY = -1
 
+# Whether a push past MEDIUM_STACK_MAX_DEPTH raises MediumStackOverflowError.
+#
+# True (the default) keeps the documented behaviour, at the cost of the one
+# host read left in the push/pop kernel: deciding whether to raise means
+# reducing a per-ray mask to a Python bool, which on a non-CPU device is a
+# synchronisation. Set False for a device path with no synchronisation at
+# all: the push then saturates (the ray keeps the medium it had) and the
+# event is counted in ``medium_stack_underflows`` alongside the pop-on-empty
+# events, i.e. reported as a stack inconsistency rather than raised.
+MEDIUM_STACK_OVERFLOW_RAISES = True
+
 
 class MediumStackOverflowError(Exception):
     """A ray's medium nesting exceeded ``MEDIUM_STACK_MAX_DEPTH``.
@@ -30,6 +41,117 @@ class MediumStackOverflowError(Exception):
     either a pathologically deep (past any realistic optical assembly)
     volume nesting, or a geometry defect that pushes without ever popping.
     """
+
+
+def backend_int_full(shape, fill_value: int, like=None, bits: int = 64):
+    """Return an integer array filled with ``fill_value``.
+
+    The result is built with the same array library, and on the same device,
+    as ``like`` -- a NumPy ndarray for NumPy ray state, a torch Tensor on the
+    tensor's own device for torch ray state. Integer bookkeeping fields are
+    built through this helper rather than ``be.zeros``/``be.full`` because
+    those carry the backend's floating-point precision and grad flag, neither
+    of which applies to an index table.
+
+    Args:
+        shape: Output shape.
+        fill_value: Integer fill value.
+        like: Array whose library and device the result follows. ``None``
+            (or a NumPy array) gives a NumPy result.
+        bits: 64 for the medium ids, 32 for depths and counters.
+
+    Returns:
+        An integer array/tensor of ``shape``.
+    """
+    if be.is_torch_tensor(like):
+        import torch  # noqa: PLC0415
+
+        dtype = torch.int64 if bits == 64 else torch.int32
+        return torch.full(
+            tuple(shape), int(fill_value), dtype=dtype, device=like.device
+        )
+    dtype = np.int64 if bits == 64 else np.int32
+    return np.full(tuple(shape), int(fill_value), dtype=dtype)
+
+
+def backend_masked_fill(table, mask, value: int):
+    """Write ``value`` into every entry of ``table`` where ``mask`` is True.
+
+    In place and without allocating a second table; elementwise, so it costs
+    no host read on either array library.
+
+    Args:
+        table: Integer table, modified in place.
+        mask: Boolean mask broadcastable to ``table``'s shape.
+        value: Integer to write.
+
+    Returns:
+        ``table``.
+    """
+    if be.is_torch_tensor(table):
+        table.masked_fill_(mask, value)
+        return table
+    np.copyto(table, value, where=mask)
+    return table
+
+
+def backend_gather_slot(table, index):
+    """Read one entry per row: ``table[row, index[row]]``.
+
+    The per-ray gather a device kernel performs, on either array library.
+
+    Args:
+        table: Integer table, shape (N, D).
+        index: Per-row column index, shape (N,), every value in [0, D).
+
+    Returns:
+        The gathered column, shape (N,).
+    """
+    if be.is_torch_tensor(table):
+        import torch  # noqa: PLC0415
+
+        return torch.gather(table, 1, index[:, None].to(torch.int64))[:, 0]
+    return np.take_along_axis(table, index[:, None], axis=1)[:, 0]
+
+
+def backend_scatter_slot(table, index, values):
+    """Write one entry per row: ``table[row, index[row]] = values[row]``.
+
+    The per-ray scatter a device kernel performs. Writes into ``table`` in
+    place, so the caller owns a table no other bundle shares. A row that
+    should not be written passes its current value back in ``values``; the
+    masking is in the values, never in the index, so every lane writes.
+
+    Args:
+        table: Integer table, shape (N, D), modified in place.
+        index: Per-row column index, shape (N,), every value in [0, D).
+        values: Per-row value to write, shape (N,).
+
+    Returns:
+        ``table``.
+    """
+    if be.is_torch_tensor(table):
+        import torch  # noqa: PLC0415
+
+        table.scatter_(1, index[:, None].to(torch.int64), values[:, None])
+        return table
+    np.put_along_axis(table, index[:, None], values[:, None], axis=1)
+    return table
+
+
+def _rows_copy(arr, idx):
+    """Return an independent copy of ``arr``'s rows at ``idx``."""
+    sub = arr[idx]
+    return sub.clone() if be.is_torch_tensor(sub) else sub.copy()
+
+
+def _rows_concat(arrays):
+    """Concatenate arrays along axis 0, NumPy or torch."""
+    if be.is_torch_tensor(arrays[0]):
+        import torch  # noqa: PLC0415
+
+        return torch.cat(list(arrays))
+    return np.concatenate(arrays)
 
 
 @dataclass
@@ -61,15 +183,22 @@ class NSQRayBundle:
         medium_stack: Nested medium ids the ray has entered but not yet
             exited, shape (N, ``MEDIUM_STACK_MAX_DEPTH``), int64. Slots at
             or beyond ``medium_depth`` for a given row are
-            ``MEDIUM_STACK_EMPTY``. Plain NumPy always (bookkeeping only,
-            never differentiated): pushed/popped by
-            ``RefractiveComponent.interact`` alongside ``n_current``.
+            ``MEDIUM_STACK_EMPTY``. An integer table of the same array
+            library and device as the rest of the ray state (NumPy for the
+            NumPy backend, a torch Tensor on the backend's device for the
+            torch backend): pushed/popped by ``RefractiveComponent.interact``
+            alongside ``n_current``, with masked integer arithmetic over the
+            whole table, never per-row host indexing. Bookkeeping only,
+            never differentiated.
         medium_depth: Stack pointer -- number of valid entries in
-            ``medium_stack`` for each ray, shape (N,), int32. Plain NumPy.
-        medium_stack_underflows: Cumulative count of pop attempts on an
-            empty ``medium_stack`` for each ray (a ray exiting a volume it
-            never entered -- a geometry defect), shape (N,), int32. Plain
-            NumPy; summed across all rays into
+            ``medium_stack`` for each ray, shape (N,), int32, same library
+            and device as ``medium_stack``.
+        medium_stack_underflows: Cumulative count of stack inconsistencies
+            for each ray -- a pop attempt on an empty ``medium_stack`` (a
+            ray exiting a volume it never entered), and, when
+            ``MEDIUM_STACK_OVERFLOW_RAISES`` is False, a push past
+            ``MEDIUM_STACK_MAX_DEPTH``. Shape (N,), int32, same library and
+            device as ``medium_stack``; summed across all rays into
             ``Diagnostics.medium_stack_underflows`` at the end of a trace.
     """
 
@@ -97,16 +226,26 @@ class NSQRayBundle:
             # tensor afterward via _ensure_torch_bundle), so this stays
             # NumPy too rather than dispatching through the active backend.
             self.k_current = np.zeros_like(self.n_current)
+        # The medium-stack fields follow the ray state they belong to: NumPy
+        # for a NumPy bundle, tensors on the same device for a bundle already
+        # promoted to torch. They are never created through be.* because the
+        # backend's creation functions carry the working float precision and
+        # the grad flag, and an integer index table wants neither.
         if self.medium_stack is None:
-            self.medium_stack = np.full(
+            self.medium_stack = backend_int_full(
                 (self.num_rays, MEDIUM_STACK_MAX_DEPTH),
                 MEDIUM_STACK_EMPTY,
-                dtype=np.int64,
+                like=self.n_current,
+                bits=64,
             )
         if self.medium_depth is None:
-            self.medium_depth = np.zeros(self.num_rays, dtype=np.int32)
+            self.medium_depth = backend_int_full(
+                (self.num_rays,), 0, like=self.n_current, bits=32
+            )
         if self.medium_stack_underflows is None:
-            self.medium_stack_underflows = np.zeros(self.num_rays, dtype=np.int32)
+            self.medium_stack_underflows = backend_int_full(
+                (self.num_rays,), 0, like=self.n_current, bits=32
+            )
 
     @property
     def num_rays(self) -> int:
@@ -170,8 +309,8 @@ class NSQRayBundle:
     def select(self, idx: np.ndarray, ray_id: np.ndarray | None = None) -> NSQRayBundle:
         """Return a new, independent bundle containing rays at ``idx``.
 
-        NumPy-only (fancy indexing on plain ndarrays): used by the bounded
-        -splitting orchestration (D2, PR11;
+        Row selection on whichever array library holds the ray state: used by
+        the bounded-splitting orchestration (D2, PR11;
         :mod:`optiland.nonsequential.ir.interpreter`) to snapshot the
         pre-interaction state of a set of rays before mutating the original
         bundle in place, so the transmit child of a split can be built from
@@ -188,32 +327,37 @@ class NSQRayBundle:
             A new :class:`NSQRayBundle`, alive on every row (splitting only
             ever snapshots rays that are alive and mid-interaction).
         """
+        # Every field goes through the same library-neutral row copy: the
+        # medium stack is a Tensor whenever the rest of the bundle is, and a
+        # Tensor has no .copy().
+        alive = _rows_copy(self.alive, idx)
+        alive[...] = True
         kwargs: dict = dict(
-            x=self.x[idx].copy(),
-            y=self.y[idx].copy(),
-            z=self.z[idx].copy(),
-            L=self.L[idx].copy(),
-            M=self.M[idx].copy(),
-            N=self.N[idx].copy(),
-            flux=self.flux[idx].copy(),
-            wavelength=self.wavelength[idx].copy(),
-            n_current=self.n_current[idx].copy(),
-            bounce=self.bounce[idx].copy(),
-            alive=np.ones(len(idx), dtype=bool),
-            k_current=self.k_current[idx].copy(),
-            medium_stack=self.medium_stack[idx].copy(),
-            medium_depth=self.medium_depth[idx].copy(),
-            medium_stack_underflows=self.medium_stack_underflows[idx].copy(),
+            x=_rows_copy(self.x, idx),
+            y=_rows_copy(self.y, idx),
+            z=_rows_copy(self.z, idx),
+            L=_rows_copy(self.L, idx),
+            M=_rows_copy(self.M, idx),
+            N=_rows_copy(self.N, idx),
+            flux=_rows_copy(self.flux, idx),
+            wavelength=_rows_copy(self.wavelength, idx),
+            n_current=_rows_copy(self.n_current, idx),
+            bounce=_rows_copy(self.bounce, idx),
+            alive=alive,
+            k_current=_rows_copy(self.k_current, idx),
+            medium_stack=_rows_copy(self.medium_stack, idx),
+            medium_depth=_rows_copy(self.medium_depth, idx),
+            medium_stack_underflows=_rows_copy(self.medium_stack_underflows, idx),
         )
         if ray_id is not None:
             kwargs["ray_id"] = ray_id
         elif self.ray_id is not None:
-            kwargs["ray_id"] = self.ray_id[idx].copy()
+            kwargs["ray_id"] = _rows_copy(self.ray_id, idx)
         return NSQRayBundle(**kwargs)
 
     @staticmethod
     def concat(bundles: list[NSQRayBundle]) -> NSQRayBundle:
-        """Concatenate several bundles into one (NumPy-only).
+        """Concatenate several bundles into one.
 
         Used by the bounded-splitting orchestration to merge
         spawned transmit-branch children back into the live bundle at the
@@ -228,24 +372,24 @@ class NSQRayBundle:
             axis 0.
         """
         kwargs: dict = dict(
-            x=np.concatenate([b.x for b in bundles]),
-            y=np.concatenate([b.y for b in bundles]),
-            z=np.concatenate([b.z for b in bundles]),
-            L=np.concatenate([b.L for b in bundles]),
-            M=np.concatenate([b.M for b in bundles]),
-            N=np.concatenate([b.N for b in bundles]),
-            flux=np.concatenate([b.flux for b in bundles]),
-            wavelength=np.concatenate([b.wavelength for b in bundles]),
-            n_current=np.concatenate([b.n_current for b in bundles]),
-            bounce=np.concatenate([b.bounce for b in bundles]),
-            alive=np.concatenate([b.alive for b in bundles]),
-            k_current=np.concatenate([b.k_current for b in bundles]),
-            medium_stack=np.concatenate([b.medium_stack for b in bundles]),
-            medium_depth=np.concatenate([b.medium_depth for b in bundles]),
-            medium_stack_underflows=np.concatenate(
+            x=_rows_concat([b.x for b in bundles]),
+            y=_rows_concat([b.y for b in bundles]),
+            z=_rows_concat([b.z for b in bundles]),
+            L=_rows_concat([b.L for b in bundles]),
+            M=_rows_concat([b.M for b in bundles]),
+            N=_rows_concat([b.N for b in bundles]),
+            flux=_rows_concat([b.flux for b in bundles]),
+            wavelength=_rows_concat([b.wavelength for b in bundles]),
+            n_current=_rows_concat([b.n_current for b in bundles]),
+            bounce=_rows_concat([b.bounce for b in bundles]),
+            alive=_rows_concat([b.alive for b in bundles]),
+            k_current=_rows_concat([b.k_current for b in bundles]),
+            medium_stack=_rows_concat([b.medium_stack for b in bundles]),
+            medium_depth=_rows_concat([b.medium_depth for b in bundles]),
+            medium_stack_underflows=_rows_concat(
                 [b.medium_stack_underflows for b in bundles]
             ),
         )
         if all(b.ray_id is not None for b in bundles):
-            kwargs["ray_id"] = np.concatenate([b.ray_id for b in bundles])
+            kwargs["ray_id"] = _rows_concat([b.ray_id for b in bundles])
         return NSQRayBundle(**kwargs)

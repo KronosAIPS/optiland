@@ -22,7 +22,12 @@ from optiland.nonsequential.materials.nsq_material import medium_stack_id
 from optiland.nonsequential.ray_bundle import (
     MEDIUM_STACK_EMPTY,
     MEDIUM_STACK_MAX_DEPTH,
+    MEDIUM_STACK_OVERFLOW_RAISES,
     MediumStackOverflowError,
+    backend_gather_slot,
+    backend_int_full,
+    backend_masked_fill,
+    backend_scatter_slot,
 )
 from optiland.nonsequential.rng import EventSlot
 from optiland.nonsequential.sampling import resolve_reflect_prob
@@ -345,59 +350,87 @@ class RefractiveComponent(BaseComponent):
         # at depth 0 is counted as a leak. Reaching a non-ambient medium
         # that matches one level below the top is a true nesting exit
         # (pop); anything else pushes.
-        transmit_np = to_numpy(hit_mask).astype(bool) & ~to_numpy(do_reflect).astype(
-            bool
+        #
+        # The state is device-resident and so is the update: masks and
+        # integer arithmetic over every ray, one gather and one scatter per
+        # stack operation, with no row indexing, no compaction to the hit
+        # rows and no Python branch on ray data. Rays that do not transmit
+        # take every lane too and write their own value back.
+        stack = rays.medium_stack
+        depth = rays.medium_depth
+        transmit = hit_mask & ~do_reflect
+        zero = backend_int_full(depth.shape, 0, like=depth, bits=32)
+
+        front_id = medium_stack_id(self.material_front)
+        back_id = medium_stack_id(self.material_back)
+        # entering_back is a device bool mask; one operand must carry the
+        # integer dtype so the ids are not cast to the working float type.
+        front_arr = backend_int_full(depth.shape, front_id, like=depth, bits=64)
+        mat2 = be.where(entering_back, back_id, front_arr)
+
+        ambient = transmit & (mat2 == 0)
+        underflow = ambient & (depth == 0)
+
+        # "Below the top" is the entry one level under the stack pointer;
+        # a stack shallower than two levels has ambient (0) below it. The
+        # gather index is clamped so every lane reads a valid slot, and the
+        # mask is applied to the value, not to the index.
+        deep = depth >= 2
+        below = backend_gather_slot(stack, be.where(deep, depth - 2, zero))
+        below = be.where(deep, below, 0)
+
+        non_ambient = transmit & (mat2 != 0)
+        pop = non_ambient & (depth >= 1) & (mat2 == below)
+        push = non_ambient & ~pop
+        overflow = push & (depth >= MEDIUM_STACK_MAX_DEPTH)
+
+        if MEDIUM_STACK_OVERFLOW_RAISES and be.any(overflow):
+            # The one host read left in this block, and the only Python
+            # branch on ray data: turning the overflow into a raise requires
+            # reducing a per-ray mask to a bool. With
+            # MEDIUM_STACK_OVERFLOW_RAISES = False the push saturates and
+            # the event is counted below instead, leaving no read at all.
+            raise MediumStackOverflowError(
+                f"Medium stack exceeded MEDIUM_STACK_MAX_DEPTH="
+                f"{MEDIUM_STACK_MAX_DEPTH} at surface "
+                f"{self.name or type(self).__name__!r}. This "
+                "indicates either pathologically deep volume "
+                "nesting or a geometry defect that pushes "
+                "without popping."
+            )
+        push_ok = push & ~overflow
+
+        # Unwinding to ambient empties the whole row -- the one pass over the
+        # full table. In place, like the push and pop below: a bundle owns its
+        # own stack table (compact/select/concat all copy it).
+        stack = backend_masked_fill(stack, ambient[:, None], MEDIUM_STACK_EMPTY)
+
+        # Pop: the vacated top slot becomes empty. Push: the slot the stack
+        # pointer names takes the new medium id. Both write every row, the
+        # unaffected ones writing back what they already held.
+        slot = be.where(pop, depth - 1, zero)
+        held = backend_gather_slot(stack, slot)
+        stack = backend_scatter_slot(
+            stack, slot, be.where(pop, MEDIUM_STACK_EMPTY, held)
         )
-        if transmit_np.any():
-            entering_back_np = to_numpy(entering_back).astype(bool)
-            front_id = medium_stack_id(self.material_front)
-            back_id = medium_stack_id(self.material_back)
-            mat2_np = np.where(entering_back_np, back_id, front_id)
+        slot = be.where(push_ok, depth, zero)
+        held = backend_gather_slot(stack, slot)
+        rays.medium_stack = backend_scatter_slot(
+            stack, slot, be.where(push_ok, mat2, held)
+        )
 
-            rows = np.where(transmit_np)[0]
-            mat2_rows = mat2_np[rows]
-            ambient_mask = mat2_rows == 0
+        delta = be.where(pop, -1, be.where(push_ok, 1, zero))
+        rays.medium_depth = be.where(ambient, 0, depth + delta)
 
-            if ambient_mask.any():
-                amb_rows = rows[ambient_mask]
-                underflow_mask = rays.medium_depth[amb_rows] == 0
-                if underflow_mask.any():
-                    rays.medium_stack_underflows[amb_rows[underflow_mask]] += 1
-                rays.medium_stack[amb_rows, :] = MEDIUM_STACK_EMPTY
-                rays.medium_depth[amb_rows] = 0
-
-            non_ambient_mask = ~ambient_mask
-            if non_ambient_mask.any():
-                na_rows = rows[non_ambient_mask]
-                na_mat2 = mat2_rows[non_ambient_mask]
-                na_depth = rays.medium_depth[na_rows]
-
-                below = np.zeros_like(na_mat2)  # depth 0 or 1 -> "below" is ambient
-                two_or_more = na_depth >= 2
-                if two_or_more.any():
-                    below[two_or_more] = rays.medium_stack[
-                        na_rows[two_or_more], na_depth[two_or_more] - 2
-                    ]
-                pop_mask = (na_depth >= 1) & (na_mat2 == below)
-                push_mask = ~pop_mask
-
-                if pop_mask.any():
-                    pr = na_rows[pop_mask]
-                    rays.medium_depth[pr] -= 1
-                    rays.medium_stack[pr, rays.medium_depth[pr]] = MEDIUM_STACK_EMPTY
-                if push_mask.any():
-                    pr = na_rows[push_mask]
-                    if (rays.medium_depth[pr] >= MEDIUM_STACK_MAX_DEPTH).any():
-                        raise MediumStackOverflowError(
-                            f"Medium stack exceeded MEDIUM_STACK_MAX_DEPTH="
-                            f"{MEDIUM_STACK_MAX_DEPTH} at surface "
-                            f"{self.name or type(self).__name__!r}. This "
-                            "indicates either pathologically deep volume "
-                            "nesting or a geometry defect that pushes "
-                            "without popping."
-                        )
-                    rays.medium_stack[pr, rays.medium_depth[pr]] = na_mat2[push_mask]
-                    rays.medium_depth[pr] += 1
+        # A pop on an empty stack, and (when the raise above is disabled) a
+        # push past the maximum depth, are both stack inconsistencies and
+        # are counted together for Diagnostics.medium_stack_underflows.
+        inconsistent = underflow | overflow
+        rays.medium_stack_underflows = be.where(
+            inconsistent,
+            rays.medium_stack_underflows + 1,
+            rays.medium_stack_underflows,
+        )
 
         # Update bounce count
         rays.bounce = be.where(hit_mask, rays.bounce + 1, rays.bounce)
