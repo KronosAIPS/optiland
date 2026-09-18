@@ -17,7 +17,9 @@ from optiland.nonsequential.ir.medium_ir import MediumIR
 # Primitive geometry kinds this revamp's lowering knows how to produce.
 # "mesh" is included for completeness but requires the optional trimesh
 # dependency to round-trip back into a live MeshGeometry.
-PrimitiveKind = Literal["conic", "plane", "annulus", "frustum", "sphere", "mesh"]
+PrimitiveKind = Literal[
+    "conic", "plane", "annulus", "frustum", "sphere", "spherical_cavity", "mesh"
+]
 
 # Which physical interaction a primitive's hit dispatches to, independent of
 # any BsdfIR scatter overlay. A future BSDF-lobe rework could fold
@@ -27,7 +29,9 @@ ComponentKind = Literal["refractive", "reflective", "absorbing"]
 
 EmitterKind = Literal["point", "collimated", "extended"]
 
-SensorKind = Literal["irradiance", "spectral", "far_field", "ray_database"]
+SensorKind = Literal[
+    "irradiance", "spectral", "far_field", "hemisphere", "ray_database"
+]
 
 
 @dataclass(frozen=True)

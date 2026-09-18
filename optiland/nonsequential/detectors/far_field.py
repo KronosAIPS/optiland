@@ -51,6 +51,7 @@ class FarFieldDetector(BaseDetector):
         aperture_radius: float = 1e6,
         name: str = "",
         absorb: bool = True,
+        side: str = "both",
     ) -> None:
         """Initialize FarFieldDetector.
 
@@ -62,9 +63,12 @@ class FarFieldDetector(BaseDetector):
             aperture_radius: Detector aperture radius [mm] (default: very large).
             name: Optional label.
             absorb: Whether a hit terminates the ray (default True).
+            side: Which side of the plane is live -- ``"both"`` (default),
+                ``"front"``, or ``"back"``. See
+                :meth:`BaseDetector.intersect`.
         """
         geometry = FinitePlaneGeometry(aperture_radius=aperture_radius)
-        super().__init__(cs, geometry, name=name, absorb=absorb)
+        super().__init__(cs, geometry, name=name, absorb=absorb, side=side)
         self.num_bins_theta = int(num_bins_theta)
         self.num_bins_phi = int(num_bins_phi)
 
@@ -120,7 +124,7 @@ class FarFieldDetector(BaseDetector):
         lz = be.where(hit_mask, dirs_l[:, 2], zero)
 
         # theta is the angle from the local +z axis
-        cos_theta = be.clip(be.abs(lz), 0.0, 1.0)
+        cos_theta = self._cos_theta(lz)
         theta_deg = be.degrees(be.arccos(cos_theta))
         phi_deg = be.degrees(be.arctan2(ly, lx))
 
@@ -152,6 +156,26 @@ class FarFieldDetector(BaseDetector):
         # Track the radiometric flux separately: _intensity is divided by the
         # per-bin solid angle, so summing it gives W/sr, not W.
         self._total_flux.add(masked_sum(rays.flux, hit_mask))
+
+    def _cos_theta(self, lz):
+        """Polar cosine of each hit direction from its local z component.
+
+        A flat far-field detector is a plane and is reached from either
+        side, so the two sides fold together onto one polar angle: a ray
+        leaving along -z is binned at the same theta as one leaving along
+        +z. A collector that is closed on one side only -- the
+        hemispherical one -- overrides this, because there the sign of the
+        direction is the physical hemisphere, not an ambiguity. Backend
+        operations only: this runs on the device path of :meth:`record`.
+
+        Args:
+            lz: Local z direction component per ray, shape (N,), already
+                masked to zero for rays that did not hit.
+
+        Returns:
+            ``cos(theta)`` in [0, 1], shape (N,).
+        """
+        return be.clip(be.abs(lz), 0.0, 1.0)
 
     def get_result(self) -> FarFieldPattern:
         """Return the accumulated far-field pattern.

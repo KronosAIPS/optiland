@@ -157,6 +157,9 @@ def _lower_geometry(geometry: object) -> tuple[str, dict[str, Any]]:
     from optiland.nonsequential.components.geometry.analytic.sphere import (  # noqa: PLC0415
         SphereGeometry,
     )
+    from optiland.nonsequential.components.geometry.analytic.spherical_cavity import (  # noqa: PLC0415
+        SphericalCavityGeometry,
+    )
     from optiland.nonsequential.components.geometry.mesh.mesh_geometry import (  # noqa: PLC0415
         MeshGeometry,
     )
@@ -195,6 +198,19 @@ def _lower_geometry(geometry: object) -> tuple[str, dict[str, Any]]:
         return "sphere", {
             "radius": geometry.radius,
             "aperture_radius": geometry.aperture_radius,
+        }
+    if isinstance(geometry, SphericalCavityGeometry):
+        # Ports are plain data -- axis and angular radius -- so the cavity
+        # round-trips through the IR's JSON without a geometry object.
+        return "spherical_cavity", {
+            "radius": geometry.radius,
+            "ports": [
+                {
+                    "axis": list(port.unit_axis),
+                    "half_angle_deg": float(port.half_angle_deg),
+                }
+                for port in geometry.ports
+            ],
         }
     if isinstance(geometry, MeshGeometry):
         mesh = geometry.mesh
@@ -391,6 +407,9 @@ def _lower_detector(idx: int, detector: object) -> SensorIR:
     from optiland.nonsequential.detectors.far_field import (
         FarFieldDetector,  # noqa: PLC0415
     )
+    from optiland.nonsequential.detectors.hemisphere import (
+        HemisphereDetector,  # noqa: PLC0415
+    )
     from optiland.nonsequential.detectors.irradiance import (
         IrradianceDetector,  # noqa: PLC0415
     )
@@ -423,12 +442,24 @@ def _lower_detector(idx: int, detector: object) -> SensorIR:
             "num_pixels_y": detector.num_pixels_y,
             "splat": detector.splat,
             "splat_sigma": detector.splat_sigma,
+            "side": detector.side,
+        }
+    elif isinstance(detector, HemisphereDetector):
+        # Before FarFieldDetector: the hemispherical collector is a
+        # subclass of it, and lowering it as a flat far-field detector
+        # would drop the shell radius from the IR.
+        kind = "hemisphere"
+        params = {
+            "radius": detector.radius,
+            "num_bins_theta": detector.num_bins_theta,
+            "num_bins_phi": detector.num_bins_phi,
         }
     elif isinstance(detector, FarFieldDetector):
         kind = "far_field"
         params = {
             "num_bins_theta": detector.num_bins_theta,
             "num_bins_phi": detector.num_bins_phi,
+            "side": detector.side,
         }
     elif isinstance(detector, RayDatabaseDetector):
         kind = "ray_database"

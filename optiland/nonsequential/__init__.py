@@ -70,13 +70,14 @@ Public API (selected)::
         ConicGeometry, FinitePlaneGeometry, MeshGeometry, SphereGeometry,
         ParaboloidGeometry, PlaneGeometry,
         CylindricalFrustumGeometry, AnnularPlaneGeometry,
+        SphericalCavityGeometry, SphericalPort,
         # BSDF
         SpecularBRDF, LambertianBSDF, HarveyShackBSDF, TabulatedBSDF,
         # Detectors
         IrradianceDetector, FarFieldDetector, SpectralDetector,
-        RayDatabaseDetector,
+        RayDatabaseDetector, HemisphereDetector,
         IrradianceDetectorConfig, FarFieldDetectorConfig,
-        SpectralDetectorConfig, RayDatabaseConfig,
+        SpectralDetectorConfig, RayDatabaseConfig, HemisphereDetectorConfig,
         # Materials
         NSQMaterial, VACUUM,
         # Conversion from a sequential Optic
@@ -258,6 +259,8 @@ from optiland.nonsequential.components.geometry import (
     ParaboloidGeometry,
     PlaneGeometry,
     SphereGeometry,
+    SphericalCavityGeometry,
+    SphericalPort,
 )
 from optiland.nonsequential.components.geometry.analytic import (
     AnnularPlaneGeometry,
@@ -273,6 +276,8 @@ from optiland.nonsequential.detectors import (
     DetectorRegistry,
     FarFieldDetector,
     FarFieldDetectorConfig,
+    HemisphereDetector,
+    HemisphereDetectorConfig,
     IrradianceDetector,
     IrradianceDetectorConfig,
     RayDatabaseConfig,
@@ -365,6 +370,8 @@ __all__ = [
     "ParaboloidGeometry",
     "PlaneGeometry",
     "SphereGeometry",
+    "SphericalCavityGeometry",
+    "SphericalPort",
     # BSDF
     "HarveyShackBSDF",
     "LambertianBSDF",
@@ -375,6 +382,8 @@ __all__ = [
     "DetectorRegistry",
     "FarFieldDetector",
     "FarFieldDetectorConfig",
+    "HemisphereDetector",
+    "HemisphereDetectorConfig",
     "IrradianceDetector",
     "IrradianceDetectorConfig",
     "RayDatabaseDetector",

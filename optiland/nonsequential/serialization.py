@@ -576,6 +576,9 @@ def _serialize_detector(name: str, detector: Any) -> dict:
     from optiland.nonsequential.detectors.far_field import (  # noqa: PLC0415
         FarFieldDetector,
     )
+    from optiland.nonsequential.detectors.hemisphere import (  # noqa: PLC0415
+        HemisphereDetector,
+    )
     from optiland.nonsequential.detectors.irradiance import (  # noqa: PLC0415
         IrradianceDetector,
     )
@@ -600,6 +603,7 @@ def _serialize_detector(name: str, detector: Any) -> dict:
             "splat": detector.splat,
             "splat_sigma": _to_float(detector.splat_sigma),
             "absorb": bool(detector.absorb),
+            "side": detector.side,
         }
 
     if isinstance(detector, SpectralDetector):
@@ -620,6 +624,20 @@ def _serialize_detector(name: str, detector: Any) -> dict:
             "absorb": bool(detector.absorb),
         }
 
+    # Before FarFieldDetector: the hemispherical collector is a subclass of
+    # it, and would otherwise serialize as a flat far-field detector and
+    # come back as one, silently losing the shell.
+    if isinstance(detector, HemisphereDetector):
+        return {
+            "type": "hemisphere",
+            "name": name,
+            "cs": cs_d,
+            "radius": _to_float(detector.radius),
+            "num_bins_theta": int(detector.num_bins_theta),
+            "num_bins_phi": int(detector.num_bins_phi),
+            "absorb": bool(detector.absorb),
+        }
+
     if isinstance(detector, FarFieldDetector):
         return {
             "type": "far_field",
@@ -628,6 +646,7 @@ def _serialize_detector(name: str, detector: Any) -> dict:
             "num_bins_theta": int(detector.num_bins_theta),
             "num_bins_phi": int(detector.num_bins_phi),
             "absorb": bool(detector.absorb),
+            "side": detector.side,
         }
 
     if isinstance(detector, RayDatabaseDetector):
@@ -644,8 +663,8 @@ def _serialize_detector(name: str, detector: Any) -> dict:
 
     raise TypeError(
         f"Cannot serialize detector '{name}' of type '{type(detector).__name__}'. "
-        "Only IrradianceDetector, SpectralDetector, FarFieldDetector, and "
-        "RayDatabaseDetector are supported."
+        "Only IrradianceDetector, SpectralDetector, FarFieldDetector, "
+        "HemisphereDetector, and RayDatabaseDetector are supported."
     )
 
 
@@ -661,6 +680,7 @@ def _deserialize_detector(d: dict, scene: NSQScene) -> None:
     """
     from optiland.nonsequential.detectors.configs import (  # noqa: PLC0415
         FarFieldDetectorConfig,
+        HemisphereDetectorConfig,
         IrradianceDetectorConfig,
         RayDatabaseConfig,
         SpectralDetectorConfig,
@@ -679,6 +699,7 @@ def _deserialize_detector(d: dict, scene: NSQScene) -> None:
             splat=d.get("splat", "bilinear"),
             splat_sigma=d.get("splat_sigma", 0.5),
             absorb=d.get("absorb", True),
+            side=d.get("side", "both"),
         )
         scene.add_detector(name, cs, config)
 
@@ -702,6 +723,16 @@ def _deserialize_detector(d: dict, scene: NSQScene) -> None:
             num_theta=d.get("num_bins_theta", 90),
             num_phi=d.get("num_bins_phi", 360),
             absorb=d.get("absorb", True),
+            side=d.get("side", "both"),
+        )
+        scene.add_detector(name, cs, config)
+
+    elif dtype == "hemisphere":
+        config = HemisphereDetectorConfig(
+            radius=d["radius"],
+            num_theta=d.get("num_bins_theta", 18),
+            num_phi=d.get("num_bins_phi", 36),
+            absorb=d.get("absorb", True),
         )
         scene.add_detector(name, cs, config)
 
@@ -716,7 +747,8 @@ def _deserialize_detector(d: dict, scene: NSQScene) -> None:
     else:
         raise ValueError(
             f"Unknown detector type '{dtype}' in NSQ JSON. "
-            "Expected 'irradiance', 'spectral', 'far_field', or 'ray_database'."
+            "Expected 'irradiance', 'spectral', 'far_field', 'hemisphere', "
+            "or 'ray_database'."
         )
 
 

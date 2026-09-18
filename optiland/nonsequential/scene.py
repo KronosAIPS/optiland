@@ -216,8 +216,8 @@ class NSQScene:
             name: Unique string name for the detector.
             cs: Coordinate system for the detector.
             config: Detector config dataclass (IrradianceDetectorConfig,
-                SpectralDetectorConfig, FarFieldDetectorConfig, or
-                RayDatabaseConfig).
+                SpectralDetectorConfig, FarFieldDetectorConfig,
+                HemisphereDetectorConfig, or RayDatabaseConfig).
         """
         detector = _build_detector(cs, config)
         self.detector_registry.add(name, detector)
@@ -512,12 +512,16 @@ def _build_detector(cs: CoordinateSystem, config) -> object:
     """
     from optiland.nonsequential.detectors.configs import (  # noqa: PLC0415
         FarFieldDetectorConfig,
+        HemisphereDetectorConfig,
         IrradianceDetectorConfig,
         RayDatabaseConfig,
         SpectralDetectorConfig,
     )
     from optiland.nonsequential.detectors.far_field import (
         FarFieldDetector,  # noqa: PLC0415
+    )
+    from optiland.nonsequential.detectors.hemisphere import (
+        HemisphereDetector,  # noqa: PLC0415
     )
     from optiland.nonsequential.detectors.irradiance import (
         IrradianceDetector,  # noqa: PLC0415
@@ -539,6 +543,7 @@ def _build_detector(cs: CoordinateSystem, config) -> object:
             splat=config.splat,
             splat_sigma=config.splat_sigma,
             absorb=config.absorb,
+            side=config.side,
         )
     if isinstance(config, SpectralDetectorConfig):
         wl_bins = be.linspace(config.wl_min, config.wl_max, config.num_bins + 1)
@@ -557,6 +562,15 @@ def _build_detector(cs: CoordinateSystem, config) -> object:
         return FarFieldDetector(
             cs=cs,
             theta_max_deg=90.0,
+            num_bins_theta=config.num_theta,
+            num_bins_phi=config.num_phi,
+            absorb=config.absorb,
+            side=config.side,
+        )
+    if isinstance(config, HemisphereDetectorConfig):
+        return HemisphereDetector(
+            cs=cs,
+            radius=config.radius,
             num_bins_theta=config.num_theta,
             num_bins_phi=config.num_phi,
             absorb=config.absorb,
