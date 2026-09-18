@@ -254,7 +254,14 @@ class BaseComponent(ABC):
         z_g = rays.z + t_safe * rays.N
 
         cached = self._local_root
-        if cached is not None and cached[0].shape == t.shape:
+        # Same array type as well as same shape: a cache left over from a
+        # trace on the other backend would otherwise reach a mixed
+        # NumPy/Torch comparison below.
+        if (
+            cached is not None
+            and type(cached[0]) is type(t)
+            and cached[0].shape == t.shape
+        ):
             t_adv, t_local = cached
             # Per-ray, elementwise: no reduction, so no device-to-host sync.
             usable = hit_mask & (t_adv + t_local == t)
