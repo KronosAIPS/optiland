@@ -12,6 +12,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.backend.utils import is_torch_tensor, to_numpy
+from optiland.nonsequential import _tol
 from optiland.nonsequential.components.base import _get_transform
 
 if TYPE_CHECKING:
@@ -187,8 +188,11 @@ class BaseDetector(ABC):
         positions_l = (positions_g - t_arr) @ R_arr
         directions_l = directions_g @ R_arr
 
+        # Self-intersection accept threshold from the ray's *global*-frame
+        # magnitude -- see BaseComponent.intersect for why global, not local.
+        t_min = _tol.accept_t_min(be.abs(positions_g).max())
         t_hit, normals_l, hit_mask, _n_geom_l = self.geometry.ray_intersect(
-            positions_l, directions_l
+            positions_l, directions_l, eps=t_min
         )
 
         # Geometry may return numpy arrays even in torch-backend mode (geometry
@@ -198,10 +202,12 @@ class BaseDetector(ABC):
         normals_l = be.array(normals_l)
         hit_mask = be.array(hit_mask)
 
-        # T_EPSILON guard: prevent self-intersection
-        T_EPSILON = 1e-9
-        t_hit = be.where(t_hit > T_EPSILON, t_hit, be.full_like(t_hit, be.inf))
-        hit_mask = hit_mask & (t_hit > T_EPSILON)
+        # Note the accept/reject decision before overwriting t_hit -- see
+        # BaseComponent.intersect for why checking the post-overwrite value
+        # would be vacuous.
+        accepted = t_hit > t_min
+        t_hit = be.where(accepted, t_hit, be.full_like(t_hit, be.inf))
+        hit_mask = hit_mask & accepted
 
         alive_be = be.array(rays.alive)
         t_hit = be.where(alive_be, t_hit, be.full_like(t_hit, be.inf))
