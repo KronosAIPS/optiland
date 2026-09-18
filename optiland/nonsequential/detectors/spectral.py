@@ -105,9 +105,10 @@ class SpectralDetector(BaseDetector):
         n_lambda = len(wavelength_bins) - 1
         self._n_lambda = n_lambda
 
-        # Flat accumulation buffer: shape (ny * nx * n_lambda,). Always
-        # float64, on the active backend and device, mutated in place by
-        # every record() call -- see detectors/base.py. Flat index for
+        # Flat accumulation buffer: shape (ny * nx * n_lambda,). The widest
+        # float the device has (float64; float32 on Apple's mps), on the
+        # active backend and device, mutated in place by every record()
+        # call -- see accumulator_dtype in detectors/base.py. Flat index for
         # (iy, ix, iwl) is (iy * nx + ix) * n_lambda + iwl.
         self._flux_map = _new_flat_accumulator(num_pixels_y * num_pixels_x * n_lambda)
         self._num_rays_hit = 0

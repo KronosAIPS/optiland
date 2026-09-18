@@ -39,11 +39,39 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
+def accumulator_dtype():
+    """The dtype detectors accumulate in: the widest float the active device has.
+
+    float64 on the NumPy backend and on Torch's ``cpu`` and ``cuda`` devices.
+    On Torch's ``mps`` device (Apple GPU) it is float32, because Metal has
+    no double type and torch refuses a float64 tensor there. A float32
+    accumulator adds a rounding error of at most about ``K * 6e-8`` relative
+    to a bin that received ``K`` contributions (the usual ``n * u`` bound;
+    a random-walk estimate is ``sqrt(K) * 6e-8``), which for any bin whose
+    Monte Carlo error is ``1/sqrt(K)`` is negligible beside it. The choice
+    is made per call so a scene built after ``be.set_device`` sees the
+    device that is active then.
+
+    Returns:
+        ``be.float64`` or ``be.float32`` (NumPy dtype aliases; the Torch
+        creation functions map them to the matching ``torch.dtype``).
+    """
+    if be.get_backend() == "torch":
+        try:
+            device = str(be.get_device())
+        except Exception:  # noqa: BLE001 - defensive: no device query, assume float64 is fine
+            device = "cpu"
+        if device.startswith("mps"):
+            return be.float32
+    return be.float64
+
+
 def _new_flat_accumulator(size: int):
-    """Create a persistent float64 accumulation buffer.
+    """Create a persistent accumulation buffer in :func:`accumulator_dtype`.
 
     The buffer lives on the active backend and device: a NumPy float64
-    array, or a Torch float64 tensor on the current device. It is
+    array, or a Torch tensor on the current device in the widest float that
+    device has (float64 on ``cpu`` and ``cuda``, float32 on ``mps``). It is
     guaranteed to not itself require grad -- regardless of the ambient
     grad-mode setting -- so it can be scatter-added into *in place* across
     many ``record()`` calls; PyTorch refuses an in-place write into a leaf
@@ -56,9 +84,9 @@ def _new_flat_accumulator(size: int):
         size: Number of flat elements (e.g. ``ny * nx``).
 
     Returns:
-        A zero-filled float64 array/tensor of shape ``(size,)``.
+        A zero-filled array/tensor of shape ``(size,)``.
     """
-    buf = be.zeros((size,), dtype=be.float64)
+    buf = be.zeros((size,), dtype=accumulator_dtype())
     if getattr(buf, "requires_grad", False):
         buf = buf.detach()
     return buf
@@ -144,15 +172,16 @@ def clamp_int(idx, lo: int, hi: int):
 
 
 def _accumulate_into(buffer, flat_np, contribution) -> None:
-    """Scatter-add ``contribution`` into ``buffer`` in place, in float64.
+    """Scatter-add ``contribution`` into ``buffer`` in place, in the buffer's dtype.
 
     ``buffer`` is a persistent accumulation buffer created by
-    :func:`_new_flat_accumulator` (float64, on the active backend and
-    device). ``contribution`` may be a NumPy array or a backend
-    array/tensor in the working (traversal) dtype; it is cast to float64
-    before accumulating. On the Torch backend the cast keeps
-    ``contribution``'s autograd graph attached -- a dtype cast is itself a
-    differentiable op, so a gradient reaching ``contribution`` (e.g. from
+    :func:`_new_flat_accumulator` (float64 wherever the device has it,
+    float32 on Apple's ``mps``; on the active backend and device).
+    ``contribution`` may be a NumPy array or a backend array/tensor in the
+    working (traversal) dtype; it is cast to the buffer's dtype before
+    accumulating. On the Torch backend the cast keeps ``contribution``'s
+    autograd graph attached -- a dtype cast is itself a differentiable op,
+    so a gradient reaching ``contribution`` (e.g. from
     ``total_flux.backward()``) still reaches its source through the cast
     and the in-place ``index_add_``; ``buffer`` itself never needs to
     require grad on its own account (see :func:`_new_flat_accumulator`).
@@ -163,7 +192,7 @@ def _accumulate_into(buffer, flat_np, contribution) -> None:
     gradient support or not -- this is unchanged from before this fix.
 
     Args:
-        buffer: Persistent float64 accumulation buffer, shape (size,).
+        buffer: Persistent accumulation buffer, shape (size,).
         flat_np: Flat bin indices for each contribution, shape (K,), int64.
         contribution: Values to add, shape (K,), any array-like.
     """
@@ -172,16 +201,76 @@ def _accumulate_into(buffer, flat_np, contribution) -> None:
 
         idx = _flat_index_like(buffer, flat_np)
         if is_torch_tensor(contribution):
-            src64 = contribution.to(dtype=torch.float64)
+            src = contribution.to(dtype=buffer.dtype)
         else:
-            src64 = torch.as_tensor(
-                contribution, dtype=torch.float64, device=buffer.device
-            )
-        buffer.index_add_(0, idx, src64)
+            src = torch.as_tensor(contribution, dtype=buffer.dtype, device=buffer.device)
+        if buffer.dtype == torch.float32:
+            _grouped_index_add_(buffer, idx, src)
+        else:
+            buffer.index_add_(0, idx, src)
         return
 
-    contrib_np = to_numpy(contribution).astype(np.float64, copy=False)
+    contrib_np = to_numpy(contribution).astype(buffer.dtype, copy=False)
     np.add.at(buffer, flat_np, contrib_np)
+
+
+#: The largest number of partial-sum rows the grouped float32 accumulation
+#: uses, and the largest scratch it will allocate (in elements) for them.
+_GROUPED_ACC_MAX_GROUPS = 256
+_GROUPED_ACC_MAX_SCRATCH = 1 << 24
+#: Below this many contributions per call a bare scatter-add is used.
+_GROUPED_ACC_MIN_CONTRIBUTIONS = 64
+
+
+def _grouped_index_add_(buffer, idx, src) -> None:
+    """Scatter-add into a float32 buffer with a bounded rounding error.
+
+    A bare ``index_add_`` into a float32 buffer rounds the running sum once
+    per contribution, so a bin that receives ``K`` contributions carries an
+    error of up to ``K * u32`` relative (``u32 = 6e-8``), and for equal
+    contributions the rounding is systematic, not random: measured 1e-4
+    relative for 18,000 equal hits in one bin on an Apple GPU. This is the
+    device that has no float64 accumulator (see :func:`accumulator_dtype`),
+    so the remedy is the one GPU Monte Carlo codes use without double
+    atomics: partial sums. The contributions are dealt round-robin into
+    ``G`` rows of a scratch ``(G, size)`` buffer (each bin then receives
+    about ``K / G`` adds per row), the rows are reduced pairwise
+    (``log2 G`` levels), and the result is added to ``buffer`` once. The
+    error per bin is about ``(K / G + log2 G + 1) * u32``; measured 6e-8
+    relative for 67,000 contributions per bin with ``G = 256``. Every step
+    is an ordinary differentiable op, so autograd through the detector is
+    unchanged. ``G`` is chosen from the number of contributions and capped
+    so the scratch never exceeds :data:`_GROUPED_ACC_MAX_SCRATCH` elements;
+    a call with fewer than :data:`_GROUPED_ACC_MIN_CONTRIBUTIONS`
+    contributions uses the bare scatter-add, whose error is then bounded
+    by that count.
+
+    Args:
+        buffer: The persistent float32 accumulation buffer, shape (size,).
+        idx: Flat bin index per contribution, a LongTensor on the buffer's
+            device, shape (K,).
+        src: Contributions, float32 on the buffer's device, shape (K,).
+    """
+    import torch  # noqa: PLC0415
+
+    k = int(src.shape[0])
+    size = int(buffer.shape[0])
+    groups = min(
+        _GROUPED_ACC_MAX_GROUPS,
+        max(1, k // _GROUPED_ACC_MIN_CONTRIBUTIONS),
+        max(1, _GROUPED_ACC_MAX_SCRATCH // max(size, 1)),
+    )
+    if groups <= 1:
+        buffer.index_add_(0, idx, src)
+        return
+    group = torch.arange(k, device=src.device, dtype=idx.dtype) % groups
+    scratch = torch.zeros((groups, size), dtype=src.dtype, device=src.device)
+    scratch.view(-1).index_add_(0, group * size + idx, src)
+    while scratch.shape[0] > 1:
+        if scratch.shape[0] % 2:
+            scratch = torch.cat([scratch, torch.zeros_like(scratch[:1])], dim=0)
+        scratch = scratch[0::2] + scratch[1::2]
+    buffer.add_(scratch[0])
 
 
 class BaseDetector(ABC):

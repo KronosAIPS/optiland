@@ -68,8 +68,9 @@ class FarFieldDetector(BaseDetector):
         self.num_bins_phi = int(num_bins_phi)
 
         # Flat accumulation buffer: shape (num_bins_theta * num_bins_phi,).
-        # Always float64, on the active backend and device, mutated in
-        # place by every record() call -- see detectors/base.py.
+        # The widest float the device has (float64; float32 on Apple's mps),
+        # on the active backend and device, mutated in place by every
+        # record() call -- see accumulator_dtype in detectors/base.py.
         self._intensity = _new_flat_accumulator(num_bins_theta * num_bins_phi)
         self._num_rays_hit = 0
         self._total_flux = 0.0

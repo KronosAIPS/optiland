@@ -88,9 +88,11 @@ class IrradianceDetector(BaseDetector):
         self.splat = splat
         self.splat_sigma = as_float(splat_sigma)
 
-        # Flat accumulation buffer: shape (ny * nx,). Always float64 (the
-        # accumulation dtype A), whatever the working/traversal dtype T is
-        # (docs/theory/08_precision.md R-08-1) -- and mutated in place by
+        # Flat accumulation buffer: shape (ny * nx,). The accumulation dtype A
+        # is the widest float the device has (float64; float32 on Apple's mps,
+        # see accumulator_dtype in detectors/base.py), whatever the
+        # working/traversal dtype T is (docs/theory/08_precision.md R-08-1)
+        # -- and mutated in place by
         # every record() call (see _accumulate_into in detectors/base.py),
         # so a bounce never reallocates the pixel buffer.
         self._data = _new_flat_accumulator(num_pixels_y * num_pixels_x)
@@ -357,7 +359,7 @@ class IrradianceDetector(BaseDetector):
     def reset(self) -> None:
         """Clear accumulated data.
 
-        Re-initialises the internal buffer to a fresh float64 accumulator,
+        Re-initialises the internal buffer to a fresh accumulator,
         disconnecting it from the previous trace's computation graph.
         """
         self._data = _new_flat_accumulator(self.num_pixels_y * self.num_pixels_x)

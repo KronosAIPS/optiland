@@ -49,9 +49,7 @@ class Layer:
         # S'assurer que n et k sont des arrays broadcastables
         n = be.atleast_1d(n)
         k = be.atleast_1d(k)
-        return be._lib.asarray(n, dtype=be._lib.complex128) + 1j * be._lib.asarray(
-            k, dtype=be._lib.complex128
-        )
+        return be.to_complex(n) + 1j * be.to_complex(k)
 
     def phase_thickness(
         self,

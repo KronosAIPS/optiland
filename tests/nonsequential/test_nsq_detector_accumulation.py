@@ -6,9 +6,14 @@ Three things are exercised, matching the fix's own requirements:
    *in place*: the buffer's identity (and, on Torch, its storage) does not
    change across ``record()`` calls, so a bounce never reallocates the
    pixel buffer.
-2. The buffer is always float64 (the accumulation dtype), whatever the
-   working/traversal dtype is -- checked here on the Torch backend at
-   float32 precision.
+2. The buffer is float64 (the accumulation dtype) wherever the device has
+   float64, whatever the working/traversal dtype is -- checked here on the
+   Torch backend at float32 precision on the CPU. On Apple's ``mps`` device
+   the accumulator is float32 (Metal has no double type) and the scatter-add
+   goes through a grouped pairwise reduction whose error is bounded by about
+   (K / G + log2 G + 1) units of float32 roundoff per bin instead of K; the
+   grouped reduction is checked on the CPU against a float64 sum, and the
+   mps dtype choice when the device is present.
 3. A gradient still flows through the in-place accumulation on the Torch
    backend.
 
@@ -191,6 +196,61 @@ class TestAccumulationDtype:
                 f"float32 contributions: rel_err={rel_err:.3e}"
             )
         finally:
+            be.set_precision("float64")
+            _reset_backend()
+
+
+class TestFloat32AccumulatorOnDevicesWithoutFloat64:
+    """The accumulator on a device without float64 (Apple's mps): float32, with
+    the grouped pairwise reduction bounding the rounding error."""
+
+    def test_grouped_scatter_add_matches_float64_sum_to_machine_precision(self):
+        """20,000 equal contributions into one bin: a bare float32 scatter-add
+        rounds the running sum once per add (a systematic error of order
+        K * u32 = 1.2e-3 relative for equal terms); the grouped reduction keeps
+        it within a few units of float32 roundoff. Tolerance derived from the
+        stated bound (K / G + log2 G + 1) * u32 with G = 256: about 9e-6, asserted
+        at 1e-5; the bare scatter-add is asserted to be worse than 1e-4 so the
+        test would notice if the grouped path were bypassed."""
+        from optiland.nonsequential.detectors.base import _grouped_index_add_
+
+        k, size = 20_000, 8
+        src = torch.full((k,), 5.0e-5, dtype=torch.float32)
+        idx = torch.zeros(k, dtype=torch.int64)
+        exact = float(src.double().sum())
+        grouped = torch.zeros(size, dtype=torch.float32)
+        _grouped_index_add_(grouped, idx, src)
+        bare = torch.zeros(size, dtype=torch.float32).index_add_(0, idx, src)
+        assert abs(float(grouped[0]) - exact) / exact < 1e-5
+        assert abs(float(bare[0]) - exact) / exact > 1e-4
+        assert float(grouped[1:].abs().sum()) == 0.0
+
+    def test_grouped_scatter_add_keeps_the_gradient(self):
+        from optiland.nonsequential.detectors.base import _grouped_index_add_
+
+        src = torch.full((4096,), 1.0e-3, dtype=torch.float32, requires_grad=True)
+        idx = torch.arange(4096, dtype=torch.int64) % 3
+        buf = torch.zeros(3, dtype=torch.float32)
+        _grouped_index_add_(buf, idx, src)
+        buf.sum().backward()
+        assert torch.allclose(src.grad, torch.ones_like(src))
+
+    def test_accumulator_dtype_follows_the_device(self):
+        from optiland.nonsequential.detectors.base import accumulator_dtype
+
+        be.set_backend("torch")
+        try:
+            be.set_precision("float32")
+            be.set_device("cpu")
+            assert accumulator_dtype() == be.float64
+            if torch.backends.mps.is_available():
+                be.set_device("mps")
+                assert accumulator_dtype() == be.float32
+                det = IrradianceDetector(CoordinateSystem(), width=10.0, height=10.0,
+                                         num_pixels_x=4, num_pixels_y=4, splat="hard")
+                assert det._data.dtype == torch.float32 and det._data.device.type == "mps"
+        finally:
+            be.set_device("cpu")
             be.set_precision("float64")
             _reset_backend()
 
