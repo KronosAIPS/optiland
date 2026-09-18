@@ -24,10 +24,11 @@ Three primitives:
   power of two" shortcut that a pure-Python reference script uses when it
   cannot ask NumPy or Torch directly. The two agree to within a factor of 2
   (rounding to the exact binade vs. the next one up) -- either is a safe
-  self-intersection guard at the ``k~25`` scale this module defaults to,
-  because both sit four-plus orders of magnitude above the self-intersection
-  artifacts they exist to reject (~1e-6 mm, measured in
-  ``NS2_precision_and_torch_measurements.md`` section 4). [derived]
+  self-intersection guard at the scale this module defaults to,
+  because both sit comfortably above the self-intersection residual they
+  exist to reject, which is half an ulp of the ray's own coordinate once
+  the hit point is built in the surface's frame (see
+  :data:`DEFAULT_ACCEPT_K`). [measured]
 
 - :func:`accept_t_min` -- the minimum accepted ray parameter ``t``, expressed
   as ``k`` ulps of a representative coordinate magnitude (with a 1.0 mm floor
@@ -65,19 +66,23 @@ from optiland.nonsequential._utils import is_tensor
 if TYPE_CHECKING:
     from optiland._types import ScalarOrArrayT
 
-# Default k for accept_t_min. docs/theory/07_geometry.md R-07-5 documents
-# [8, 64] as sufficient when the accept test is one ulp of coordinate error
-# away from the noise floor. Measured directly against this engine's own
-# conic and frustum intersection arithmetic (each several multiply/subtract
-# operations, not the single-operation idealization the [8, 64] range
-# assumes), the self-intersection residual after a real refraction reaches
-# several hundred to about a thousand ulps of the coordinate magnitude --
-# e.g. 6.8e-12 mm measured at a 50 mm coordinate in float64 (ulp 7.1e-15 mm,
-# so ~960 ulps) -- and a long-path collimated singlet (source at z=-1e6 mm)
-# needs a k this large before the rms spot radius stops drifting with
-# distance; k=1024, one still safely below, was not enough. [measured] See
-# docs/build/W4_tolerances.md for the sweep.
-DEFAULT_ACCEPT_K = 16384
+# Default k for accept_t_min: docs/theory/07_geometry.md R-07-5's own
+# default, inside its documented [8, 64].
+#
+# This was 16384 while the hit point was computed as p + t*d in global
+# coordinates. A hit distance is one number of the size of the whole leg
+# travelled, so it carries u*|t| of rounding, and the ray landed that far
+# off the surface it had just hit -- 5.8e-11 mm in float64 after a 1e6 mm
+# leg, eight thousand ulps of the 50 mm coordinate it landed at -- which
+# only a threshold that large could reject. The hit point is now rebuilt in
+# the surface's own frame from the advance and the residual separately
+# (BaseComponent.advance_to_hit), which puts the ray back on the surface to
+# half an ulp of its own coordinate: measured over the singlet's conic
+# surfaces, max 3.60e-15 mm at a 55 mm coordinate in float64 (0.51 ulp) and
+# max 2.00e-06 mm in float32 (0.52 ulp), at every source distance from 0 to
+# 1e6 mm. [measured] k=16 leaves a factor of 30 above that floor. See
+# docs/build/X1_threshold_arithmetic.md.
+DEFAULT_ACCEPT_K = 16
 
 # Coordinate-magnitude floor [mm] for accept_t_min: a ray whose local origin
 # is at (or very near) the coordinate origin still needs a non-zero minimum
@@ -133,8 +138,8 @@ def accept_t_min(
             1.0 (in whatever units ``origin_magnitude`` carries -- mm
             throughout this package) so a ray already at the local origin
             still gets a non-zero threshold.
-        k: Multiple of the local ulp. Default 25, within the documented
-            [8, 64] range.
+        k: Multiple of the local ulp. Default
+            :data:`DEFAULT_ACCEPT_K`, inside the documented [8, 64] range.
 
     Returns:
         The threshold, same backend/dtype as ``origin_magnitude``.

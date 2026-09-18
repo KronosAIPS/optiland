@@ -75,6 +75,11 @@ class BaseComponent(ABC):
         self.bsdf = bsdf
         self.name = name
         self.scatter_fraction = as_param(scatter_fraction)
+        # The two parts of the last solved hit distance -- see intersect()
+        # and advance_to_hit(). Not scene state: transient per-bounce
+        # scratch, rewritten by every intersect() call and validated
+        # per-ray before use.
+        self._local_root: tuple[np.ndarray, np.ndarray] | None = None
 
     def intersect(
         self, rays: NSQRayBundle
@@ -139,7 +144,15 @@ class BaseComponent(ABC):
         # tighter than the rounding error actually carried in the ray's
         # tracked position, reintroducing self-hit instability rather than
         # removing it.
-        t_min = _tol.accept_t_min(be.abs(positions_g).max())
+        #
+        # Per ray, not one scalar for the whole bundle: the rounding a ray's
+        # own position carries is set by that ray's own coordinate, and one
+        # distant ray must not coarsen the threshold for every other ray
+        # (at float32 a bundle reaching 1e4 mm would put the threshold at
+        # 1e-2 mm for all of them, which skips a thin plate or a cemented
+        # interface). It also removes a full-bundle reduction to a scalar
+        # from the inner loop, which on a GPU is a device-to-host sync.
+        t_min = _tol.accept_t_min(coordinate_magnitude(rays))
         # A geometry's own root-validity tests compare the LOCAL parameter
         # (t_local) against eps, e.g. "t_local > eps"; what must actually
         # hold is "t_local + t_adv > t_min" (a genuine forward hit in the
@@ -157,6 +170,15 @@ class BaseComponent(ABC):
             positions_adv, directions_l, eps=eps_shifted
         )
         t_hit = t_local + t_adv
+
+        # Keep the advance and the residual as two numbers. Their sum is
+        # what the scene's nearest-hit comparison needs, but the sum alone
+        # cannot place the ray back on the surface: rounding it costs
+        # u*|t_hit|, so a ray that has just travelled a long leg lands that
+        # far off the surface it just hit, and the next bounce's
+        # intersection test finds a root there. advance_to_hit() rebuilds
+        # the hit point from these two parts instead. See its docstring.
+        self._local_root = (t_adv, t_local)
 
         # Note the accept/reject decision before overwriting t_hit: checking
         # the *post*-overwrite value here would always read back either the
@@ -178,6 +200,95 @@ class BaseComponent(ABC):
         n_geom_g = n_geom_l @ R_be.T
 
         return t_hit, normals_g, hit_mask, n_geom_g
+
+    def advance_to_hit(
+        self, rays: NSQRayBundle, t: np.ndarray, hit_mask: np.ndarray
+    ) -> None:
+        """Move every ray in ``hit_mask`` onto its intersection point.
+
+        Not ``p + t*d``. A hit distance is a single number of the size of
+        the whole leg just travelled, so it can only be written down to
+        ``u*|t|``: a ray that comes 1e6 mm to a surface 50 mm from the
+        origin arrives with its position 1e-10 mm off that surface in
+        float64 (measured), even though every coordinate involved is
+        representable a thousand times more finely than that. The next
+        bounce's intersection test then finds a real root at 1e-10 mm and
+        the ray sticks to the surface it has just left. Raising the
+        self-intersection threshold to cover it (the previous cure) makes
+        the engine blind to any surface nearer than that -- at float32 and
+        a 50 mm coordinate it reached 0.06 mm, which skips a thin plate, a
+        cemented interface, or a coating modelled as a surface.
+
+        The distance is therefore never composed before it is used. The
+        intersection was solved from an origin already advanced into the
+        surface's neighbourhood (see :meth:`intersect`), so the residual
+        ``t_local`` is of the order of the part, not of the leg. Rebuilding
+        the hit point in the surface's own frame,
+
+            p = T + (o_adv + t_local * d_local) @ R^T,
+
+        adds one large number, the surface's own position ``T``, and adds
+        it last: the hit point lands on the surface to one ulp of ``T``,
+        whatever the leg was. ``docs/theory/07_geometry.md`` section 7.7
+        (cure 3) and R-07-4.
+
+        The two parts come from this component's own last
+        :meth:`intersect` call, and each ray checks for itself that they
+        still compose to the ``t`` it is being advanced by; a ray whose
+        check fails (a bundle this component has not just intersected --
+        a bounded-splitting snapshot, a direct call in a test) falls back
+        to the plain global update, per ray and without a host sync.
+
+        Args:
+            rays: Ray bundle, updated in place.
+            t: Per-ray hit distance [mm], shape (N,). ``inf`` outside
+                ``hit_mask``.
+            hit_mask: Rays to advance, shape (N,).
+        """
+        # Missed rays carry t = inf; zero it for the differentiable update
+        # so a masked-out be.where branch cannot inject 0 * inf = NaN into
+        # the backward pass.
+        t_safe = be.where(hit_mask, t, be.zeros_like(t))
+        x_g = rays.x + t_safe * rays.L
+        y_g = rays.y + t_safe * rays.M
+        z_g = rays.z + t_safe * rays.N
+
+        cached = self._local_root
+        # Same array type as well as same shape: a cache left over from a
+        # trace on the other backend would otherwise reach a mixed
+        # NumPy/Torch comparison below.
+        if (
+            cached is not None
+            and type(cached[0]) is type(t)
+            and cached[0].shape == t.shape
+        ):
+            t_adv, t_local = cached
+            # Per-ray, elementwise: no reduction, so no device-to-host sync.
+            usable = hit_mask & (t_adv + t_local == t)
+            adv_safe = be.where(usable, t_adv, be.zeros_like(t_adv))
+            loc_safe = be.where(usable, t_local, be.zeros_like(t_local))
+
+            translation, rot = _get_transform(self.cs)
+            t_be = be.array(translation)
+            R_be = be.array(rot)
+            positions_g = be.stack([rays.x, rays.y, rays.z], axis=1)
+            directions_l = be.stack([rays.L, rays.M, rays.N], axis=1) @ R_be
+            # Bitwise the advanced origin intersect() solved from: same
+            # inputs, same operations, and this ray's position has not been
+            # touched since (one bounce moves each ray at exactly one
+            # component).
+            positions_adv = (
+                (positions_g - t_be) @ R_be + adv_safe[:, None] * directions_l
+            )
+            hit_l = positions_adv + loc_safe[:, None] * directions_l
+            hit_g = hit_l @ R_be.T + t_be
+            x_g = be.where(usable, hit_g[:, 0], x_g)
+            y_g = be.where(usable, hit_g[:, 1], y_g)
+            z_g = be.where(usable, hit_g[:, 2], z_g)
+
+        rays.x = be.where(hit_mask, x_g, rays.x)
+        rays.y = be.where(hit_mask, y_g, rays.y)
+        rays.z = be.where(hit_mask, z_g, rays.z)
 
     @abstractmethod
     def interact(
@@ -243,6 +354,25 @@ class BaseComponent(ABC):
         """
         transform = _get_transform(self.cs)
         return self.geometry.bounding_box(transform)
+
+
+def coordinate_magnitude(rays: NSQRayBundle) -> np.ndarray:
+    """Per-ray infinity norm of the global position, shape (N,).
+
+    The scale the ray's own tracked position is resolved at, and so the
+    scale every self-intersection threshold is measured in
+    (docs/theory/07_geometry.md R-07-5). Built from the three coordinate
+    arrays rather than from a stacked (N, 3) array so it costs no extra
+    allocation, and reduced per ray rather than over the bundle so one
+    distant ray cannot coarsen every other ray's threshold.
+
+    Args:
+        rays: The ray bundle, in global coordinates.
+
+    Returns:
+        ``max(|x|, |y|, |z|)`` per ray, in the working backend and dtype.
+    """
+    return be.maximum(be.maximum(be.abs(rays.x), be.abs(rays.y)), be.abs(rays.z))
 
 
 def _get_transform(cs: CoordinateSystem) -> tuple[np.ndarray, np.ndarray]:

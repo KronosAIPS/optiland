@@ -82,15 +82,9 @@ class AbsorbingComponent(BaseComponent):
             forced_branch: Unused -- bounded splitting only applies
                 to ``RefractiveComponent``.
         """
-        # Missed rays carry t = inf; zero it before the position update so the
-        # masked-out be.where branch cannot backpropagate 0 * inf = NaN into
-        # the ray directions.
-        t = be.where(hit_mask, t, be.zeros_like(t))
-
-        # Advance to hit point before killing
-        rays.x = be.where(hit_mask, rays.x + t * rays.L, rays.x)
-        rays.y = be.where(hit_mask, rays.y + t * rays.M, rays.y)
-        rays.z = be.where(hit_mask, rays.z + t * rays.N, rays.z)
+        # Advance to the hit point before killing, rebuilt in this
+        # surface's own frame -- see BaseComponent.advance_to_hit.
+        self.advance_to_hit(rays, t, hit_mask)
 
         # Count absorbed rays (must be alive when they hit)
         hit_alive = hit_mask & rays.alive
