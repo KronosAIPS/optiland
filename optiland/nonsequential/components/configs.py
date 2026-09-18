@@ -51,10 +51,13 @@ class SurfaceConfig:
             surface (e.g. an AR coating). When set, its reflectance/
             transmittance replace the bare Fresnel calculation, so NSQ and
             the sequential engine agree on R. Must be an unpolarized coating
-            (``SimpleCoating``); a ``BaseCoatingPolarized`` instance (Jones-
-            matrix based -- ``FresnelCoating``, ``ThinFilmCoating``, ...)
-            raises ``NotImplementedError`` rather than being silently
-            degraded to its scalar average. Ignored on absorbing surfaces.
+            (``SimpleCoating``, or a
+            ``coating_support.UnpolarizedThinFilmCoating`` wrapping a
+            ``ThinFilmStack`` for an angle- and wavelength-dependent R/T); a
+            ``BaseCoatingPolarized`` instance (Jones-matrix based --
+            ``FresnelCoating``, ``ThinFilmCoating``, ...) raises
+            ``NotImplementedError`` rather than being silently degraded to
+            its scalar average. Ignored on absorbing surfaces.
         aperture_radius: Semi-diameter override [mm].  Overrides the aperture
             computed from the compound config.
         interaction: Force a specific interaction type on this surface.
