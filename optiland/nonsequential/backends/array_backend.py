@@ -501,9 +501,13 @@ class ArrayBackend(TracerBackend):
                     t_min, hit_normals, comp_idx, hit_n_geom = self.intersect_scene(
                         rays, scene.surfaces
                     )
-                    det_t_min, _det_normals, det_idx, det_absorb = intersect_detectors(
-                        rays, scene.detectors
-                    )
+                    (
+                        det_t_min,
+                        _det_normals,
+                        det_idx,
+                        det_absorb,
+                        det_n_geom,
+                    ) = intersect_detectors(rays, scene.detectors)
 
                     # Nearest hit: component vs detector
                     comp_closer = t_min <= det_t_min
@@ -564,14 +568,33 @@ class ArrayBackend(TracerBackend):
                     # transmissive: the hit is recorded (above) and the ray
                     # continues on its unchanged direction.
                     if not self._empty(det_first):
+                        # An absorbing detector is terminal, so the plain
+                        # global advance is all its rays' positions are ever
+                        # used for -- p + t*d carries u*|t| of rounding and
+                        # nothing reads it again.
+                        terminal = det_first & det_absorb
                         dx = det_t_safe * rays.L
                         dy = det_t_safe * rays.M
                         dz = det_t_safe * rays.N
-                        rays.x = be.where(det_first, rays.x + dx, rays.x)
-                        rays.y = be.where(det_first, rays.y + dy, rays.y)
-                        rays.z = be.where(det_first, rays.z + dz, rays.z)
+                        rays.x = be.where(terminal, rays.x + dx, rays.x)
+                        rays.y = be.where(terminal, rays.y + dy, rays.y)
+                        rays.z = be.where(terminal, rays.z + dz, rays.z)
+                        # A transmissive detector is not terminal: the ray
+                        # carries on from where this puts it and the next
+                        # bounce tests the same plane again. It therefore
+                        # gets a surface's treatment -- the hit point
+                        # rebuilt in the detector's own frame, then pushed
+                        # clear of the plane along the geometric normal, or
+                        # a grazing crossing is recorded twice (R-07-6,
+                        # docs/build/X7_grazing_exit.md section 6).
+                        for di, det in enumerate(scene.detectors):
+                            if det.absorb:
+                                continue
+                            crossed = det_first & (det_idx == di)
+                            det.advance_to_hit(rays, det_t_safe, crossed)
+                            det.offset_from_surface(rays, det_n_geom, crossed)
                         rays.bounce = be.where(det_first, rays.bounce + 1, rays.bounce)
-                        rays.alive = rays.alive & ~(det_first & det_absorb)
+                        rays.alive = rays.alive & ~terminal
 
                     # --- component interactions -------------------------
                     # Dispatched from the IR (ir.primitives[i].component_kind

@@ -34,7 +34,7 @@ if TYPE_CHECKING:
 def intersect_detectors(
     rays: NSQRayBundle,
     detectors: list[BaseDetector],
-) -> tuple[object, object, object, object]:
+) -> tuple[object, object, object, object, object]:
     """Find the nearest detector intersection for every ray.
 
     A running minimum over the detector list, in the active backend's own
@@ -52,11 +52,14 @@ def intersect_detectors(
         detectors: ``scene.detectors``.
 
     Returns:
-        ``(t_min, hit_normals, detector_indices, absorbs)``: backend arrays,
-        with ``detector_indices`` an integer array holding ``-1`` where no
-        detector was hit, and ``absorbs`` the hit detector's ``absorb``
-        flag (``True`` where nothing was hit -- the caller only consults it
-        where a detector actually was).
+        ``(t_min, hit_normals, detector_indices, absorbs, hit_n_geom)``:
+        backend arrays, with ``detector_indices`` an integer array holding
+        ``-1`` where no detector was hit, ``absorbs`` the hit detector's
+        ``absorb`` flag (``True`` where nothing was hit -- the caller only
+        consults it where a detector actually was), and ``hit_n_geom`` the
+        geometric (unflipped) normal of the winning detector's surface,
+        which is what a transmitted ray's origin is offset along (R-07-6,
+        R-07-9).
     """
     from optiland.nonsequential.ray_bundle import (  # noqa: PLC0415
         backend_bool_full,
@@ -66,15 +69,17 @@ def intersect_detectors(
     n = rays.num_rays
     t_min = be.ones(n) * be.inf
     hit_normals = be.zeros((n, 3))
+    hit_n_geom = be.zeros((n, 3))
     det_indices = backend_int_full((n,), -1, like=rays.x, bits=32)
     absorbs = backend_bool_full((n,), True, like=rays.alive)
 
     for i, det in enumerate(detectors):
-        t_d, normals_d, hit_d = det.intersect(rays)
+        t_d, normals_d, hit_d, n_geom_d = det.intersect(rays)
         better = hit_d & (t_d < t_min)
 
         t_min = be.where(better, t_d, t_min)
         hit_normals = be.where(better[:, None], normals_d, hit_normals)
+        hit_n_geom = be.where(better[:, None], n_geom_d, hit_n_geom)
         det_indices = be.where(
             better, backend_int_full((n,), i, like=rays.x, bits=32), det_indices
         )
@@ -82,7 +87,7 @@ def intersect_detectors(
             better, backend_bool_full((n,), det.absorb, like=rays.alive), absorbs
         )
 
-    return t_min, hit_normals, det_indices, absorbs
+    return t_min, hit_normals, det_indices, absorbs, hit_n_geom
 
 
 def detector_absorb_mask(

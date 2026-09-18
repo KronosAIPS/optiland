@@ -15,7 +15,9 @@ from optiland.backend.utils import is_torch_tensor, to_numpy
 from optiland.nonsequential import _tol
 from optiland.nonsequential.components.base import (
     _get_transform,
+    advance_to_hit_in_frame,
     coordinate_magnitude,
+    offset_origin_from_surface,
 )
 
 if TYPE_CHECKING:
@@ -232,6 +234,11 @@ class BaseDetector(ABC):
         self._frame = None
         self._tables: dict[str, object] = {}
         self._tables_key = None
+        # The two parts of the last solved hit distance, for a transmissive
+        # detector's hit-point rebuild -- see intersect(). Transient
+        # per-bounce scratch, rewritten by every intersect() call and
+        # validated per ray before use, never scene state.
+        self._local_root: tuple[np.ndarray, np.ndarray] | None = None
 
     def table(self, name: str, values):
         """A constant lookup table of this detector's, resident on the backend.
@@ -296,14 +303,29 @@ class BaseDetector(ABC):
 
     def intersect(
         self, rays: NSQRayBundle
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Find ray intersections with this detector surface.
+
+        An **absorbing** detector is terminal: the ray stops there, its
+        recorded position is never fed back into another intersection, and
+        the solve is the plain one it has always been
+        (``docs/build/X1_threshold_arithmetic.md`` section 7, note 4).
+
+        A **transmissive** detector is not. The ray carries on from the
+        point the loop puts it at and the next bounce tests this same plane
+        again, so the hit point has to be rebuildable in the detector's own
+        frame -- which means solving from an origin advanced into the
+        plane's neighbourhood and keeping the advance and the residual as
+        two numbers, exactly as :meth:`~optiland.nonsequential.components
+        .base.BaseComponent.intersect` does. That is the only difference
+        between the two branches below.
 
         Args:
             rays: Ray bundle in global coordinates.
 
         Returns:
-            Tuple (t, normals, hit_mask) in global frame.
+            Tuple (t, normals, hit_mask, n_geom) in the global frame, with
+            ``n_geom`` the geometric (unflipped) surface normal.
         """
         t_arr, R_arr = self.frame()
 
@@ -318,16 +340,33 @@ class BaseDetector(ABC):
         # rather than local, and why per ray rather than one scalar for the
         # whole bundle.
         t_min = _tol.accept_t_min(coordinate_magnitude(rays))
-        t_hit, normals_l, hit_mask, _n_geom_l = self.geometry.ray_intersect(
-            positions_l, directions_l, eps=t_min
-        )
+
+        if self.absorb:
+            self._local_root = None
+            t_local, normals_l, hit_mask, n_geom_l = self.geometry.ray_intersect(
+                positions_l, directions_l, eps=t_min
+            )
+            t_adv = None
+        else:
+            t_adv = -(positions_l * directions_l).sum(axis=1)
+            positions_adv = positions_l + t_adv[:, None] * directions_l
+            t_local, normals_l, hit_mask, n_geom_l = self.geometry.ray_intersect(
+                positions_adv, directions_l, eps=t_min - t_adv
+            )
 
         # Geometry may return numpy arrays even in torch-backend mode (geometry
         # internals are numpy-based). Convert to the current backend format so
         # that be.where dispatches correctly in both NumPy and Torch paths.
-        t_hit = be.array(t_hit)
+        t_local = be.array(t_local)
         normals_l = be.array(normals_l)
         hit_mask = be.array(hit_mask)
+        n_geom_l = be.array(n_geom_l)
+
+        if t_adv is None:
+            t_hit = t_local
+        else:
+            t_hit = t_local + t_adv
+            self._local_root = (t_adv, t_local)
 
         # Note the accept/reject decision before overwriting t_hit -- see
         # BaseComponent.intersect for why checking the post-overwrite value
@@ -341,7 +380,40 @@ class BaseDetector(ABC):
         hit_mask = hit_mask & alive_be
 
         normals_g = normals_l @ R_arr.T
-        return t_hit, normals_g, hit_mask
+        n_geom_g = n_geom_l @ R_arr.T
+        return t_hit, normals_g, hit_mask, n_geom_g
+
+    def advance_to_hit(self, rays: NSQRayBundle, t, hit_mask) -> None:
+        """Move every ray in ``hit_mask`` onto this detector's plane.
+
+        Only a transmissive detector needs this -- see :meth:`intersect`.
+        An absorbing detector has no ``_local_root``, and the shared helper
+        then falls back to the plain global update per ray.
+
+        Args:
+            rays: Ray bundle, updated in place.
+            t: Per-ray hit distance [mm], shape (N,).
+            hit_mask: Rays that reached this detector, shape (N,).
+        """
+        advance_to_hit_in_frame(
+            rays, t, hit_mask, self._local_root, self.frame()
+        )
+
+    def offset_from_surface(self, rays: NSQRayBundle, n_geom, hit_mask) -> None:
+        """Push a transmitted ray's origin clear of this detector's plane.
+
+        R-07-6, for the same reason a surface needs it: a ray crossing a
+        plane at a grazing angle turns the half-ulp it lands off that plane
+        by into a path-length root above the accept threshold, and the plane
+        records it a second time. Only rays the detector let through are
+        offset; a ray an absorbing detector stopped is terminal.
+
+        Args:
+            rays: Ray bundle, updated in place.
+            n_geom: Geometric surface normal in the global frame, (N, 3).
+            hit_mask: Rays that crossed this detector, shape (N,).
+        """
+        offset_origin_from_surface(rays, n_geom, hit_mask)
 
     @abstractmethod
     def record(self, rays: NSQRayBundle, t: np.ndarray, hit_mask: np.ndarray) -> None:
