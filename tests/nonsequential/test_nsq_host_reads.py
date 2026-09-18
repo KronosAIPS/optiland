@@ -37,10 +37,15 @@ torch = pytest.importorskip("torch", reason="Torch not available")
 import optiland.backend as be
 from optiland.nonsequential import (
     CollimatedSourceConfig,
+    FarFieldDetectorConfig,
+    HarveyShackBSDF,
     IrradianceDetectorConfig,
     LensConfig,
+    MirrorConfig,
     NSQScene,
+    SpectralDetectorConfig,
     Spectrum,
+    SurfaceConfig,
 )
 from optiland.nonsequential.backends.array_backend import ArrayBackend
 from optiland.nonsequential.backends.torch_backend import TorchBackend
@@ -239,6 +244,60 @@ def _singlet() -> NSQScene:
     return scene
 
 
+def _scattering_scene() -> NSQScene:
+    """The three record() paths the singlet does not reach.
+
+    A Harvey-Shack lobe on a mirror, a spectral detector read in
+    transmission on the way out and again on the way back, and a far-field
+    detector behind the source catching the returned beam. Between them
+    they exercise the tabulated inverse-CDF draw, the wavelength binning,
+    the angular binning and the transmissive detector's hit-point rebuild
+    -- every one of which used to copy the ray state to the host once per
+    bounce.
+    """
+    scene = NSQScene()
+    spec = Spectrum.monochromatic(0.55)
+    scene.add_source(
+        "S1",
+        CoordinateSystem(),
+        CollimatedSourceConfig(spectrum=spec, total_flux=1.0, aperture_radius=5.0),
+    )
+    scene.add_detector(
+        "TAP",
+        CoordinateSystem(z=40),
+        SpectralDetectorConfig(
+            width=200,
+            height=200,
+            num_pixels_x=16,
+            num_pixels_y=16,
+            wl_min=0.4,
+            wl_max=0.7,
+            num_bins=4,
+            splat="bilinear",
+            absorb=False,
+        ),
+    )
+    scene.add_mirror(
+        "M1",
+        CoordinateSystem(z=100),
+        MirrorConfig(
+            radius=0.0,
+            reflectance=1.0,
+            aperture_radius=50.0,
+            surface=SurfaceConfig(
+                bsdf=HarveyShackBSDF(b0=1e-3, l0=0.05, s=2.0),
+                scatter_fraction=1.0,
+            ),
+        ),
+    )
+    scene.add_detector(
+        "FF",
+        CoordinateSystem(z=-60),
+        FarFieldDetectorConfig(num_theta=32, num_phi=64),
+    )
+    return scene
+
+
 def _trace_and_count(
     num_rays: int,
     max_depth: int,
@@ -359,3 +418,67 @@ class TestNoHostReadPerBounce:
         # Measured at 66 per bounce on this three-surface scene; the bound
         # allows for a little variation, not for a new site.
         assert per_bounce < 80
+
+
+class TestTheScatteringSceneReadsNothingEither:
+    """The same bound, on the paths the singlet does not reach.
+
+    A Harvey-Shack lobe, a spectral detector and a far-field detector were
+    the three places left that dropped to host NumPy for a whole ``sample``
+    or ``record`` -- four transfers each, per surface or detector, per
+    bounce. The count inside the loop is now the alive check and nothing
+    else, on this scene as on the singlet.
+    """
+
+    def test_the_default_reads_only_the_alive_count(self):
+        counter = _trace_and_count(
+            40_000,
+            max_depth=8,
+            alive_check_every=None,
+            batch_size=10_000,
+            scene_fn=_scattering_scene,
+        )
+        assert counter.bounces >= 8
+        _assert_steady_bounces(counter)
+        recurring = {
+            site: n
+            for site, n in counter.recurring_sites().items()
+            if _UNOWNED not in site and "num_rays_alive" not in site and n > 0
+        }
+        assert recurring == {}, f"per-bounce host reads remain: {recurring}"
+
+    def test_fixed_trip_count_reads_nothing(self):
+        counter = _trace_and_count(
+            40_000,
+            max_depth=8,
+            alive_check_every=0,
+            batch_size=10_000,
+            scene_fn=_scattering_scene,
+        )
+        _assert_steady_bounces(counter)
+        recurring = {
+            site: n
+            for site, n in counter.recurring_sites().items()
+            if _UNOWNED not in site and n > 0
+        }
+        assert recurring == {}, f"per-bounce host reads remain: {recurring}"
+
+    def test_every_detector_and_the_lobe_were_actually_reached(self):
+        """The control: a scene nothing hits would pass the two above."""
+        be.set_backend("torch")
+        be.set_precision("float64")
+        try:
+            result = _scattering_scene().trace(
+                num_rays=20_000,
+                seed=42,
+                max_depth=8,
+                batch_size=10_000,
+                backend=TorchBackend(seed=42),
+            )
+        finally:
+            be.set_backend("numpy")
+        # The tap reads every ray twice: once outbound, once on the way back.
+        assert result.detectors["TAP"].num_rays_hit > 20_000
+        assert result.detectors["FF"].num_rays_hit > 0
+        # The lobe ran: the returned beam is spread, not a pencil.
+        assert result.detectors["FF"].total_flux > 0.0
