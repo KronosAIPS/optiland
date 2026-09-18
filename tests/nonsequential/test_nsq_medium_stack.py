@@ -10,6 +10,8 @@ import numpy as np
 import pytest
 
 from optiland.coordinate_system import CoordinateSystem
+from optiland.nonsequential.backends.torch_backend import TorchBackend
+from optiland.nonsequential.components import refractive
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
@@ -260,3 +262,71 @@ class TestMediumStackPushPop:
         self._interact(comp, rays, forced_branch="reflect")
         assert rays.medium_depth[0] == 0
         assert rays.medium_stack_underflows[0] == 0
+
+    def test_overflow_saturates_and_counts_when_the_raise_is_off(self, monkeypatch):
+        # The device formulation of the push cannot raise without reading a
+        # per-ray mask back to the host. With the raise off, the push
+        # saturates instead and the event is counted like any other stack
+        # inconsistency.
+        monkeypatch.setattr(refractive, "MEDIUM_STACK_OVERFLOW_RAISES", False)
+        deep = [i + 1 for i in range(MEDIUM_STACK_MAX_DEPTH)]
+        glass = NSQMaterial.from_glass("N-BK7")
+        other = NSQMaterial.from_glass("N-SF5")
+        comp = RefractiveComponent(
+            CoordinateSystem(),
+            FinitePlaneGeometry(20, 20),
+            glass,
+            other,
+        )
+        rays = self._rays(depth=MEDIUM_STACK_MAX_DEPTH, stack=deep)
+        self._interact(comp, rays)
+        assert rays.medium_depth[0] == MEDIUM_STACK_MAX_DEPTH
+        assert rays.medium_stack[0].tolist() == deep
+        assert rays.medium_stack_underflows[0] == 1
+
+
+class TestMediumStackIsBackendState:
+    """The stack lives wherever the ray state lives."""
+
+    def _bundle(self, n=3):
+        return NSQRayBundle(
+            x=np.zeros(n),
+            y=np.zeros(n),
+            z=np.zeros(n),
+            L=np.zeros(n),
+            M=np.zeros(n),
+            N=np.ones(n),
+            flux=np.ones(n),
+            wavelength=np.full(n, GREEN),
+            n_current=np.ones(n),
+            bounce=np.zeros(n, dtype=np.int32),
+            alive=np.ones(n, dtype=bool),
+            ray_id=np.arange(n, dtype=np.int64),
+        )
+
+    def test_numpy_bundle_keeps_numpy_integer_fields(self):
+        rays = self._bundle()
+        assert isinstance(rays.medium_stack, np.ndarray)
+        assert rays.medium_stack.dtype == np.int64
+        assert rays.medium_depth.dtype == np.int32
+        assert rays.medium_stack_underflows.dtype == np.int32
+
+    def test_torch_bundle_carries_tensors_through_select_and_concat(self):
+        torch = pytest.importorskip("torch")
+        rays = TorchBackend()._ensure_torch_bundle(self._bundle())
+        for field in ("medium_stack", "medium_depth", "medium_stack_underflows"):
+            assert isinstance(getattr(rays, field), torch.Tensor)
+        assert rays.medium_stack.dtype == torch.int64
+        assert rays.medium_depth.dtype == torch.int32
+
+        rays.medium_depth += 1
+        sub = rays.select(np.array([0, 2]))
+        assert isinstance(sub.medium_stack, torch.Tensor)
+        assert int(sub.medium_depth[0]) == 1
+        # An independent copy, as on the NumPy path.
+        rays.medium_depth[0] = 7
+        assert int(sub.medium_depth[0]) == 1
+
+        merged = NSQRayBundle.concat([sub, sub])
+        assert isinstance(merged.medium_stack, torch.Tensor)
+        assert merged.num_rays == 4
