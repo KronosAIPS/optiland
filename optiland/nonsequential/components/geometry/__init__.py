@@ -8,6 +8,8 @@ from .analytic import (
     ParaboloidGeometry,
     PlaneGeometry,
     SphereGeometry,
+    SphericalCavityGeometry,
+    SphericalPort,
 )
 from .base import AABB, AnalyticGeometry, ComponentGeometry
 from .mesh import MeshGeometry
@@ -22,4 +24,6 @@ __all__ = [
     "ParaboloidGeometry",
     "PlaneGeometry",
     "SphereGeometry",
+    "SphericalCavityGeometry",
+    "SphericalPort",
 ]

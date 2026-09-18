@@ -7,6 +7,7 @@ from .conic import ConicGeometry, ParaboloidGeometry
 from .frustum import CylindricalFrustumGeometry
 from .plane import FinitePlaneGeometry, PlaneGeometry
 from .sphere import SphereGeometry
+from .spherical_cavity import SphericalCavityGeometry, SphericalPort
 
 __all__ = [
     "AnnularPlaneGeometry",
@@ -16,4 +17,6 @@ __all__ = [
     "ParaboloidGeometry",
     "PlaneGeometry",
     "SphereGeometry",
+    "SphericalCavityGeometry",
+    "SphericalPort",
 ]
