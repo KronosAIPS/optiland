@@ -575,4 +575,22 @@ class TorchBackend(TracerBackend):
             rays.bounce = _torch.from_numpy(
                 np.asarray(rays.bounce, dtype=np.int32).copy()
             )
+
+        # The medium stack is ray state like any other: it lives on the same
+        # device as the rest of the bundle, as an integer table, so
+        # RefractiveComponent.interact can push and pop it without moving
+        # anything to the host.
+        device = rays.x.device
+
+        def _to_int(x: object, dtype: _torch.dtype) -> _torch.Tensor:
+            if isinstance(x, _torch.Tensor):
+                return x.to(device=device, dtype=dtype)
+            np_dtype = np.int64 if dtype == _torch.int64 else np.int32
+            return _torch.from_numpy(np.asarray(x, dtype=np_dtype).copy()).to(device)
+
+        rays.medium_stack = _to_int(rays.medium_stack, _torch.int64)
+        rays.medium_depth = _to_int(rays.medium_depth, _torch.int32)
+        rays.medium_stack_underflows = _to_int(
+            rays.medium_stack_underflows, _torch.int32
+        )
         return rays
