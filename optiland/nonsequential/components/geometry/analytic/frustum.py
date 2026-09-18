@@ -120,6 +120,14 @@ class CylindricalFrustumGeometry(AnalyticGeometry):
 
         if eps is None:
             eps = _tol.accept_t_min(be.abs(origins).max())
+        # The axial-window slack is a separate, always-positive quantity
+        # from the t-accept threshold `eps`: BaseComponent.intersect may
+        # pass a *shifted* eps (t_min - t_adv, which can be negative) so
+        # that "t_local > eps" tests the ray's true, unshifted parameter --
+        # correct for a t-accept comparison, but wrong for a position-window
+        # tolerance, which must stay a small positive length regardless of
+        # the origin advance.
+        axial_slack = _tol.accept_t_min(be.abs(origins).max())
         inf_val = be.ones_like(a) * be.inf
 
         # Linear fallback when |a| is very small (ray nearly parallel to
@@ -151,7 +159,9 @@ class CylindricalFrustumGeometry(AnalyticGeometry):
         def _valid(t: np.ndarray) -> np.ndarray:
             """True where t > eps, within axial limits, and disc >= 0."""
             z_hit = oz + t * dz
-            in_z = (z_hit >= self.z_front - eps) & (z_hit <= self.z_back + eps)
+            in_z = (z_hit >= self.z_front - axial_slack) & (
+                z_hit <= self.z_back + axial_slack
+            )
             return (disc >= 0.0) & (t > eps) & in_z
 
         valid1 = _valid(t1)

@@ -65,10 +65,19 @@ from optiland.nonsequential._utils import is_tensor
 if TYPE_CHECKING:
     from optiland._types import ScalarOrArrayT
 
-# Default k for accept_t_min: within the documented [8, 64] range
-# (docs/theory/07_geometry.md R-07-5), matching the reference cure's "about
-# 25 ulp" measurement (bench/local_mps_epsilon.py, results/local_mps_epsilon.json).
-DEFAULT_ACCEPT_K = 25
+# Default k for accept_t_min. docs/theory/07_geometry.md R-07-5 documents
+# [8, 64] as sufficient when the accept test is one ulp of coordinate error
+# away from the noise floor. Measured directly against this engine's own
+# conic and frustum intersection arithmetic (each several multiply/subtract
+# operations, not the single-operation idealization the [8, 64] range
+# assumes), the self-intersection residual after a real refraction reaches
+# several hundred to about a thousand ulps of the coordinate magnitude --
+# e.g. 6.8e-12 mm measured at a 50 mm coordinate in float64 (ulp 7.1e-15 mm,
+# so ~960 ulps) -- and a long-path collimated singlet (source at z=-1e6 mm)
+# needs a k this large before the rms spot radius stops drifting with
+# distance; k=1024, one still safely below, was not enough. [measured] See
+# docs/build/W4_tolerances.md for the sweep.
+DEFAULT_ACCEPT_K = 16384
 
 # Coordinate-magnitude floor [mm] for accept_t_min: a ray whose local origin
 # is at (or very near) the coordinate origin still needs a non-zero minimum
