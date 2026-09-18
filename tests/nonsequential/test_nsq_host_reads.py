@@ -75,9 +75,17 @@ class _ReadCounter:
     def __init__(self) -> None:
         self.total = 0
         self.sites: collections.Counter[str] = collections.Counter()
-        self.marks: list[tuple[int, collections.Counter[str]]] = []
+        self.marks: list[tuple[int, collections.Counter[str], int, int]] = []
         self._orig: dict[str, object] = {}
         self._orig_intersect = None
+        # The bundle the previous bounce ran on, held by reference rather
+        # than by id(): CPython reuses the id of a collected object, and a
+        # compacted bundle is collected the moment the loop rebinds past
+        # it. One strong reference is enough to make "is it still the same
+        # bundle?" answerable for adjacent bounces, and the sequence number
+        # below carries that answer into the mark list.
+        self._last_bundle = None
+        self._bundle_seq = 0
 
     # -- attribution ---------------------------------------------------
 
@@ -110,9 +118,12 @@ class _ReadCounter:
 
         self._orig_intersect = ArrayBackend.intersect_scene
 
-        def bracketed(backend, *a, **k):
-            self.mark()
-            return self._orig_intersect(backend, *a, **k)
+        def bracketed(backend, rays, *a, **k):
+            if rays is not self._last_bundle:
+                self._bundle_seq += 1
+                self._last_bundle = rays
+            self.mark(rays.num_rays, self._bundle_seq)
+            return self._orig_intersect(backend, rays, *a, **k)
 
         ArrayBackend.intersect_scene = bracketed
         return self
@@ -122,8 +133,8 @@ class _ReadCounter:
             setattr(torch.Tensor, name, orig)
         ArrayBackend.intersect_scene = self._orig_intersect
 
-    def mark(self) -> None:
-        self.marks.append((self.total, self.sites.copy()))
+    def mark(self, width: int = 0, bundle: int = 0) -> None:
+        self.marks.append((self.total, self.sites.copy(), width, bundle))
 
     # -- results -------------------------------------------------------
 
@@ -138,21 +149,64 @@ class _ReadCounter:
             return collections.Counter()
         return self.marks[-1][1] - self.marks[0][1]
 
-    def intervals_touched(self) -> collections.Counter[str]:
-        """How many separate bounces each site read in.
+    def widths(self) -> list[int]:
+        """The bundle width the loop ran each bounce at, in order."""
+        return [width for _, _, width, _ in self.marks]
 
-        A read that fires once per trace shows up in one interval whichever
-        bounce it lands in; a read that is genuinely per-bounce shows up in
-        every one. Counting intervals rather than reads separates the two
-        without having to know which bounce a one-off belongs to.
+    def _steady(self, i: int) -> bool:
+        """True when interval ``i`` is pure bounce work on one ray-state buffer.
+
+        The interval runs from bounce ``i``'s traversal to bounce
+        ``i + 1``'s, so it holds bounce ``i``'s body and whatever came after
+        it. It is pure bounce work only when the bundle it started on was
+        already the previous bounce's (nothing about the ray state's shape
+        or storage is new) and is still the next bounce's (the interval did
+        not build a replacement -- a compaction, or the next batch's freshly
+        generated rays).
         """
-        touched: collections.Counter[str] = collections.Counter()
-        for (_, before), (_, after) in zip(
-            self.marks, self.marks[1:], strict=False
-        ):
-            for site in (after - before):
-                touched[site] += 1
-        return touched
+        return (
+            0 < i < len(self.marks) - 1
+            and self.marks[i - 1][3] == self.marks[i][3] == self.marks[i + 1][3]
+        )
+
+    def steady_bounces(self) -> int:
+        """Bounces whose bundle is the object the previous bounce ran on."""
+        return sum(1 for i in range(len(self.marks) - 1) if self._steady(i))
+
+    def recurring_sites(self) -> collections.Counter[str]:
+        """How many *steady* bounces each site read in, after its first read.
+
+        Two kinds of read are not per-bounce costs and must not be counted
+        as one.
+
+        A read that fires **once per trace** -- a glass catalogue entry
+        resolved on its first use -- shows up in one interval whichever
+        bounce it lands in. It is excluded by counting a site only from its
+        second read.
+
+        A read that fires **once per ray-state buffer** -- the source
+        building a batch, or a cache in the shared library keyed on an
+        array's shape and identity, which every fresh batch and every
+        compaction event presents a new one of -- is the per-shape cost that
+        bucketed compaction trades a per-bounce cost for
+        (``docs/theory/12_gpu_mapping.md`` section 12.3: O(log N) shapes,
+        each paid for once). It is excluded by counting only *steady*
+        intervals: those that start and end on the bundle object the loop
+        was already running on, so nothing about the ray state's shape or
+        storage is new in them.
+
+        A genuinely per-bounce read survives both rules, because it reads in
+        every steady bounce and a trace has many.
+        """
+        seen: set[str] = set()
+        recurring: collections.Counter[str] = collections.Counter()
+        for i in range(len(self.marks) - 1):
+            steady = self._steady(i)
+            for site in self.marks[i + 1][1] - self.marks[i][1]:
+                if steady and site in seen:
+                    recurring[site] += 1
+                seen.add(site)
+        return recurring
 
 
 def _singlet() -> NSQScene:
@@ -185,23 +239,45 @@ def _singlet() -> NSQScene:
     return scene
 
 
-def _trace_and_count(num_rays: int, max_depth: int, alive_check_every):
+def _trace_and_count(
+    num_rays: int,
+    max_depth: int,
+    alive_check_every,
+    batch_size: int | None = None,
+    scene_fn=None,
+):
     be.set_backend("torch")
     be.set_precision("float64")
     try:
-        scene = _singlet()
+        scene = (scene_fn or _singlet)()
         backend = TorchBackend(seed=42, alive_check_every=alive_check_every)
         with _ReadCounter() as counter:
             scene.trace(
                 num_rays=num_rays,
                 seed=42,
                 max_depth=max_depth,
-                batch_size=num_rays,
+                batch_size=batch_size or num_rays,
                 backend=backend,
             )
         return counter
     finally:
         be.set_backend("numpy")
+
+
+def _assert_steady_bounces(counter: _ReadCounter) -> None:
+    """The control for :meth:`_ReadCounter.recurring_sites`.
+
+    That method counts a read only in a bounce whose bundle is the one the
+    previous bounce already ran on, so a trace in which the bundle is
+    replaced at every bounce would report nothing at all and every assertion
+    built on it would pass vacuously. Assert that a useful share of the
+    bounces are steady ones.
+    """
+    steady = counter.steady_bounces()
+    assert steady >= 3, (
+        f"only {steady} of {counter.bounces} bounces ran on an unchanged "
+        "bundle -- too few to detect a per-bounce read"
+    )
 
 
 class TestNoHostReadPerBounce:
@@ -216,26 +292,36 @@ class TestNoHostReadPerBounce:
         a device mask or a device accumulator read back once after the
         trace.
         """
-        counter = _trace_and_count(100_000, max_depth=16, alive_check_every=0)
+        counter = _trace_and_count(
+            100_000, max_depth=16, alive_check_every=0, batch_size=25_000
+        )
         assert counter.bounces >= 8
+        _assert_steady_bounces(counter)
 
-        # A material's first evaluation caches a catalogue lookup: one
-        # read, in whichever bounce it happens to fall in. A per-bounce read
-        # shows up in every interval instead, so count intervals.
+        # A read that fires once per trace (a glass catalogue entry) or once
+        # per bundle width (a shape-keyed cache) is not a per-bounce cost --
+        # see _ReadCounter.recurring_sites for how the three are separated.
         recurring = {
             site: n
-            for site, n in counter.intervals_touched().items()
-            if _UNOWNED not in site and n > 1
+            for site, n in counter.recurring_sites().items()
+            if _UNOWNED not in site and n > 0
         }
         assert recurring == {}, f"per-bounce host reads remain: {recurring}"
 
     def test_the_default_reads_only_the_alive_count(self):
-        """The shipped default keeps one read and drops every other."""
-        counter = _trace_and_count(100_000, max_depth=16, alive_check_every=None)
+        """The shipped default keeps one read and drops every other.
+
+        That one read is the live count, and compaction takes its bucket
+        from the same read rather than making a second one.
+        """
+        counter = _trace_and_count(
+            100_000, max_depth=16, alive_check_every=None, batch_size=25_000
+        )
+        _assert_steady_bounces(counter)
         recurring = {
             site: n
-            for site, n in counter.intervals_touched().items()
-            if _UNOWNED not in site and "num_rays_alive" not in site and n > 1
+            for site, n in counter.recurring_sites().items()
+            if _UNOWNED not in site and "num_rays_alive" not in site and n > 0
         }
         assert recurring == {}, f"per-bounce host reads remain: {recurring}"
 
@@ -253,8 +339,8 @@ class TestNoHostReadPerBounce:
         # And it is the only thing in the loop that reads at all.
         recurring = {
             site: n
-            for site, n in counter.intervals_touched().items()
-            if _UNOWNED not in site and "num_rays_alive" not in site and n > 1
+            for site, n in counter.recurring_sites().items()
+            if _UNOWNED not in site and "num_rays_alive" not in site and n > 0
         }
         assert recurring == {}, f"per-bounce host reads remain: {recurring}"
 

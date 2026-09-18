@@ -163,6 +163,53 @@ def backend_scatter_slot(table, index, values):
     return table
 
 
+def backend_live_permutation(alive, n_live: int):
+    """Row order that puts every live ray first, dead rays after it.
+
+    A stable partition of the rows, written as a prefix sum rather than a
+    sort: a live row goes to its rank among the live rows, a dead row to
+    ``n_live`` plus its rank among the dead ones, and the two ranks are two
+    cumulative sums over the ``alive`` flags. The result is a permutation of
+    ``0 .. N-1``, so it is built at a fixed shape and nothing is read back
+    to the host -- the caller has already read ``n_live`` once and takes the
+    leading slice it needs (``docs/theory/12_gpu_mapping.md`` section 12.3:
+    "build the live index list with a prefix sum over the alive flags").
+
+    Order within each group is preserved, so the permutation is a
+    deterministic function of the ``alive`` flags alone.
+
+    Args:
+        alive: Per-ray boolean mask, shape (N,).
+        n_live: Number of True entries in ``alive``, as a Python int.
+
+    Returns:
+        Integer permutation array/tensor of shape (N,), beside ``alive``.
+    """
+    if be.is_torch_tensor(alive):
+        import torch  # noqa: PLC0415
+
+        n = alive.shape[0]
+        live = alive.to(torch.int64)
+        live_rank = torch.cumsum(live, 0) - 1
+        dead_rank = torch.cumsum(1 - live, 0) - 1 + n_live
+        dest = torch.where(alive, live_rank, dead_rank)
+        perm = torch.empty(n, dtype=torch.int64, device=alive.device)
+        perm.scatter_(
+            0, dest, torch.arange(n, dtype=torch.int64, device=alive.device)
+        )
+        return perm
+
+    alive_np = np.asarray(alive, dtype=bool)
+    n = alive_np.shape[0]
+    live = alive_np.astype(np.int64)
+    live_rank = np.cumsum(live) - 1
+    dead_rank = np.cumsum(1 - live) - 1 + n_live
+    dest = np.where(alive_np, live_rank, dead_rank)
+    perm = np.empty(n, dtype=np.int64)
+    perm[dest] = np.arange(n, dtype=np.int64)
+    return perm
+
+
 def _rows_copy(arr, idx):
     """Return an independent copy of ``arr``'s rows at ``idx``."""
     sub = arr[idx]
@@ -318,6 +365,50 @@ class NSQRayBundle:
         )
         if self.ray_id is not None:
             kwargs["ray_id"] = self.ray_id[mask]
+        return NSQRayBundle(**kwargs)
+
+    def take(self, idx) -> NSQRayBundle:
+        """Return a new bundle holding the rows at ``idx``, alive flags kept.
+
+        The gather half of bucketed compaction (``docs/theory/12_gpu_mapping
+        .md`` R-12-6). Unlike :meth:`select`, which exists to snapshot a set
+        of mid-interaction rays for bounded splitting and therefore marks
+        every row of its result alive, this carries each row's own ``alive``
+        flag across -- a compacted bundle that is wider than the live count
+        is padded with the dead rows the index ends on, and those rows must
+        stay dead.
+
+        Fancy indexing returns a fresh array on either library, so the
+        result owns its own medium-stack table (which
+        ``RefractiveComponent.interact`` writes in place) and shares nothing
+        with ``self``.
+
+        Args:
+            idx: Integer row indices, shape (W,), on the same library and
+                device as the ray state.
+
+        Returns:
+            A new :class:`NSQRayBundle` of width ``W``.
+        """
+        kwargs: dict = dict(
+            x=self.x[idx],
+            y=self.y[idx],
+            z=self.z[idx],
+            L=self.L[idx],
+            M=self.M[idx],
+            N=self.N[idx],
+            flux=self.flux[idx],
+            wavelength=self.wavelength[idx],
+            n_current=self.n_current[idx],
+            bounce=self.bounce[idx],
+            alive=self.alive[idx],
+            k_current=self.k_current[idx],
+            medium_stack=self.medium_stack[idx],
+            medium_depth=self.medium_depth[idx],
+            medium_stack_underflows=self.medium_stack_underflows[idx],
+        )
+        if self.ray_id is not None:
+            kwargs["ray_id"] = self.ray_id[idx]
         return NSQRayBundle(**kwargs)
 
     def advance(self, t: np.ndarray) -> None:
