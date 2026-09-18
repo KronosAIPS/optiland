@@ -113,10 +113,12 @@ def resolve_path_sample_mask(
     # A ray's hash is a pure function of (seed, ray_id) -- independent of
     # bounce or batch -- so the same ray is always in or always out of the
     # sample for its whole lifetime, across every event type.
-    h = pcg32_uint32(seed, ray_id_np, np.zeros_like(ray_id_np), EventSlot.PATH_SAMPLE)
+    h = to_numpy(
+        pcg32_uint32(seed, ray_id_np, np.zeros_like(ray_id_np), EventSlot.PATH_SAMPLE)
+    )
     # threshold = (n / num_rays_total) * 2**32, computed to stay in uint32
     # range without overflowing an intermediate float32.
-    threshold = np.uint32(min(int((n / num_rays_total) * 2.0**32), 0xFFFFFFFF))
+    threshold = min(int((n / num_rays_total) * 2.0**32), 0xFFFFFFFF)
     return h < threshold
 
 

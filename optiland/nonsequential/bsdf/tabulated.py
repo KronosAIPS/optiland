@@ -107,7 +107,7 @@ class TabulatedBSDF(BaseBSDF):
         d_np = np.asarray(to_numpy(incident_dirs), dtype=np.float64)
 
         if self.transmissive_fraction > 0.0:
-            u_lobe = rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH)
+            u_lobe = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH))
             transmitted_np = u_lobe < self.transmissive_fraction
             hemisphere_np = np.where(transmitted_np[:, None], -n_np, n_np)
         else:
@@ -122,8 +122,8 @@ class TabulatedBSDF(BaseBSDF):
             _orthonormal_basis,
         )
 
-        r1 = rng.uniform(ray_id, bounce, EventSlot.BSDF_U1)
-        r2 = rng.uniform(ray_id, bounce, EventSlot.BSDF_U2)
+        r1 = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_U1))
+        r2 = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_U2))
         phi = 2.0 * np.pi * r1
         cos_theta = np.sqrt(r2)
         sin_theta = np.sqrt(1.0 - r2)

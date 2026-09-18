@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from optiland.backend.utils import to_numpy
 from optiland.nonsequential.rng import EventSlot
 
 if TYPE_CHECKING:
@@ -74,7 +75,7 @@ class Spectrum:
         num = len(ray_id)
         if len(self.wavelengths) == 1:
             return np.full(num, self.wavelengths[0])
-        u = rng.uniform(ray_id, bounce, EventSlot.SOURCE_WAVELENGTH)
+        u = to_numpy(rng.uniform(ray_id, bounce, EventSlot.SOURCE_WAVELENGTH))
         indices = np.searchsorted(self._cdf, u)
         indices = np.clip(indices, 0, len(self.wavelengths) - 1)
         return self.wavelengths[indices]

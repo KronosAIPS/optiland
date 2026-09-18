@@ -185,7 +185,7 @@ class HarveyShackBSDF(BaseBSDF):
         # ray the ABg blur is centred on. d_np itself (unrefracted) is
         # already a unit vector; only d_spec needs the below norm-guard.
         if self.transmissive_fraction > 0.0:
-            u_lobe = rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH)
+            u_lobe = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH))
             transmitted_np = u_lobe < self.transmissive_fraction
         else:
             transmitted_np = np.zeros(n_np.shape[0], dtype=bool)
@@ -213,8 +213,8 @@ class HarveyShackBSDF(BaseBSDF):
         ref_normal_sign[ref_normal_sign == 0.0] = 1.0
 
         # Radial offset from the tabulated inverse CDF; azimuth uniform.
-        u_radial = rng.uniform(ray_id, bounce, EventSlot.BSDF_U1)
-        u_azimuth = rng.uniform(ray_id, bounce, EventSlot.BSDF_U2)
+        u_radial = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_U1))
+        u_azimuth = to_numpy(rng.uniform(ray_id, bounce, EventSlot.BSDF_U2))
         delta = np.interp(u_radial, self._cdf_grid, self._beta_grid)
         psi = 2.0 * np.pi * u_azimuth
 

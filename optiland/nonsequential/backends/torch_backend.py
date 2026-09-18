@@ -436,8 +436,8 @@ class TorchBackend(TracerBackend):
                         rr_threshold_fraction,
                         flux_per_ray,
                         self.rng,
-                        to_numpy(rays.ray_id),
-                        to_numpy(rays.bounce),
+                        rays.ray_id,
+                        rays.bounce,
                     )
                     if rr_killed_np.any():
                         num_rays_flux_killed += int(rr_killed_np.sum())
