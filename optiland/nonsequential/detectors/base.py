@@ -200,12 +200,22 @@ class BaseDetector(ABC):
     beyond it -- use ``absorb=False`` (or trace one scene per plane) to
     profile a beam at several planes.
 
+    Detectors are **two-sided by default**: a planar detector is a plane, and
+    a ray crossing it from either side is recorded. ``side="front"`` (or
+    ``"back"``) restricts it to hits arriving on one side, which is what a
+    collector placed to read light *returning* from a surface needs -- it
+    then ignores the beam travelling the other way through the same plane,
+    instead of absorbing it before it ever reaches the surface under test
+    (``docs/theory/11_validation_catalogue.md`` 11.4.18).
+
     Attributes:
         cs: Coordinate system defining detector position and orientation.
         geometry: Surface geometry that defines the detector area.
         name: Optional human-readable label.
         absorb: Whether a hit terminates the ray. False => the ray is
             recorded and passes through unaffected.
+        side: Which side of the surface is live -- ``"both"`` (default),
+            ``"front"``, or ``"back"``. See :meth:`intersect`.
     """
 
     def __init__(
@@ -214,6 +224,7 @@ class BaseDetector(ABC):
         geometry: ComponentGeometry,
         name: str = "",
         absorb: bool = True,
+        side: str = "both",
     ) -> None:
         """Initialize BaseDetector.
 
@@ -224,11 +235,23 @@ class BaseDetector(ABC):
             absorb: Whether a hit terminates the ray (default True).
                 False makes the detector transmissive: the hit is recorded
                 and the ray continues with its direction unchanged.
+            side: ``"both"`` (default, unchanged behaviour), ``"front"``, or
+                ``"back"``. The front is the side the surface normal points
+                toward: for every flat detector here that is the placement's
+                own normal, local +z.
+
+        Raises:
+            ValueError: If ``side`` is not one of the three accepted values.
         """
+        if side not in ("both", "front", "back"):
+            raise ValueError(
+                f"side must be 'both', 'front', or 'back'; got {side!r}."
+            )
         self.cs = cs
         self.geometry = geometry
         self.name = name
         self.absorb = bool(absorb)
+        self.side = side
         self._frame = None
 
     def frame(self):
@@ -258,6 +281,16 @@ class BaseDetector(ABC):
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Find ray intersections with this detector surface.
 
+        With ``side`` set, a hit is kept only when the ray arrives on the
+        requested side. The test is on the *geometric* normal ``n_geom``,
+        which every geometry defines independently of the ray's direction:
+        a ray arriving on the front travels against it (``d . n_geom < 0``).
+        For the flat detectors ``n_geom`` is the placement's local +z, so
+        "front" is the side the detector faces; for a closed geometry --
+        a hemispherical collector's shell -- the same test reads as
+        "hit from the side the normal points toward", with no separate
+        convention.
+
         Args:
             rays: Ray bundle in global coordinates.
 
@@ -277,9 +310,16 @@ class BaseDetector(ABC):
         # rather than local, and why per ray rather than one scalar for the
         # whole bundle.
         t_min = _tol.accept_t_min(coordinate_magnitude(rays))
-        t_hit, normals_l, hit_mask, _n_geom_l = self.geometry.ray_intersect(
+        t_hit, normals_l, hit_mask, n_geom_l = self.geometry.ray_intersect(
             positions_l, directions_l, eps=t_min
         )
+
+        if self.side != "both":
+            facing = (be.array(directions_l) * be.array(n_geom_l)).sum(axis=1)
+            wanted = facing < 0.0 if self.side == "front" else facing > 0.0
+            hit_mask = be.array(hit_mask) & wanted
+            t_hit = be.array(t_hit)
+            t_hit = be.where(wanted, t_hit, be.full_like(t_hit, be.inf))
 
         # Geometry may return numpy arrays even in torch-backend mode (geometry
         # internals are numpy-based). Convert to the current backend format so

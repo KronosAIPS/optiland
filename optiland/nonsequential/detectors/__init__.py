@@ -5,11 +5,13 @@ from __future__ import annotations
 from .base import BaseDetector
 from .configs import (
     FarFieldDetectorConfig,
+    HemisphereDetectorConfig,
     IrradianceDetectorConfig,
     RayDatabaseConfig,
     SpectralDetectorConfig,
 )
 from .far_field import FarFieldDetector
+from .hemisphere import HemisphereDetector
 from .irradiance import IrradianceDetector
 from .ray_database import RayDatabaseDetector
 from .registry import DetectorRegistry
@@ -20,6 +22,8 @@ __all__ = [
     "DetectorRegistry",
     "FarFieldDetector",
     "FarFieldDetectorConfig",
+    "HemisphereDetector",
+    "HemisphereDetectorConfig",
     "IrradianceDetector",
     "IrradianceDetectorConfig",
     "RayDatabaseDetector",

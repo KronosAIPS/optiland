@@ -61,6 +61,7 @@ class IrradianceDetector(BaseDetector):
         splat_sigma: float = 0.5,
         name: str = "",
         absorb: bool = True,
+        side: str = "both",
     ) -> None:
         """Initialize IrradianceDetector.
 
@@ -78,9 +79,13 @@ class IrradianceDetector(BaseDetector):
                 ``splat='gaussian'``.
             name: Optional label.
             absorb: Whether a hit terminates the ray (default True).
+            side: Which side of the plane is live -- ``"both"`` (default),
+                ``"front"`` (only rays arriving on the side the placement's
+                normal, local +z, points toward), or ``"back"``. See
+                :meth:`BaseDetector.intersect`.
         """
         geometry = FinitePlaneGeometry(width=width, height=height)
-        super().__init__(cs, geometry, name=name, absorb=absorb)
+        super().__init__(cs, geometry, name=name, absorb=absorb, side=side)
         self.width = as_param(width)
         self.height = as_param(height)
         self.num_pixels_x = int(num_pixels_x)

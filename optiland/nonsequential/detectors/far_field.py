@@ -50,6 +50,7 @@ class FarFieldDetector(BaseDetector):
         aperture_radius: float = 1e6,
         name: str = "",
         absorb: bool = True,
+        side: str = "both",
     ) -> None:
         """Initialize FarFieldDetector.
 
@@ -61,9 +62,12 @@ class FarFieldDetector(BaseDetector):
             aperture_radius: Detector aperture radius [mm] (default: very large).
             name: Optional label.
             absorb: Whether a hit terminates the ray (default True).
+            side: Which side of the plane is live -- ``"both"`` (default),
+                ``"front"``, or ``"back"``. See
+                :meth:`BaseDetector.intersect`.
         """
         geometry = FinitePlaneGeometry(aperture_radius=aperture_radius)
-        super().__init__(cs, geometry, name=name, absorb=absorb)
+        super().__init__(cs, geometry, name=name, absorb=absorb, side=side)
         self.num_bins_theta = int(num_bins_theta)
         self.num_bins_phi = int(num_bins_phi)
 
@@ -107,7 +111,7 @@ class FarFieldDetector(BaseDetector):
 
         # Compute polar angles in local frame
         # theta is angle from local +z axis
-        cos_theta = np.clip(np.abs(dirs_hit[:, 2]), 0.0, 1.0)
+        cos_theta = self._cos_theta(dirs_hit)
         theta_deg = np.degrees(np.arccos(cos_theta))
         phi_deg = np.degrees(np.arctan2(dirs_hit[:, 1], dirs_hit[:, 0]))
 
@@ -132,6 +136,24 @@ class FarFieldDetector(BaseDetector):
         # Track the radiometric flux separately: _intensity is divided by the
         # per-bin solid angle, so summing it gives W/sr, not W.
         self._total_flux += float(flux_hit.sum())
+
+    def _cos_theta(self, dirs_l: np.ndarray) -> np.ndarray:
+        """Polar cosine of each hit direction, in the detector's local frame.
+
+        A flat far-field detector is a plane and is reached from either
+        side, so the two sides fold together onto one polar angle: a ray
+        leaving along -z is binned at the same theta as one leaving along
+        +z. A collector that is closed on one side only -- the
+        hemispherical one -- overrides this, because there the sign of the
+        direction is the physical hemisphere, not an ambiguity.
+
+        Args:
+            dirs_l: Hit ray directions in the local frame, shape (K, 3).
+
+        Returns:
+            ``cos(theta)`` in [0, 1], shape (K,).
+        """
+        return np.clip(np.abs(dirs_l[:, 2]), 0.0, 1.0)
 
     def get_result(self) -> FarFieldPattern:
         """Return the accumulated far-field pattern.

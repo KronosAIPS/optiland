@@ -23,6 +23,10 @@ class IrradianceDetectorConfig:
         absorb: Whether a hit terminates the ray. False makes the detector
             transmissive: the hit is recorded and the ray continues on its
             unchanged direction, enabling mid-system beam sampling.
+        side: Which side of the detector plane is live: 'both' (default,
+            a ray crossing from either side is recorded), 'front' (only
+            rays arriving on the side the placement's normal points
+            toward), or 'back'.
     """
 
     width: float
@@ -32,6 +36,7 @@ class IrradianceDetectorConfig:
     splat: Literal["bilinear", "gaussian", "hard"] = "bilinear"
     splat_sigma: float = 0.5
     absorb: bool = True
+    side: Literal["both", "front", "back"] = "both"
 
 
 @dataclass
@@ -78,10 +83,35 @@ class FarFieldDetectorConfig:
         num_theta: Number of polar angle bins.
         num_phi: Number of azimuthal angle bins.
         absorb: Whether a hit terminates the ray.
+        side: Which side of the detector plane is live: 'both' (default),
+            'front', or 'back'. See ``IrradianceDetectorConfig.side``.
     """
 
     num_theta: int = 90
     num_phi: int = 360
+    absorb: bool = True
+    side: Literal["both", "front", "back"] = "both"
+
+
+@dataclass
+class HemisphereDetectorConfig:
+    """Configuration for a HemisphereDetector.
+
+    A closed hemispherical shell that collects the angular distribution of
+    everything leaving the half-space it covers. It has no ``side`` option:
+    the shell is closed on one side by construction, which is the point of
+    it.
+
+    Attributes:
+        radius: Shell radius [mm].
+        num_theta: Number of polar bins over 0-90 degrees.
+        num_phi: Number of azimuthal bins.
+        absorb: Whether a hit terminates the ray.
+    """
+
+    radius: float
+    num_theta: int = 18
+    num_phi: int = 36
     absorb: bool = True
 
 
