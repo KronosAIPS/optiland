@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 import optiland.backend as be
+from optiland.nonsequential.ray_bundle import backend_bool_full
 from optiland.nonsequential.rng import EventSlot
 
 if TYPE_CHECKING:
@@ -82,6 +83,7 @@ def russian_roulette(
     rng: NSQRng,
     ray_id: np.ndarray,
     bounce: np.ndarray,
+    fast_path: bool = True,
 ) -> tuple[object, object, object]:
     """Unbiased stochastic termination of low-flux rays.
 
@@ -103,42 +105,44 @@ def russian_roulette(
         rng: Keyed PCG32 RNG.
         ray_id: Per-ray identifiers, shape (N,).
         bounce: Per-ray bounce index as of this event, shape (N,).
+        fast_path: Return early when no ray is a candidate. Deciding that
+            means reducing a per-ray mask to a Python bool: free on a host
+            array, a device synchronisation on a device array. A device
+            backend passes False and runs the arithmetic unconditionally,
+            which is exact rather than merely close -- with no candidate,
+            ``boost_mask`` is all False and ``flux_after`` is ``flux``
+            elementwise -- and costs one keyed draw that nothing reads. The
+            draw does not move the stream: the generator is a pure function
+            of ``(seed, ray_id, bounce, slot)``.
 
     Returns:
         ``(flux_after, alive_after, killed_mask)``: updated flux (boosted
         for survivors, unchanged for non-candidates), updated alive mask,
-        and a NumPy bool mask of rays newly killed by roulette this call
-        (for flux-loss bookkeeping -- always ~0 in expectation, unlike the
-        old ``total_flux_lost`` truncation bias).
+        and a boolean mask of rays newly killed by roulette this call, in
+        the same array library as ``flux`` (for flux-loss bookkeeping --
+        always ~0 in expectation, unlike the old ``total_flux_lost``
+        truncation bias).
     """
-    from optiland.backend.utils import to_numpy  # noqa: PLC0415
-
     threshold = rr_start_flux * flux_per_ray
-    flux_np = to_numpy(flux)
-    alive_np = to_numpy(alive).astype(bool)
 
-    candidate_np = alive_np & (flux_np < threshold) & (flux_np > 0.0)
-    if not candidate_np.any():
-        killed_mask = np.zeros_like(alive_np)
-        return flux, alive, killed_mask
+    candidate = alive & (flux < threshold) & (flux > 0.0)
+    if fast_path and not bool(be.any(candidate)):
+        return flux, alive, backend_bool_full(candidate.shape, False, like=alive)
 
-    survive_prob_np = np.clip(flux_np / max(threshold, 1e-300), _RR_SURVIVE_FLOOR, 1.0)
-    u = to_numpy(rng.uniform(ray_id, bounce, EventSlot.RR))
-    survive_np = u < survive_prob_np
-    killed_mask = candidate_np & ~survive_np
+    survive_prob = be.clip(flux / max(threshold, 1e-300), _RR_SURVIVE_FLOOR, 1.0)
+    u = rng.uniform(ray_id, bounce, EventSlot.RR)
+    survive = u < survive_prob
+    killed = candidate & ~survive
 
     # Boost only the surviving candidates -- a killed ray's flux is left
     # untouched (it is immediately excluded via alive_after=False and, on
-    # the NumPy backend, compacted away next bounce; leaving it at its
+    # a compacting backend, compacted away next bounce; leaving it at its
     # pre-roulette value rather than a discarded boosted one avoids a
     # meaningless number sitting in a dead ray's flux field).
-    boost_mask_np = candidate_np & survive_np
-    boost_np = np.where(boost_mask_np, 1.0 / survive_prob_np, 1.0)
-    boost = be.array(boost_np)
-    boost_mask = be.array(boost_mask_np)
+    boost_mask = candidate & survive
+    boost = be.where(boost_mask, 1.0 / survive_prob, be.ones_like(survive_prob))
     flux_after = be.where(boost_mask, flux * boost, flux)
 
-    killed = be.array(killed_mask)
     alive_after = alive & ~killed
 
-    return flux_after, alive_after, killed_mask
+    return flux_after, alive_after, killed

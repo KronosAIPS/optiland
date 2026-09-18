@@ -19,10 +19,14 @@ from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
+from optiland.nonsequential._tally import masked_count
 from optiland.nonsequential.detectors.base import (
     BaseDetector,
     _accumulate_into,
     _new_flat_accumulator,
+    clamp_int,
+    floor_to_int,
+    int_to_float_like,
 )
 from optiland.nonsequential.results.irradiance_map import IrradianceMap
 
@@ -110,11 +114,7 @@ class IrradianceDetector(BaseDetector):
             t: Hit distances [mm], shape (N,).
             hit_mask: Boolean mask of hitting rays, shape (N,).
         """
-        hit_mask_np = to_numpy(hit_mask).astype(bool)
-        if not hit_mask_np.any():
-            return
-
-        translation, rot = _get_transform(self.cs)
+        t_arr, R_arr = self.frame()
 
         # Advance hit rays to intersection point in backend-attached arrays
         t_hit_be = be.where(hit_mask, t, be.zeros_like(t))
@@ -122,30 +122,44 @@ class IrradianceDetector(BaseDetector):
         hy_g = rays.y + t_hit_be * rays.M
         hz_g = rays.z + t_hit_be * rays.N
 
-        t_arr = be.array(translation)
-        R_arr = be.array(rot)
         pos_g = be.stack([hx_g, hy_g, hz_g], axis=1)
         pos_l = (pos_g - t_arr) @ R_arr
-        hx_l = pos_l[:, 0]
-        hy_l = pos_l[:, 1]
+        # A ray that did not hit this detector contributes nothing, and its
+        # landing position is meaningless -- a dead ray's origin can be
+        # infinite (it was pushed out of the scene when it escaped), and
+        # inf * 0 is NaN, which no later multiplication by a zero flux can
+        # undo. Mask the coordinate itself rather than relying on the zero
+        # weight (docs/theory/08_precision.md R-08-8): the splat then reads
+        # a finite 0 for every non-hit ray and adds exactly zero.
+        hx_l = be.where(hit_mask, pos_l[:, 0], be.zeros_like(pos_l[:, 0]))
+        hy_l = be.where(hit_mask, pos_l[:, 1], be.zeros_like(pos_l[:, 1]))
 
         # Zero out non-hit ray contributions while keeping graph attached
-        hit_mask_be = be.array(hit_mask_np)
-        flux_masked = be.where(hit_mask_be, rays.flux, be.zeros_like(rays.flux))
+        flux_masked = be.where(hit_mask, rays.flux, be.zeros_like(rays.flux))
 
         nx = self.num_pixels_x
         ny = self.num_pixels_y
         dx = self.width / nx
         dy = self.height / ny
 
-        if self.splat == "hard":
-            self._record_hard(hx_l, hy_l, flux_masked, hit_mask_np, nx, ny)
+        if self.splat == "bilinear":
+            # The default splat, and the only one written to stay on the
+            # device: index arithmetic in the active backend, one in-place
+            # scatter-add per neighbour. A non-hit ray carries zero flux
+            # through it and adds exactly zero, so an empty mask needs no
+            # early exit -- which is what lets a device backend call
+            # record() for every detector every bounce without asking
+            # whether any ray hit it.
+            self._record_bilinear(hx_l, hy_l, flux_masked, nx, ny, dx, dy)
         elif self.splat == "gaussian":
             self._record_gaussian(hx_l, hy_l, flux_masked, nx, ny, dx, dy)
         else:
-            self._record_bilinear(hx_l, hy_l, flux_masked, hit_mask_np, nx, ny, dx, dy)
+            hit_mask_np = to_numpy(hit_mask).astype(bool)
+            if not hit_mask_np.any():
+                return
+            self._record_hard(hx_l, hy_l, flux_masked, hit_mask_np, nx, ny)
 
-        self._num_rays_hit += int(hit_mask_np.sum())
+        self._num_rays_hit = self._num_rays_hit + masked_count(hit_mask)
 
     def _record_hard(
         self,
@@ -189,7 +203,6 @@ class IrradianceDetector(BaseDetector):
         hx_l,
         hy_l,
         flux_masked,
-        hit_mask_np: np.ndarray,
         nx: int,
         ny: int,
         dx: float,
@@ -198,14 +211,15 @@ class IrradianceDetector(BaseDetector):
         """Bilinear splat — differentiable w.r.t. landing position and flux.
 
         Distributes each ray's flux to the four surrounding pixel centres
-        with bilinear weights. Index arithmetic uses detached NumPy arrays;
-        the flux contribution (flux * weight) carries gradients.
+        with bilinear weights. The index arithmetic is detached (an index
+        carries no gradient) but stays in the active backend, on the same
+        device as the ray state and the pixel buffer; the flux contribution
+        (flux * weight) carries gradients.
 
         Args:
             hx_l: Local x coordinates, be-array shape (N,).
             hy_l: Local y coordinates, be-array shape (N,).
             flux_masked: Per-ray flux (non-hit rays zeroed), be-array.
-            hit_mask_np: Boolean NumPy mask, shape (N,).
             nx: Number of pixels along x.
             ny: Number of pixels along y.
             dx: Pixel width [mm].
@@ -217,33 +231,28 @@ class IrradianceDetector(BaseDetector):
         py = (hy_l + self.height / 2.0) / dy - 0.5
 
         # Base pixel index (detached — index must not carry gradient)
-        px_np = to_numpy(px)
-        py_np = to_numpy(py)
-        ix0_np = np.floor(px_np).astype(np.int64)
-        iy0_np = np.floor(py_np).astype(np.int64)
+        ix0 = floor_to_int(px)
+        iy0 = floor_to_int(py)
 
-        # Fractional weights (attached to graph via be-arrays)
-        wx1 = px - be.array(ix0_np.astype(np.float64))  # fraction toward ix+1
-        wy1 = py - be.array(iy0_np.astype(np.float64))
+        # Fractional weights (attached to the graph)
+        wx1 = px - int_to_float_like(ix0, px)  # fraction toward ix+1
+        wy1 = py - int_to_float_like(iy0, py)
         wx0 = 1.0 - wx1
         wy0 = 1.0 - wy1
 
         # Distribute flux to all four neighbour pixels.
-        # index must be an integer array — pass flat_np directly (not via
-        # be.array which casts to float) so that numpy uses int indexing and
-        # torch receives a LongTensor.
         for dix, diy, wx, wy in (
             (0, 0, wx0, wy0),
             (1, 0, wx1, wy0),
             (0, 1, wx0, wy1),
             (1, 1, wx1, wy1),
         ):
-            ix_np = np.clip(ix0_np + dix, 0, nx - 1)
-            iy_np = np.clip(iy0_np + diy, 0, ny - 1)
-            flat_np = (iy_np * nx + ix_np).astype(np.int64)
+            ix = clamp_int(ix0 + dix, 0, nx - 1)
+            iy = clamp_int(iy0 + diy, 0, ny - 1)
+            flat = iy * nx + ix
 
             contrib = flux_masked * wx * wy  # attached
-            _accumulate_into(self._data, flat_np, contrib)
+            _accumulate_into(self._data, flat, contrib)
 
     def _record_gaussian(
         self,
@@ -342,7 +351,7 @@ class IrradianceDetector(BaseDetector):
             # `result.detectors["D1"].total_flux.backward()` carries a
             # gradient. Use `.total_flux_float` for printing/formatting.
             total_flux=be.sum(self._data),
-            num_rays_hit=self._num_rays_hit,
+            num_rays_hit=int(to_numpy(self._num_rays_hit)),
         )
 
     def reset(self) -> None:
@@ -353,3 +362,4 @@ class IrradianceDetector(BaseDetector):
         """
         self._data = _new_flat_accumulator(self.num_pixels_y * self.num_pixels_x)
         self._num_rays_hit = 0
+        self.invalidate_frame()

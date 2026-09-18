@@ -419,10 +419,15 @@ class TestVisibilityGradientZero:
         """Which-surface-is-hit is a discrete choice with no gradient path.
 
         Documents the v1 limitation. The dispatch is resolved by comparing
-        hit distances in NumPy, so ``comp_indices`` is an integer array with
-        no autograd history — silhouette and vignetting boundaries therefore
-        contribute nothing to the gradient. Reparameterization (roadmap #1)
-        addresses this.
+        hit distances, and the winning index is carried in an *integer*
+        array with no autograd history — silhouette and vignetting
+        boundaries therefore contribute nothing to the gradient.
+        Reparameterization (roadmap #1) addresses this.
+
+        What is asserted is the property that matters: integer dtype, no
+        gradient. Which array library holds it is not part of that property
+        — the index is built beside the ray state, on the device, so that
+        the dispatch never has to come back to the host.
 
         Measured directly rather than asserted structurally: a live
         occluder-translation gradient is exercised in
@@ -443,8 +448,10 @@ class TestVisibilityGradientZero:
 
         # The dispatch index is a plain integer array: no grad_fn, so no
         # gradient can flow through the choice of surface.
-        assert isinstance(comp_indices, np.ndarray)
-        assert np.issubdtype(comp_indices.dtype, np.integer)
+        assert not torch.is_floating_point(comp_indices)
+        assert getattr(comp_indices, "grad_fn", None) is None
+        assert not getattr(comp_indices, "requires_grad", False)
+        assert np.issubdtype(np.asarray(be.to_numpy(comp_indices)).dtype, np.integer)
 
         # The hit *distance*, by contrast, must stay attached -- the landing
         # position depends on it continuously.

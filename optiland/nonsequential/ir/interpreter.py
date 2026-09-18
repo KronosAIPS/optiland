@@ -145,6 +145,8 @@ def apply_primitive_interactions(
     rng: NSQRng,
     log_hit_fn: LogHitFn | None = None,
     ray_id_allocator: RayIdAllocator | None = None,
+    skip_unhit: bool = True,
+    hit_counts: object | None = None,
 ) -> NSQRayBundle | None:
     """Apply each hit primitive's interaction to ``rays``, in-place.
 
@@ -185,6 +187,23 @@ def apply_primitive_interactions(
             ``ir.sampling.split_depth > 0``) -- omit (the default) on the
             Torch backend, which forces ``split_depth=0`` and never spawns
             rays (fixed tensor shapes are required for the autograd graph).
+        skip_unhit: Skip a primitive no ray hit this bounce. Deciding that
+            means reducing the primitive's mask to a Python bool, which is
+            free on a host array and a device synchronisation on a device
+            one -- so a device backend passes False and calls every
+            primitive's ``interact()`` unconditionally. That is a fixed
+            number of interaction kernels per bounce
+            (``docs/theory/12_gpu_mapping.md`` R-12-3), and it is exact
+            rather than merely close: every write inside ``interact()`` is
+            ``be.where(hit_mask, new, old)``, so an all-False mask writes
+            every field back unchanged, and the generator is keyed by
+            ``(ray_id, bounce, slot)`` rather than by draw order, so the
+            discarded draws do not move the stream.
+        hit_counts: Optional :class:`~optiland.nonsequential.backends.tally
+            ._TallyVector` of per-primitive nearest-hit counts, incremented
+            on the device and read once per trace (the unreached-geometry
+            list, and the per-surface hit counter of
+            ``docs/theory/10_ledger_and_diagnostics.md`` R-10-6).
 
     Returns:
         A new :class:`NSQRayBundle` of transmit-branch children spawned by
@@ -194,32 +213,51 @@ def apply_primitive_interactions(
         live bundle -- see
         :meth:`optiland.nonsequential.backends.array_backend.ArrayBackend.trace`.
     """
+    from optiland.nonsequential._tally import masked_count  # noqa: PLC0415
+
     spawned_chunks: list[NSQRayBundle] = []
 
     for i, primitive in enumerate(ir.primitives):
-        mask_i_np = comp_first_np & (comp_idx == i)
-        if not mask_i_np.any():
+        mask_i = comp_first_np & (comp_idx == i)
+        if skip_unhit and not bool(be.any(mask_i)):
             continue
 
         component = components[i]
         assert_component_kind_matches(component, primitive)
         assert_bsdf_matches(component.bsdf, primitive.bsdf)
 
-        if log_hit_fn is not None:
-            log_hit_fn(rays, mask_i_np, primitive.name, t_min)
+        if hit_counts is not None:
+            hit_counts.add_at(i, masked_count(mask_i))
 
-        split_eligible_np = np.zeros_like(mask_i_np)
-        if (
+        if log_hit_fn is not None:
+            log_hit_fn(rays, mask_i, primitive.name, t_min)
+
+        splitting = (
             ray_id_allocator is not None
             and ir.sampling.split_depth > 0
             and primitive.component_kind == "refractive"
-        ):
-            bounce_np = np.asarray(rays.bounce)
-            split_eligible_np = mask_i_np & (bounce_np < ir.sampling.split_depth)
+        )
+        if not splitting:
+            component.interact(
+                rays,
+                t_min,
+                hit_normals,
+                mask_i,
+                rng,
+                primitive.bsdf,
+                hit_n_geom,
+                sampling=ir.sampling,
+            )
+            continue
+
+        # Bounded splitting is the host forward engine only: it selects
+        # rows, which needs a host-resident index list.
+        mask_i_np = np.asarray(be.to_numpy(mask_i), dtype=bool)
+        bounce_np = np.asarray(be.to_numpy(rays.bounce))
+        split_eligible_np = mask_i_np & (bounce_np < ir.sampling.split_depth)
 
         split_idx = np.where(split_eligible_np)[0]
         if split_idx.size == 0:
-            mask_i = be.array(mask_i_np)
             component.interact(
                 rays,
                 t_min,

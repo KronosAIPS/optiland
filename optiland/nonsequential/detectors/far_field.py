@@ -157,3 +157,4 @@ class FarFieldDetector(BaseDetector):
         self._intensity = _new_flat_accumulator(self.num_bins_theta * self.num_bins_phi)
         self._num_rays_hit = 0
         self._total_flux = 0.0
+        self.invalidate_frame()
