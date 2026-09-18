@@ -16,7 +16,11 @@ from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
-from optiland.nonsequential.detectors.base import BaseDetector
+from optiland.nonsequential.detectors.base import (
+    BaseDetector,
+    _accumulate_into,
+    _new_flat_accumulator,
+)
 from optiland.nonsequential.results.spectral_result import SpectralResult
 
 if TYPE_CHECKING:
@@ -99,10 +103,13 @@ class SpectralDetector(BaseDetector):
                 f"nanometres - divide by 1000 (e.g. 550 nm -> 0.55)."
             )
         n_lambda = len(wavelength_bins) - 1
+        self._n_lambda = n_lambda
 
-        self._flux_map = np.zeros(
-            (num_pixels_y, num_pixels_x, n_lambda), dtype=np.float64
-        )
+        # Flat accumulation buffer: shape (ny * nx * n_lambda,). Always
+        # float64, on the active backend and device, mutated in place by
+        # every record() call -- see detectors/base.py. Flat index for
+        # (iy, ix, iwl) is (iy * nx + ix) * n_lambda + iwl.
+        self._flux_map = _new_flat_accumulator(num_pixels_y * num_pixels_x * n_lambda)
         self._num_rays_hit = 0
 
         self._x_edges = np.linspace(
@@ -155,7 +162,7 @@ class SpectralDetector(BaseDetector):
         iwl = np.clip(
             np.searchsorted(self.wavelength_bins, wl_hit, side="right") - 1,
             0,
-            self._flux_map.shape[2] - 1,
+            self._n_lambda - 1,
         )
 
         nx, ny = self.num_pixels_x, self.num_pixels_y
@@ -169,11 +176,18 @@ class SpectralDetector(BaseDetector):
             self._record_bilinear(hx_l, hy_l, flux_hit, iwl, nx, ny, dx, dy)
         self._num_rays_hit += hit_mask_np.sum()
 
+    def _flat_index(self, iy, ix, iwl) -> np.ndarray:
+        """Flatten (iy, ix, iwl) into the flux-map buffer's flat index."""
+        nx = self.num_pixels_x
+        n_lambda = self._n_lambda
+        return ((iy * nx + ix) * n_lambda + iwl).astype(np.int64)
+
     def _record_hard(self, hx_l, hy_l, flux_hit, iwl, nx, ny) -> None:
         """Hard-bin spatial accumulation (see ``IrradianceDetector._record_hard``)."""
         ix = np.clip(np.searchsorted(self._x_edges, hx_l, side="right") - 1, 0, nx - 1)
         iy = np.clip(np.searchsorted(self._y_edges, hy_l, side="right") - 1, 0, ny - 1)
-        np.add.at(self._flux_map, (iy, ix, iwl), flux_hit)
+        flat = self._flat_index(iy, ix, iwl)
+        _accumulate_into(self._flux_map, flat, flux_hit)
 
     def _record_bilinear(self, hx_l, hy_l, flux_hit, iwl, nx, ny, dx, dy) -> None:
         """Bilinear spatial splat (see ``IrradianceDetector._record_bilinear``)."""
@@ -194,7 +208,8 @@ class SpectralDetector(BaseDetector):
         ):
             ix = np.clip(ix0 + dix, 0, nx - 1)
             iy = np.clip(iy0 + diy, 0, ny - 1)
-            np.add.at(self._flux_map, (iy, ix, iwl), flux_hit * wx * wy)
+            flat = self._flat_index(iy, ix, iwl)
+            _accumulate_into(self._flux_map, flat, flux_hit * wx * wy)
 
     def _record_gaussian(self, hx_l, hy_l, flux_hit, iwl, nx, ny, dx, dy) -> None:
         """Gaussian spatial splat, truncated and renormalised per ray so
@@ -223,7 +238,8 @@ class SpectralDetector(BaseDetector):
             for diy in offsets:
                 iy = np.clip(iy0 + diy, 0, ny - 1)
                 weight = (gx[dix] * gy[diy]) / norm
-                np.add.at(self._flux_map, (iy, ix, iwl), flux_hit * weight)
+                flat = self._flat_index(iy, ix, iwl)
+                _accumulate_into(self._flux_map, flat, flux_hit * weight)
 
     def get_result(self) -> SpectralResult:
         """Return accumulated spectral result.
@@ -234,7 +250,10 @@ class SpectralDetector(BaseDetector):
         pixel_area = (self.width / self.num_pixels_x) * (
             self.height / self.num_pixels_y
         )
-        irradiance = self._flux_map / pixel_area
+        flux_map_np = to_numpy(self._flux_map).reshape(
+            self.num_pixels_y, self.num_pixels_x, self._n_lambda
+        )
+        irradiance = flux_map_np / pixel_area
 
         x_centres = 0.5 * (self._x_edges[:-1] + self._x_edges[1:])
         y_centres = 0.5 * (self._y_edges[:-1] + self._y_edges[1:])
@@ -246,11 +265,13 @@ class SpectralDetector(BaseDetector):
             x_coords=x_centres,
             y_coords=y_centres,
             wavelengths=wl_centres,
-            total_flux=float(self._flux_map.sum()),
+            total_flux=float(flux_map_np.sum()),
             num_rays_hit=self._num_rays_hit,
         )
 
     def reset(self) -> None:
         """Clear accumulated data."""
-        self._flux_map[:] = 0.0
+        self._flux_map = _new_flat_accumulator(
+            self.num_pixels_y * self.num_pixels_x * self._n_lambda
+        )
         self._num_rays_hit = 0
