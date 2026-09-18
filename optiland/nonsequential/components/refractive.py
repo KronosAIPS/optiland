@@ -17,6 +17,7 @@ from optiland.backend.utils import to_numpy
 from optiland.nonsequential import _tol
 from optiland.nonsequential.components.base import BaseComponent
 from optiland.nonsequential.components.coating_support import (
+    evaluate_transmissive_coating,
     reject_polarized_coating,
 )
 from optiland.nonsequential.materials.nsq_material import medium_stack_id
@@ -101,12 +102,16 @@ class RefractiveComponent(BaseComponent):
             scatter_fraction: Probability that a hit ray is routed through
                 ``bsdf`` rather than refracted.
             coating: Optional ``optiland.coatings.BaseCoating`` (e.g.
-                ``SimpleCoating``). When set, its ``.reflectance``/
-                ``.transmittance`` replace the bare Fresnel R/T so NSQ
-                agrees with the sequential engine's coating model. Must be
-                unpolarized -- a ``BaseCoatingPolarized`` instance raises
-                ``NotImplementedError`` immediately, since NSQ rays carry no
-                polarization state.
+                ``SimpleCoating``) or a
+                ``coating_support.UnpolarizedThinFilmCoating``. When set, its
+                R/T (via ``evaluate_transmissive_coating`` --
+                wavelength-only for ``SimpleCoating``, wavelength- and
+                angle-of-incidence-dependent for
+                ``UnpolarizedThinFilmCoating``) replace the bare Fresnel R/T
+                so NSQ agrees with the sequential engine's coating model.
+                Must be unpolarized -- a ``BaseCoatingPolarized`` instance
+                raises ``NotImplementedError`` immediately, since NSQ rays
+                carry no polarization state.
         """
         reject_polarized_coating(coating, surface_name=name)
         self.coating = coating
@@ -251,12 +256,17 @@ class RefractiveComponent(BaseComponent):
         R_fresnel = be.where(tir, be.ones_like(rs), 0.5 * (rs**2 + rp**2))
 
         # A coating overrides the bare Fresnel R/T with its own (possibly
-        # wavelength-independent, possibly lossy: R + T < 1) values -- except
-        # under TIR, where there is no real transmitted wave regardless of
-        # what the coating claims, so reflection stays forced to R=1, T=0.
+        # wavelength- and angle-dependent, possibly lossy: R + T < 1) values
+        # -- except under TIR, where there is no real transmitted wave
+        # regardless of what the coating claims, so reflection stays forced
+        # to R=1, T=0. evaluate_transmissive_coating dispatches on what the
+        # coating exposes -- see coating_support.py -- so a scalar
+        # SimpleCoating and an angle-dependent UnpolarizedThinFilmCoating
+        # both flow through this one call.
         if self.coating is not None:
-            R_used = be.ones_like(R_fresnel) * float(self.coating.reflectance)
-            T_used = be.ones_like(R_fresnel) * float(self.coating.transmittance)
+            R_used, T_used = evaluate_transmissive_coating(
+                self.coating, wl, cos_theta_i
+            )
         else:
             R_used = R_fresnel
             T_used = 1.0 - R_fresnel
