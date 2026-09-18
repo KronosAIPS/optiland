@@ -13,7 +13,10 @@ import numpy as np
 import optiland.backend as be
 from optiland.backend.utils import is_torch_tensor, to_numpy
 from optiland.nonsequential import _tol
-from optiland.nonsequential.components.base import _get_transform
+from optiland.nonsequential.components.base import (
+    _get_transform,
+    coordinate_magnitude,
+)
 
 if TYPE_CHECKING:
     from optiland.coordinate_system import CoordinateSystem
@@ -189,8 +192,10 @@ class BaseDetector(ABC):
         directions_l = directions_g @ R_arr
 
         # Self-intersection accept threshold from the ray's *global*-frame
-        # magnitude -- see BaseComponent.intersect for why global, not local.
-        t_min = _tol.accept_t_min(be.abs(positions_g).max())
+        # magnitude, per ray -- see BaseComponent.intersect for why global
+        # rather than local, and why per ray rather than one scalar for the
+        # whole bundle.
+        t_min = _tol.accept_t_min(coordinate_magnitude(rays))
         t_hit, normals_l, hit_mask, _n_geom_l = self.geometry.ray_intersect(
             positions_l, directions_l, eps=t_min
         )

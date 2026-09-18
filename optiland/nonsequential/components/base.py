@@ -139,7 +139,15 @@ class BaseComponent(ABC):
         # tighter than the rounding error actually carried in the ray's
         # tracked position, reintroducing self-hit instability rather than
         # removing it.
-        t_min = _tol.accept_t_min(be.abs(positions_g).max())
+        #
+        # Per ray, not one scalar for the whole bundle: the rounding a ray's
+        # own position carries is set by that ray's own coordinate, and one
+        # distant ray must not coarsen the threshold for every other ray
+        # (at float32 a bundle reaching 1e4 mm would put the threshold at
+        # 1e-2 mm for all of them, which skips a thin plate or a cemented
+        # interface). It also removes a full-bundle reduction to a scalar
+        # from the inner loop, which on a GPU is a device-to-host sync.
+        t_min = _tol.accept_t_min(coordinate_magnitude(rays))
         # A geometry's own root-validity tests compare the LOCAL parameter
         # (t_local) against eps, e.g. "t_local > eps"; what must actually
         # hold is "t_local + t_adv > t_min" (a genuine forward hit in the
@@ -243,6 +251,25 @@ class BaseComponent(ABC):
         """
         transform = _get_transform(self.cs)
         return self.geometry.bounding_box(transform)
+
+
+def coordinate_magnitude(rays: NSQRayBundle) -> np.ndarray:
+    """Per-ray infinity norm of the global position, shape (N,).
+
+    The scale the ray's own tracked position is resolved at, and so the
+    scale every self-intersection threshold is measured in
+    (docs/theory/07_geometry.md R-07-5). Built from the three coordinate
+    arrays rather than from a stacked (N, 3) array so it costs no extra
+    allocation, and reduced per ray rather than over the bundle so one
+    distant ray cannot coarsen every other ray's threshold.
+
+    Args:
+        rays: The ray bundle, in global coordinates.
+
+    Returns:
+        ``max(|x|, |y|, |z|)`` per ray, in the working backend and dtype.
+    """
+    return be.maximum(be.maximum(be.abs(rays.x), be.abs(rays.y)), be.abs(rays.z))
 
 
 def _get_transform(cs: CoordinateSystem) -> tuple[np.ndarray, np.ndarray]:
