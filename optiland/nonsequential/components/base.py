@@ -261,48 +261,9 @@ class BaseComponent(ABC):
                 ``hit_mask``.
             hit_mask: Rays to advance, shape (N,).
         """
-        # Missed rays carry t = inf; zero it for the differentiable update
-        # so a masked-out be.where branch cannot inject 0 * inf = NaN into
-        # the backward pass.
-        t_safe = be.where(hit_mask, t, be.zeros_like(t))
-        x_g = rays.x + t_safe * rays.L
-        y_g = rays.y + t_safe * rays.M
-        z_g = rays.z + t_safe * rays.N
-
-        cached = self._local_root
-        # Same array type as well as same shape: a cache left over from a
-        # trace on the other backend would otherwise reach a mixed
-        # NumPy/Torch comparison below.
-        if (
-            cached is not None
-            and type(cached[0]) is type(t)
-            and cached[0].shape == t.shape
-        ):
-            t_adv, t_local = cached
-            # Per-ray, elementwise: no reduction, so no device-to-host sync.
-            usable = hit_mask & (t_adv + t_local == t)
-            adv_safe = be.where(usable, t_adv, be.zeros_like(t_adv))
-            loc_safe = be.where(usable, t_local, be.zeros_like(t_local))
-
-            t_be, R_be = _resident_transform(self)
-            positions_g = be.stack([rays.x, rays.y, rays.z], axis=1)
-            directions_l = be.stack([rays.L, rays.M, rays.N], axis=1) @ R_be
-            # Bitwise the advanced origin intersect() solved from: same
-            # inputs, same operations, and this ray's position has not been
-            # touched since (one bounce moves each ray at exactly one
-            # component).
-            positions_adv = (
-                (positions_g - t_be) @ R_be + adv_safe[:, None] * directions_l
-            )
-            hit_l = positions_adv + loc_safe[:, None] * directions_l
-            hit_g = hit_l @ R_be.T + t_be
-            x_g = be.where(usable, hit_g[:, 0], x_g)
-            y_g = be.where(usable, hit_g[:, 1], y_g)
-            z_g = be.where(usable, hit_g[:, 2], z_g)
-
-        rays.x = be.where(hit_mask, x_g, rays.x)
-        rays.y = be.where(hit_mask, y_g, rays.y)
-        rays.z = be.where(hit_mask, z_g, rays.z)
+        advance_to_hit_in_frame(
+            rays, t, hit_mask, self._local_root, _resident_transform(self)
+        )
 
     def offset_from_surface(
         self, rays: NSQRayBundle, n_geom: np.ndarray, hit_mask: np.ndarray
@@ -344,17 +305,7 @@ class BaseComponent(ABC):
                 normal, never an interpolated one.
             hit_mask: Rays that interacted with this component, shape (N,).
         """
-        dot = rays.L * n_geom[:, 0] + rays.M * n_geom[:, 1] + rays.N * n_geom[:, 2]
-        delta = _tol.origin_offset(coordinate_magnitude(rays))
-        # Sign from the outgoing hemisphere. A direction exactly in the
-        # surface plane (dot == 0) never re-crosses it -- the geometries
-        # reject a parallel ray on the denominator test -- so either sign
-        # is safe there; +1 keeps the expression branch-free.
-        signed = be.where(dot < 0, -delta, delta)
-        step = be.where(hit_mask, signed, be.zeros_like(signed))
-        rays.x = rays.x + step * n_geom[:, 0]
-        rays.y = rays.y + step * n_geom[:, 1]
-        rays.z = rays.z + step * n_geom[:, 2]
+        offset_origin_from_surface(rays, n_geom, hit_mask)
 
     @abstractmethod
     def interact(
@@ -422,6 +373,100 @@ class BaseComponent(ABC):
         return self.geometry.bounding_box(transform)
 
 
+def advance_to_hit_in_frame(rays, t, hit_mask, local_root, transform) -> None:
+    """Move every ray in ``hit_mask`` onto its hit point, rebuilt in a frame.
+
+    The body of :meth:`BaseComponent.advance_to_hit`, as a function, because
+    a *transmissive* detector needs exactly the same treatment and is not a
+    component: a ray that a detector lets through carries on from the point
+    this puts it at, and the next bounce intersects that same plane again
+    (``docs/build/X1_threshold_arithmetic.md`` section 7, note 4).
+
+    Args:
+        rays: Ray bundle, updated in place.
+        t: Per-ray hit distance [mm], shape (N,). ``inf`` outside
+            ``hit_mask``.
+        hit_mask: Rays to advance, shape (N,).
+        local_root: The ``(t_adv, t_local)`` pair the surface's own last
+            intersect left behind, or ``None``. Each ray checks for itself
+            that the two still compose to the ``t`` it is being advanced by,
+            and a ray whose check fails falls back to the plain global
+            update -- per ray, and without a host synchronisation.
+        transform: The surface's ``(translation, rotation)`` on the array
+            backend.
+    """
+    # Missed rays carry t = inf; zero it for the differentiable update
+    # so a masked-out be.where branch cannot inject 0 * inf = NaN into
+    # the backward pass.
+    t_safe = be.where(hit_mask, t, be.zeros_like(t))
+    x_g = rays.x + t_safe * rays.L
+    y_g = rays.y + t_safe * rays.M
+    z_g = rays.z + t_safe * rays.N
+
+    # Same array type as well as same shape: a cache left over from a
+    # trace on the other backend would otherwise reach a mixed
+    # NumPy/Torch comparison below.
+    if (
+        local_root is not None
+        and type(local_root[0]) is type(t)
+        and local_root[0].shape == t.shape
+    ):
+        t_adv, t_local = local_root
+        # Per-ray, elementwise: no reduction, so no device-to-host sync.
+        usable = hit_mask & (t_adv + t_local == t)
+        adv_safe = be.where(usable, t_adv, be.zeros_like(t_adv))
+        loc_safe = be.where(usable, t_local, be.zeros_like(t_local))
+
+        t_be, R_be = transform
+        positions_g = be.stack([rays.x, rays.y, rays.z], axis=1)
+        directions_l = be.stack([rays.L, rays.M, rays.N], axis=1) @ R_be
+        # Bitwise the advanced origin intersect() solved from: same
+        # inputs, same operations, and this ray's position has not been
+        # touched since (one bounce moves each ray at exactly one
+        # component).
+        positions_adv = (
+            (positions_g - t_be) @ R_be + adv_safe[:, None] * directions_l
+        )
+        hit_l = positions_adv + loc_safe[:, None] * directions_l
+        hit_g = hit_l @ R_be.T + t_be
+        x_g = be.where(usable, hit_g[:, 0], x_g)
+        y_g = be.where(usable, hit_g[:, 1], y_g)
+        z_g = be.where(usable, hit_g[:, 2], z_g)
+
+    rays.x = be.where(hit_mask, x_g, rays.x)
+    rays.y = be.where(hit_mask, y_g, rays.y)
+    rays.z = be.where(hit_mask, z_g, rays.z)
+
+
+def offset_origin_from_surface(rays, n_geom, hit_mask) -> None:
+    """Push an outgoing ray's origin off the surface it has just left.
+
+    The body of :meth:`BaseComponent.offset_from_surface`, as a function,
+    for the same reason :func:`advance_to_hit_in_frame` is one: a
+    transmissive detector leaves a ray on a plane the ray is about to be
+    tested against again, and a grazing crossing turns the half-ulp it lands
+    off that plane by into a root above the accept threshold.
+
+    Args:
+        rays: Ray bundle, updated in place. Positions must already be at the
+            hit point and directions must already be the outgoing ones.
+        n_geom: Geometric (unflipped) surface normal in the global frame,
+            shape (N, 3).
+        hit_mask: Rays that interacted with this surface, shape (N,).
+    """
+    dot = rays.L * n_geom[:, 0] + rays.M * n_geom[:, 1] + rays.N * n_geom[:, 2]
+    delta = _tol.origin_offset(coordinate_magnitude(rays))
+    # Sign from the outgoing hemisphere. A direction exactly in the
+    # surface plane (dot == 0) never re-crosses it -- the geometries
+    # reject a parallel ray on the denominator test -- so either sign
+    # is safe there; +1 keeps the expression branch-free.
+    signed = be.where(dot < 0, -delta, delta)
+    step = be.where(hit_mask, signed, be.zeros_like(signed))
+    rays.x = rays.x + step * n_geom[:, 0]
+    rays.y = rays.y + step * n_geom[:, 1]
+    rays.z = rays.z + step * n_geom[:, 2]
+
+
 def coordinate_magnitude(rays: NSQRayBundle) -> np.ndarray:
     """Per-ray infinity norm of the global position, shape (N,).
 
@@ -470,6 +515,40 @@ def _resident_transform(component) -> tuple:
         return cached()
     translation, rot = _get_transform(component.cs)
     return be.array(translation), be.array(rot)
+
+
+def resident_table(owner, name: str, values):
+    """A constant lookup table of ``owner``'s, uploaded to the backend once.
+
+    Bin edges, a tabulated inverse CDF, a measured BSDF grid: all of them
+    are configuration, not ray data. They are built once from the object's
+    own parameters and never change during a trace, so the arithmetic that
+    reads them has no reason to leave the device -- but only if the table is
+    there too, which is what this uploads and keeps
+    (``docs/theory/12_gpu_mapping.md`` R-12-8, the rule
+    :func:`_resident_transform` follows for a placement).
+
+    The cache is keyed on the backend configuration, so an object reused
+    across a NumPy trace and a Torch one gets the right array each time.
+
+    Args:
+        owner: The object the table belongs to; the cache lives on it.
+        name: Key for this table on this object.
+        values: The table, as NumPy values.
+
+    Returns:
+        The table as an array of the active backend, in its working dtype
+        and on its device.
+    """
+    key = _backend_key()
+    if getattr(owner, "_be_tables_key", None) != key:
+        owner._be_tables = {}
+        owner._be_tables_key = key
+    cached = owner._be_tables.get(name)
+    if cached is None:
+        cached = be.array(np.asarray(values, dtype=np.float64))
+        owner._be_tables[name] = cached
+    return cached
 
 
 def _backend_key() -> tuple:

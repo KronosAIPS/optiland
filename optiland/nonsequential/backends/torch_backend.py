@@ -8,9 +8,11 @@ to running it on torch tensors on a device:
   field of a freshly generated bundle -- floats, the alive flag, the bounce
   and ray-id integers, and the medium-stack table -- onto the backend's
   device. Nothing in the trace path then refers to a host array.
-- **fixed shapes**: the bundle is never compacted, so the autograd graph is
-  a single clean chain of fixed-shape operations and no bounce needs a
-  boolean-mask gather (whose output shape is a device read).
+- **bucketed compaction**: in forward-only mode the bundle is gathered down
+  to a width from a fixed ladder once fewer than half its rays are alive, so
+  dead rays stop costing a full-width bounce while the set of tensor shapes
+  a trace uses stays small and known. In gradient mode the width is left
+  alone, so the autograd graph is a single chain of fixed-shape operations.
 - **loop control**: ``host_reads_free = False`` tells the loop that
   reducing a per-ray mask to a Python bool is a synchronisation, so the
   loop skips nothing and takes a bounded trip count, asking whether any ray
@@ -33,7 +35,11 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.backend.utils import to_numpy
-from optiland.nonsequential.backends.array_backend import ArrayBackend
+from optiland.nonsequential.backends.array_backend import (
+    ArrayBackend,
+    bucketed_width,
+)
+from optiland.nonsequential.ray_bundle import backend_live_permutation
 from optiland.nonsequential.rng import NSQRng
 
 if TYPE_CHECKING:
@@ -48,19 +54,26 @@ class TorchBackend(ArrayBackend):
     through the entire trace so that ``result.detectors[name].data.backward()``
     propagates gradients to scene parameters.
 
-    Compaction is disabled: dead rays (``alive=False``) carry zero throughput
-    and participate in all operations as no-ops; the tensor shape stays fixed
-    across bounces so the graph remains clean.
+    In **gradient mode** compaction is disabled: dead rays
+    (``alive=False``) carry zero throughput and participate in all
+    operations as no-ops, and the tensor shape stays fixed across bounces so
+    the graph remains a clean chain. The gather itself would be
+    differentiable -- its adjoint is a scatter into a zero-filled buffer of
+    the original width, exact and cheap -- so this is a shape decision, not
+    a correctness one (``docs/theory/12_gpu_mapping.md`` section 12.3,
+    ``docs/theory/09_differentiation.md`` R-09-11).
 
-    It stays disabled in forward-only mode too, which is a decision and not
-    an oversight. Compaction by boolean mask costs one device-to-host
-    synchronisation per bounce, because the width of its own output is a
-    property of the data -- which is the cost this backend exists to avoid,
-    and it would put back per bounce exactly what the rest of the loop gives
-    up. The saving is real and worth having: ``docs/theory/12_gpu_mapping.md``
-    R-12-6 gets it without the read by rounding the live count up to a fixed
-    ladder of bucketed widths, so the shape is chosen from a small known set
-    rather than measured. That is the next item, not this one.
+    In **forward-only mode** the bundle is compacted to a bucketed width
+    (R-12-6). Two things make that free of a synchronisation of its own:
+    the width comes from a fixed ladder (:func:`~optiland.nonsequential
+    .backends.array_backend.bucketed_width`) rather than from the live count
+    directly, and the one read the ladder needs is the live count the
+    alive check already makes -- taken once per period and handed to both
+    (:meth:`~optiland.nonsequential.backends.array_backend.ArrayBackend
+    ._live_count`). A plain boolean-mask gather was the formulation ruled
+    out here before, and for the right reason: the width of its own output
+    is a property of the data, so it costs a read per bounce whatever the
+    loop does.
 
     Gradient strategy is "autograd" (naive attached graph) in v1. A pluggable
     ``gradient_mode`` seam is provided for future Path Replay Backpropagation.
@@ -81,7 +94,8 @@ class TorchBackend(ArrayBackend):
             assumed. A fixed trip count runs every bounce at full width
             whether or not anything is still alive, and on a scene whose
             rays die at bounce 3 of 16 that is four times the work. On the
-            quick-start singlet at 1e6 rays on this CPU, in float64:
+            quick-start singlet at 1e6 rays on this CPU, in float64, before
+            compaction existed:
 
                 period   host reads/bounce   rays/s
                 0                        0   68,067
@@ -89,13 +103,14 @@ class TorchBackend(ArrayBackend):
                 2                      0.5   174,604
                 4                     0.25   134,620
 
-            So the last synchronisation is worth keeping until the dead
-            rays stop costing anything, and what makes them stop costing is
-            compaction to bucketed widths (R-12-6), not the trip count.
-            Until that lands, 1 removes 96% of this engine's per-bounce
-            synchronisations and keeps the early exit that pays for the
-            other 4%; 0 is one argument away for a device run that would
-            rather have neither.
+            The same read now also selects the compaction bucket, so at the
+            default the loop makes one synchronisation per bounce and gets
+            both the early exit and the narrowing out of it. 0 turns off
+            both, for a device run that would rather have neither.
+        compact_every: How often the bundle may be compacted to a bucketed
+            width. ``None`` (the default) follows ``alive_check_every``, so
+            the two share their one read. Set it explicitly only to measure
+            one without the other.
     """
 
     host_reads_free = False
@@ -107,6 +122,7 @@ class TorchBackend(ArrayBackend):
         seed: int | None = None,
         gradient_mode: Literal["autograd"] = "autograd",
         alive_check_every: int | None = None,
+        compact_every: int | None = None,
     ) -> None:
         """Initialize TorchBackend.
 
@@ -116,6 +132,9 @@ class TorchBackend(ArrayBackend):
                 ``"autograd"`` is supported; "prb" is the planned follow-up.
             alive_check_every: Override the class default (see the class
                 docstring). 0 disables the check entirely.
+            compact_every: Override the compaction period, which otherwise
+                follows ``alive_check_every``. 0 disables compaction, which
+                is what gradient mode does for itself.
         """
         self.seed = seed
         self.gradient_mode = gradient_mode
@@ -123,6 +142,70 @@ class TorchBackend(ArrayBackend):
         self.rng = NSQRng(seed)
         if alive_check_every is not None:
             self.alive_check_every = int(alive_check_every)
+        self.compact_every = compact_every
+
+    def _gradient_mode(self, rays: NSQRayBundle) -> bool:
+        """True when any field of the bundle is on an autograd graph.
+
+        A host-side attribute read on each of the bundle's float fields --
+        ``requires_grad`` is a property of the tensor, not of its contents,
+        so asking costs no synchronisation. True for a leaf that requires a
+        gradient and for anything derived from one, which is what makes a
+        scene whose gradients enter at a surface (rather than at the source)
+        switch to fixed shapes as soon as that surface is reached.
+
+        Args:
+            rays: Current ray bundle.
+
+        Returns:
+            True when the width must stay fixed.
+        """
+        return any(
+            getattr(field, "requires_grad", False)
+            for field in (
+                rays.x,
+                rays.y,
+                rays.z,
+                rays.L,
+                rays.M,
+                rays.N,
+                rays.flux,
+                rays.wavelength,
+                rays.n_current,
+                rays.k_current,
+            )
+        )
+
+    def _maybe_compact(self, rays: NSQRayBundle, depth: int) -> NSQRayBundle:
+        """Gather the live rays down to a bucketed width.
+
+        Runs at the end of every ``compaction_period``-th bounce, and only
+        in forward-only mode. The width comes from
+        :func:`~optiland.nonsequential.backends.array_backend
+        .bucketed_width`, which returns the bundle's current width while
+        more than half its rays are alive -- so the gather is skipped
+        entirely until it pays for itself, which is the alive-fraction
+        trigger R-12-6 asks for.
+
+        Args:
+            rays: Current ray bundle.
+            depth: Bounces already run for this batch, counting from 0.
+
+        Returns:
+            The bundle, narrowed or unchanged.
+        """
+        period = self.compaction_period
+        if not period or (depth + 1) % period:
+            return rays
+        if self._gradient_mode(rays):
+            return rays
+
+        n_live = self._live_count(rays)
+        width = bucketed_width(n_live, rays.num_rays)
+        if width >= rays.num_rays:
+            return rays
+        perm = backend_live_permutation(rays.alive, n_live)
+        return rays.take(perm[:width])
 
     def _check_sampling_support(self, ir) -> None:
         """Refuse bounded splitting, loudly.

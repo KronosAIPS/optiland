@@ -15,7 +15,10 @@ from optiland.backend.utils import is_torch_tensor, to_numpy
 from optiland.nonsequential import _tol
 from optiland.nonsequential.components.base import (
     _get_transform,
+    advance_to_hit_in_frame,
     coordinate_magnitude,
+    offset_origin_from_surface,
+    resident_table,
 )
 
 if TYPE_CHECKING:
@@ -85,64 +88,6 @@ def _flat_index_like(buffer, flat_np):
     return flat_np
 
 
-def floor_to_int(x):
-    """Floor ``x`` to an integer array of the same library and device.
-
-    The bin a hit lands in is a discrete function of the landing position,
-    so it never carries a gradient -- but it does not have to be computed
-    on the host either, and computing it there is a device-to-host copy per
-    detector per bounce.
-
-    Args:
-        x: Continuous pixel coordinate, shape (N,).
-
-    Returns:
-        ``floor(x)`` as an int64 array/tensor beside ``x``.
-    """
-    if is_torch_tensor(x):
-        import torch  # noqa: PLC0415
-
-        return torch.floor(x).to(torch.int64)
-    return np.floor(x).astype(np.int64)
-
-
-def int_to_float_like(idx, like):
-    """Cast an integer index array back to ``like``'s float dtype.
-
-    Args:
-        idx: Integer array/tensor.
-        like: Array/tensor whose dtype and device to match.
-
-    Returns:
-        ``idx`` as a float array/tensor beside ``like``.
-    """
-    if is_torch_tensor(idx):
-        return idx.to(dtype=like.dtype)
-    return idx.astype(np.float64)
-
-
-def clamp_int(idx, lo: int, hi: int):
-    """Clamp an integer index array into ``[lo, hi]``.
-
-    ``be.clip``/``be.maximum`` push both operands through ``array()``, which
-    carries the working float precision -- so an integer clamp written with
-    them comes back as floats. ``be.where`` does not.
-
-    Args:
-        idx: Integer array/tensor.
-        lo: Lower bound, inclusive.
-        hi: Upper bound, inclusive.
-
-    Returns:
-        The clamped indices, still integer.
-    """
-    if is_torch_tensor(idx):
-        import torch  # noqa: PLC0415
-
-        return torch.clamp(idx, lo, hi)
-    return np.clip(idx, lo, hi)
-
-
 def _accumulate_into(buffer, flat_np, contribution) -> None:
     """Scatter-add ``contribution`` into ``buffer`` in place, in float64.
 
@@ -157,14 +102,14 @@ def _accumulate_into(buffer, flat_np, contribution) -> None:
     and the in-place ``index_add_``; ``buffer`` itself never needs to
     require grad on its own account (see :func:`_new_flat_accumulator`).
 
-    ``flat_np`` is always a plain NumPy int64 index array: the bin index is
-    a discrete function of the hit position (docs/theory/12_gpu_mapping.md
-    S12.5) and is computed on the host in every splatting detector,
-    gradient support or not -- this is unchanged from before this fix.
+    ``flat_np`` is an integer index array of whichever library the detector
+    computed it in: the bin index is a discrete function of the hit position
+    (docs/theory/12_gpu_mapping.md S12.5) and so carries no gradient, but it
+    is computed beside the ray state and stays there.
 
     Args:
         buffer: Persistent float64 accumulation buffer, shape (size,).
-        flat_np: Flat bin indices for each contribution, shape (K,), int64.
+        flat_np: Flat bin indices for each contribution, shape (K,), integer.
         contribution: Values to add, shape (K,), any array-like.
     """
     if is_torch_tensor(buffer):
@@ -230,6 +175,30 @@ class BaseDetector(ABC):
         self.name = name
         self.absorb = bool(absorb)
         self._frame = None
+        self._be_tables: dict[str, object] = {}
+        self._be_tables_key = None
+        # The two parts of the last solved hit distance, for a transmissive
+        # detector's hit-point rebuild -- see intersect(). Transient
+        # per-bounce scratch, rewritten by every intersect() call and
+        # validated per ray before use, never scene state.
+        self._local_root: tuple[np.ndarray, np.ndarray] | None = None
+
+    def table(self, name: str, values):
+        """A constant lookup table of this detector's, resident on the backend.
+
+        Bin edges, bin centres and the like are scene data, not ray data, so
+        the binning arithmetic that reads them stays where the ray state is
+        -- see :func:`~optiland.nonsequential.components.base
+        .resident_table`. The cache is dropped by :meth:`reset`.
+
+        Args:
+            name: Key for this table on this detector.
+            values: The table, as NumPy values.
+
+        Returns:
+            The table as an array of the active backend.
+        """
+        return resident_table(self, name, values)
 
     def frame(self):
         """This detector's global->local transform, as backend arrays.
@@ -250,19 +219,36 @@ class BaseDetector(ABC):
         return self._frame
 
     def invalidate_frame(self) -> None:
-        """Drop the cached transform; the next bounce resolves it again."""
+        """Drop the cached transform and tables; the next trace rebuilds them."""
         self._frame = None
+        self._be_tables = {}
+        self._be_tables_key = None
 
     def intersect(
         self, rays: NSQRayBundle
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Find ray intersections with this detector surface.
+
+        An **absorbing** detector is terminal: the ray stops there, its
+        recorded position is never fed back into another intersection, and
+        the solve is the plain one it has always been
+        (``docs/build/X1_threshold_arithmetic.md`` section 7, note 4).
+
+        A **transmissive** detector is not. The ray carries on from the
+        point the loop puts it at and the next bounce tests this same plane
+        again, so the hit point has to be rebuildable in the detector's own
+        frame -- which means solving from an origin advanced into the
+        plane's neighbourhood and keeping the advance and the residual as
+        two numbers, exactly as :meth:`~optiland.nonsequential.components
+        .base.BaseComponent.intersect` does. That is the only difference
+        between the two branches below.
 
         Args:
             rays: Ray bundle in global coordinates.
 
         Returns:
-            Tuple (t, normals, hit_mask) in global frame.
+            Tuple (t, normals, hit_mask, n_geom) in the global frame, with
+            ``n_geom`` the geometric (unflipped) surface normal.
         """
         t_arr, R_arr = self.frame()
 
@@ -277,16 +263,33 @@ class BaseDetector(ABC):
         # rather than local, and why per ray rather than one scalar for the
         # whole bundle.
         t_min = _tol.accept_t_min(coordinate_magnitude(rays))
-        t_hit, normals_l, hit_mask, _n_geom_l = self.geometry.ray_intersect(
-            positions_l, directions_l, eps=t_min
-        )
+
+        if self.absorb:
+            self._local_root = None
+            t_local, normals_l, hit_mask, n_geom_l = self.geometry.ray_intersect(
+                positions_l, directions_l, eps=t_min
+            )
+            t_adv = None
+        else:
+            t_adv = -(positions_l * directions_l).sum(axis=1)
+            positions_adv = positions_l + t_adv[:, None] * directions_l
+            t_local, normals_l, hit_mask, n_geom_l = self.geometry.ray_intersect(
+                positions_adv, directions_l, eps=t_min - t_adv
+            )
 
         # Geometry may return numpy arrays even in torch-backend mode (geometry
         # internals are numpy-based). Convert to the current backend format so
         # that be.where dispatches correctly in both NumPy and Torch paths.
-        t_hit = be.array(t_hit)
+        t_local = be.array(t_local)
         normals_l = be.array(normals_l)
         hit_mask = be.array(hit_mask)
+        n_geom_l = be.array(n_geom_l)
+
+        if t_adv is None:
+            t_hit = t_local
+        else:
+            t_hit = t_local + t_adv
+            self._local_root = (t_adv, t_local)
 
         # Note the accept/reject decision before overwriting t_hit -- see
         # BaseComponent.intersect for why checking the post-overwrite value
@@ -300,7 +303,40 @@ class BaseDetector(ABC):
         hit_mask = hit_mask & alive_be
 
         normals_g = normals_l @ R_arr.T
-        return t_hit, normals_g, hit_mask
+        n_geom_g = n_geom_l @ R_arr.T
+        return t_hit, normals_g, hit_mask, n_geom_g
+
+    def advance_to_hit(self, rays: NSQRayBundle, t, hit_mask) -> None:
+        """Move every ray in ``hit_mask`` onto this detector's plane.
+
+        Only a transmissive detector needs this -- see :meth:`intersect`.
+        An absorbing detector has no ``_local_root``, and the shared helper
+        then falls back to the plain global update per ray.
+
+        Args:
+            rays: Ray bundle, updated in place.
+            t: Per-ray hit distance [mm], shape (N,).
+            hit_mask: Rays that reached this detector, shape (N,).
+        """
+        advance_to_hit_in_frame(
+            rays, t, hit_mask, self._local_root, self.frame()
+        )
+
+    def offset_from_surface(self, rays: NSQRayBundle, n_geom, hit_mask) -> None:
+        """Push a transmitted ray's origin clear of this detector's plane.
+
+        R-07-6, for the same reason a surface needs it: a ray crossing a
+        plane at a grazing angle turns the half-ulp it lands off that plane
+        by into a path-length root above the accept threshold, and the plane
+        records it a second time. Only rays the detector let through are
+        offset; a ray an absorbing detector stopped is terminal.
+
+        Args:
+            rays: Ray bundle, updated in place.
+            n_geom: Geometric surface normal in the global frame, (N, 3).
+            hit_mask: Rays that crossed this detector, shape (N,).
+        """
+        offset_origin_from_surface(rays, n_geom, hit_mask)
 
     @abstractmethod
     def record(self, rays: NSQRayBundle, t: np.ndarray, hit_mask: np.ndarray) -> None:

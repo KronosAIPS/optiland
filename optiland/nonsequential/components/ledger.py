@@ -80,6 +80,29 @@ class LedgerBooking:
             masked_sum(detached(flux * residual_fraction), hit_mask)
         )
 
+    def book_lobe(self, flux, gate, albedo_gate, hit_mask) -> None:
+        """Split a BSDF lobe's ``1 - gate`` between the two bins.
+
+        A lobe whose weight is a physical fraction of the incident flux
+        (``BaseBSDF.weight_is_albedo``) passes ``albedo_gate is gate`` and
+        the whole of ``1 - gate`` is a surface loss. A lobe whose weight is
+        a sampling weight passes the surface's albedo as ``albedo_gate``:
+        ``1 - albedo_gate`` is then what the surface physically kept and
+        ``albedo_gate - gate`` is the estimator's event residual, which has
+        expectation zero. The two always sum to ``1 - gate``, so the
+        identity closes the same either way.
+
+        Args:
+            flux: Per-ray flux *before* the lobe's weight is applied.
+            gate: Per-ray weight the lobe returned, 1 off the lobe.
+            albedo_gate: Per-ray albedo, 1 off the lobe; ``gate`` itself
+                when the weight is already an albedo.
+            hit_mask: Per-ray mask of rays interacting with this surface.
+        """
+        self.book_loss(flux, 1.0 - albedo_gate, hit_mask)
+        if albedo_gate is not gate:
+            self.book_residual(flux, albedo_gate - gate, hit_mask)
+
     @property
     def coating_loss(self) -> float:
         """Flux booked into the coating bin this trace [W]."""

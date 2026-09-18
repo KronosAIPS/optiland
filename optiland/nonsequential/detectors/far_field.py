@@ -11,8 +11,9 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from optiland.nonsequential._utils import to_numpy
-from optiland.nonsequential.components.base import _get_transform
+import optiland.backend as be
+from optiland.nonsequential._tally import Tally, masked_count, masked_sum
+from optiland.nonsequential._utils import clamp_int, to_numpy
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
@@ -72,66 +73,85 @@ class FarFieldDetector(BaseDetector):
         # place by every record() call -- see detectors/base.py.
         self._intensity = _new_flat_accumulator(num_bins_theta * num_bins_phi)
         self._num_rays_hit = 0
-        self._total_flux = 0.0
+        self._total_flux = Tally()
 
         self._theta_edges = np.linspace(0.0, theta_max_deg, num_bins_theta + 1)
         self._phi_edges = np.linspace(-180.0, 180.0, num_bins_phi + 1)
+        # Per-bin solid angle, sin(theta_centre) * dtheta * dphi, held as a
+        # table rather than recomputed per ray: it depends only on the bin,
+        # so the per-ray work is one gather.
+        self._sin_theta_centres = np.sin(
+            np.radians(0.5 * (self._theta_edges[:-1] + self._theta_edges[1:]))
+        )
+        self._d_theta = float(np.radians(self._theta_edges[1] - self._theta_edges[0]))
+        self._d_phi = float(np.radians(self._phi_edges[1] - self._phi_edges[0]))
 
     def record(self, rays: NSQRayBundle, t: np.ndarray, hit_mask: np.ndarray) -> None:
         """Accumulate angular flux from hit rays.
 
-        Converts ray directions to (theta, phi) in local detector frame and bins.
+        Converts ray directions to (theta, phi) in the local detector frame
+        and bins them, in the active backend's own operations: the rotation
+        comes from the placement resolved once per trace
+        (:meth:`~optiland.nonsequential.detectors.base.BaseDetector.frame`),
+        the bin edges and the per-bin solid angle from tables uploaded once
+        (:meth:`~optiland.nonsequential.detectors.base.BaseDetector.table`),
+        and the direction of a ray that did not hit is masked to zero rather
+        than gathered out -- so nothing here needs to know how many rays hit
+        and the method costs no device-to-host transfer.
 
         Args:
             rays: Current ray bundle.
-            t: Hit distances [mm], shape (N,).
-            hit_mask: Boolean mask of hitting rays, shape (N,).
+            t: Hit distances [mm], shape (N,). Unused: a far-field bin is a
+                function of the direction alone.
+            hit_mask: Boolean mask of rays hitting this detector, shape (N,).
         """
-        hit_mask_np = to_numpy(hit_mask).astype(bool)
-        if not hit_mask_np.any():
-            return
+        _translation, rot = self.frame()
 
-        _, rot = _get_transform(self.cs)
-        R = np.array(rot, dtype=float)
+        dirs_g = be.stack([rays.L, rays.M, rays.N], axis=1)
+        dirs_l = dirs_g @ rot  # global -> local
 
-        L_g = to_numpy(rays.L)
-        M_g = to_numpy(rays.M)
-        N_g = to_numpy(rays.N)
-        flux_np = to_numpy(rays.flux)
+        # A ray that did not hit contributes zero flux, but its direction
+        # would still go through arccos and arctan2 -- and a dead ray's
+        # direction can be the zero vector. Mask the direction itself so
+        # every lane evaluates on finite numbers.
+        zero = be.zeros_like(dirs_l[:, 0])
+        lx = be.where(hit_mask, dirs_l[:, 0], zero)
+        ly = be.where(hit_mask, dirs_l[:, 1], zero)
+        lz = be.where(hit_mask, dirs_l[:, 2], zero)
 
-        dirs_g = np.stack([L_g, M_g, N_g], axis=1)
-        dirs_l = dirs_g @ R  # global -> local
+        # theta is the angle from the local +z axis
+        cos_theta = be.clip(be.abs(lz), 0.0, 1.0)
+        theta_deg = be.degrees(be.arccos(cos_theta))
+        phi_deg = be.degrees(be.arctan2(ly, lx))
 
-        dirs_hit = dirs_l[hit_mask_np]
-        flux_hit = flux_np[hit_mask_np]
-
-        # Compute polar angles in local frame
-        # theta is angle from local +z axis
-        cos_theta = np.clip(np.abs(dirs_hit[:, 2]), 0.0, 1.0)
-        theta_deg = np.degrees(np.arccos(cos_theta))
-        phi_deg = np.degrees(np.arctan2(dirs_hit[:, 1], dirs_hit[:, 0]))
-
-        # Bin into 2D histogram
-        i_theta = np.searchsorted(self._theta_edges, theta_deg, side="right") - 1
-        i_phi = np.searchsorted(self._phi_edges, phi_deg, side="right") - 1
-        i_theta = np.clip(i_theta, 0, self.num_bins_theta - 1)
-        i_phi = np.clip(i_phi, 0, self.num_bins_phi - 1)
+        theta_edges = self.table("theta_edges", self._theta_edges)
+        phi_edges = self.table("phi_edges", self._phi_edges)
+        i_theta = clamp_int(
+            be.searchsorted(theta_edges, theta_deg, side="right") - 1,
+            0,
+            self.num_bins_theta - 1,
+        )
+        i_phi = clamp_int(
+            be.searchsorted(phi_edges, phi_deg, side="right") - 1,
+            0,
+            self.num_bins_phi - 1,
+        )
 
         # Solid-angle normalisation per bin (W/sr)
-        d_theta = np.radians(self._theta_edges[1] - self._theta_edges[0])
-        d_phi = np.radians(self._phi_edges[1] - self._phi_edges[0])
-        theta_centres = np.radians(
-            0.5 * (self._theta_edges[:-1] + self._theta_edges[1:])
-        )
-        solid_angle = np.sin(theta_centres[i_theta]) * d_theta * d_phi
-        solid_angle = np.where(solid_angle > 0, solid_angle, 1.0)
+        sin_centres = self.table("sin_theta_centres", self._sin_theta_centres)
+        solid_angle = sin_centres[i_theta] * self._d_theta * self._d_phi
+        solid_angle = be.where(solid_angle > 0, solid_angle, be.ones_like(solid_angle))
 
-        flat = (i_theta * self.num_bins_phi + i_phi).astype(np.int64)
-        _accumulate_into(self._intensity, flat, flux_hit / solid_angle)
-        self._num_rays_hit += hit_mask_np.sum()
+        flux_masked = be.where(hit_mask, rays.flux, be.zeros_like(rays.flux))
+        _accumulate_into(
+            self._intensity,
+            i_theta * self.num_bins_phi + i_phi,
+            flux_masked / solid_angle,
+        )
+        self._num_rays_hit = self._num_rays_hit + masked_count(hit_mask)
         # Track the radiometric flux separately: _intensity is divided by the
         # per-bin solid angle, so summing it gives W/sr, not W.
-        self._total_flux += float(flux_hit.sum())
+        self._total_flux.add(masked_sum(rays.flux, hit_mask))
 
     def get_result(self) -> FarFieldPattern:
         """Return the accumulated far-field pattern.
@@ -148,13 +168,13 @@ class FarFieldDetector(BaseDetector):
             intensity=intensity.copy(),
             theta=theta_centres,
             phi=phi_centres,
-            total_flux=self._total_flux,
-            num_rays_hit=self._num_rays_hit,
+            total_flux=self._total_flux.value(),
+            num_rays_hit=int(to_numpy(self._num_rays_hit)),
         )
 
     def reset(self) -> None:
         """Clear accumulated data."""
         self._intensity = _new_flat_accumulator(self.num_bins_theta * self.num_bins_phi)
         self._num_rays_hit = 0
-        self._total_flux = 0.0
+        self._total_flux = Tally()
         self.invalidate_frame()

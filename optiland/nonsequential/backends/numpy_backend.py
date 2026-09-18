@@ -44,14 +44,18 @@ class NumpyBackend(ArrayBackend):
         self.seed = seed
         self.rng = NSQRng(seed)
 
-    def _maybe_compact(self, rays: NSQRayBundle) -> NSQRayBundle:
+    def _maybe_compact(self, rays: NSQRayBundle, depth: int) -> NSQRayBundle:
         """Compact dead rays after every bounce for the NumPy fast path.
 
         Removes rays where ``alive=False`` so subsequent intersection tests
         skip them, giving a significant speedup when many rays die early.
+        Not bucketed: a host array's width is a Python int, so an exact
+        width costs nothing here and there is no kernel to recompile.
 
         Args:
             rays: Current ray bundle.
+            depth: Bounces already run for this batch. Unused -- the host
+                path compacts every bounce.
 
         Returns:
             Compacted ray bundle containing only alive rays.

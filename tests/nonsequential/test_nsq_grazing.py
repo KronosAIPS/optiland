@@ -385,3 +385,125 @@ class TestOffsetConstant:
         assert float(tol.origin_offset(np.float64(0.0))) == pytest.approx(
             16.0 * np.spacing(1.0), rel=1e-12
         )
+
+
+# ---------------------------------------------------------------------------
+# 4. the transmissive detector
+# ---------------------------------------------------------------------------
+
+
+def _grazing_transmissive_detector_scene(
+    grazing_deg: float, aperture_radius: float = 0.02
+):
+    """A pencil crossing a transmissive detector plane at a grazing angle.
+
+    The exposure X7 section 6 named and left open. A detector with
+    ``absorb=False`` reads the beam and lets it through, so the ray carries
+    on from the point the loop puts it at and the next bounce tests the same
+    plane again -- the grazing-exit failure, with no interface involved.
+
+    The plane is the fold mirror's: 45 degrees about x at ``MIRROR_Z``, for
+    the reasons ``_grazing_mirror_scene`` gives (an axis-aligned normal or a
+    plane tilted to meet the beam both hide the residual). The beam
+    approaches from the ``-normal`` side at ``grazing_deg`` above the plane
+    and leaves on the other side at the same angle, undeviated.
+    """
+    normal, in_plane = _fold_mirror_frame()
+    g = math.radians(grazing_deg)
+    direction = math.cos(g) * in_plane + math.sin(g) * normal
+    vertex = np.array([0.0, 0.0, MIRROR_Z])
+    source_at = vertex - 100.0 * direction
+    collector_at = vertex + 200.0 * direction
+
+    scene = NSQScene()
+    scene.add_source(
+        "S",
+        CoordinateSystem(
+            y=float(source_at[1]), z=float(source_at[2]), rx=_rx_for(direction)
+        ),
+        CollimatedSourceConfig(
+            spectrum=Spectrum.monochromatic(WAVELENGTH),
+            total_flux=1.0,
+            aperture_radius=aperture_radius,
+        ),
+    )
+    scene.add_detector(
+        "TAP",
+        CoordinateSystem(z=MIRROR_Z, rx=math.radians(MIRROR_TILT_DEG)),
+        IrradianceDetectorConfig(
+            width=400,
+            height=400,
+            num_pixels_x=1,
+            num_pixels_y=1,
+            splat="hard",
+            absorb=False,
+        ),
+    )
+    scene.add_detector(
+        "END",
+        CoordinateSystem(
+            y=float(collector_at[1]),
+            z=float(collector_at[2]),
+            rx=_rx_for(direction),
+        ),
+        IrradianceDetectorConfig(
+            width=400, height=400, num_pixels_x=1, num_pixels_y=1, splat="hard"
+        ),
+    )
+    return scene
+
+
+@pytest.fixture
+def no_detector_offset(monkeypatch):
+    """Disable the origin offset on detectors only, for the control."""
+    from optiland.nonsequential.detectors.base import BaseDetector
+
+    monkeypatch.setattr(
+        BaseDetector, "offset_from_surface", lambda self, rays, n_geom, hit: None
+    )
+
+
+class TestGrazingCrossingOfATransmissiveDetector:
+    """A ray crossing a tap at a grazing angle is recorded once."""
+
+    @pytest.mark.parametrize("grazing_deg", [5.0, 1.0, 0.1])
+    def test_recorded_once_per_ray(self, grazing_deg):
+        n_rays = 20_000
+        result = _grazing_transmissive_detector_scene(grazing_deg).trace(
+            num_rays=n_rays, seed=3, max_depth=8
+        )
+        tap = result.detectors["TAP"]
+        assert tap.num_rays_hit == n_rays, (
+            f"a ray crossing the tap {grazing_deg} deg above its plane was "
+            f"recorded {tap.num_rays_hit / n_rays:.3f} times on average"
+        )
+        # And the tap read the whole beam exactly once, in watts.
+        assert float(tap.total_flux) == pytest.approx(1.0, rel=1e-12)
+
+    @pytest.mark.parametrize("grazing_deg", [5.0, 1.0, 0.1])
+    def test_the_beam_still_arrives_undeviated(self, grazing_deg):
+        """A tap must not change what reaches the collector behind it."""
+        result = _grazing_transmissive_detector_scene(grazing_deg).trace(
+            num_rays=20_000, seed=3, max_depth=8
+        )
+        assert float(result.detectors["END"].total_flux) == pytest.approx(
+            1.0, rel=1e-12
+        )
+        # The tap's reading is booked separately so the ledger does not
+        # count the same watt twice.
+        assert result.total_flux_tapped == pytest.approx(1.0, rel=1e-12)
+        assert result.flux_conservation_error < 1e-12
+
+    def test_without_the_offset_the_tap_reads_twice(self, no_detector_offset):
+        """Control: the failure this fixes, measured rather than assumed."""
+        n_rays = 20_000
+        result = _grazing_transmissive_detector_scene(0.1).trace(
+            num_rays=n_rays, seed=3, max_depth=8
+        )
+        tap = result.detectors["TAP"]
+        extra = tap.num_rays_hit - n_rays
+        assert extra > 100, (
+            "the control is supposed to reproduce the repeat reading; with "
+            f"only {extra} extra readings of {n_rays} rays it is not "
+            "measuring what the test above fixes"
+        )

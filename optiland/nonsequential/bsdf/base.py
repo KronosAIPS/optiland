@@ -31,7 +31,35 @@ class BaseBSDF(ABC):
     the medium a scattered ray ends up in is decided by its own lobe choice,
     never by the independent Fresnel branch draw that only applies to
     unscattered rays.
+
+    Attributes:
+        weight_is_albedo: What the surface is to make of ``1 - weight``.
+
+            ``True`` (the default) says the weight is a *physical fraction
+            of the incident flux on this realisation*: the lobe returns
+            ``weight`` of what arrived and the surface kept the rest, so
+            ``1 - weight`` is booked in the coating bin ``Phi_coat`` of
+            ``docs/theory/10_ledger_and_diagnostics.md`` (10.1).
+            ``LambertianBSDF`` is this: its weight is its reflectance, the
+            same number for every ray.
+
+            ``False`` says the weight is a *sampling weight whose
+            expectation is the albedo*. A lobe that draws its direction from
+            one distribution and corrects with ``f / pdf`` hands one ray
+            much more than the surface's reflectance and the next ray much
+            less; only the mean is the reflectance. Booking ``1 - weight``
+            as absorption then puts a zero-mean fluctuation into a physical
+            bin and makes ``Phi_coat`` a random variable. The surface
+            instead books ``1 - reflectance()`` as the physical loss and the
+            difference as the sampling residual ``Phi_samp``, whose
+            documented property is exactly that its expectation is zero and
+            its magnitude falls as the square root of the ray count. The
+            identity closes either way -- the two terms sum to the same
+            ``1 - weight`` -- so this changes which bin the flux is
+            attributed to, not whether the ledger balances.
     """
+
+    weight_is_albedo: bool = True
 
     @abstractmethod
     def sample(

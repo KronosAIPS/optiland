@@ -63,6 +63,50 @@ if TYPE_CHECKING:
 # -saturated budget cannot produce an arbitrarily large boosted flux.
 _BUDGET_CULL_SURVIVE_FLOOR = 0.02
 
+# Smallest width the bucket ladder offers. Two independent reasons for the
+# floor, both pointing at about the same number:
+#
+# - a bundle narrower than this is below one launch's worth of work on a
+#   device, so rounding further down buys nothing and only adds another
+#   shape to compile;
+# - measured: the shared library's material property cache builds its key
+#   from the *contents* of the wavelength array once that array holds 1024
+#   elements or fewer (``optiland.materials.base.BaseMaterial
+#   ._MAX_VALUE_KEY_ARRAY_SIZE``), which copies the whole array to the host
+#   on every evaluation. A rung below that would put a per-bounce host read
+#   back into the loop -- the exact cost compaction exists to remove.
+BUCKET_MIN_WIDTH = 2048
+
+
+def bucketed_width(n_live: int, n_now: int, min_width: int = BUCKET_MIN_WIDTH) -> int:
+    """The width a bundle of ``n_live`` live rays is compacted to.
+
+    ``docs/theory/12_gpu_mapping.md`` R-12-6: the compacted width comes from
+    a fixed ladder -- here 0, ``min_width``, and the powers of two above it,
+    capped at the current width -- rather than from the live count itself,
+    so a whole trace sees O(log N) distinct shapes and each is compiled,
+    captured or autotuned once.
+
+    Rounding up to a power of two also *is* the alive-fraction trigger R-12-6
+    asks for, with no second rule: the next rung down is only reached once
+    fewer than half the rays are alive, so a bundle that is still mostly live
+    returns its own width and the caller skips the gather.
+
+    Args:
+        n_live: Live rays in the bundle.
+        n_now: The bundle's current width.
+        min_width: Smallest non-zero rung of the ladder.
+
+    Returns:
+        The target width, in ``[0, n_now]``.
+    """
+    if n_live <= 0:
+        return 0
+    width = min_width
+    while width < n_live:
+        width <<= 1
+    return width if width < n_now else n_now
+
 
 def _cull_to_budget(
     spawned: NSQRayBundle, headroom: int, rng
@@ -125,11 +169,56 @@ class ArrayBackend(TracerBackend):
             count (zero synchronisations, ``max_depth`` bounces always);
             k > 0 costs one synchronisation every k bounces and wastes at
             most k - 1 bounces of all-dead work.
+        compact_every: How often a device backend may compact to a bucketed
+            width. ``None`` follows :attr:`alive_check_every`, so the live
+            count the alive check already reads is the same one compaction
+            selects its bucket with and the loop keeps exactly one
+            synchronisation per period.
     """
 
     host_reads_free: bool = True
     supports_splitting: bool = True
     alive_check_every: int = 0
+    compact_every: int | None = None
+
+    # Live count for the current bounce, read at most once and shared by
+    # the alive check and the compaction bucket. None means "not read yet".
+    _live_count_cache: int | None = None
+
+    @property
+    def compaction_period(self) -> int:
+        """Bounces between compaction attempts; 0 disables compaction."""
+        k = self.compact_every
+        return int(self.alive_check_every if k is None else k)
+
+    def _live_count(self, rays: NSQRayBundle) -> int:
+        """The number of live rays, read from the device at most once a bounce.
+
+        Both the early-exit check and the compaction bucket need the same
+        number, and on a device backend reading it is the loop's only
+        synchronisation. Reading it once and handing it to both is what
+        keeps compaction free of a synchronisation of its own.
+
+        Args:
+            rays: Current ray bundle.
+
+        Returns:
+            The live-ray count as a Python int.
+        """
+        if self._live_count_cache is None:
+            self._live_count_cache = rays.num_rays_alive
+        return self._live_count_cache
+
+    def _gradient_mode(self, rays: NSQRayBundle) -> bool:
+        """True when some field of the bundle carries a gradient.
+
+        Args:
+            rays: Current ray bundle.
+
+        Returns:
+            False on a backend with no autograd.
+        """
+        return False
 
     # ------------------------------------------------------------------
     # Backend hooks
@@ -146,15 +235,16 @@ class ArrayBackend(TracerBackend):
         """
         return rays
 
-    def _maybe_compact(self, rays: NSQRayBundle) -> NSQRayBundle:
+    def _maybe_compact(self, rays: NSQRayBundle, depth: int) -> NSQRayBundle:
         """Post-bounce hook: optionally compact dead rays from the bundle.
 
         Default is a no-op. ``NumpyBackend`` overrides it to call
-        ``rays.compact()``; ``TorchBackend`` keeps the default so tensor
-        shapes stay fixed.
+        ``rays.compact()`` every bounce; ``TorchBackend`` gathers to a
+        bucketed width on a schedule.
 
         Args:
             rays: Current ray bundle.
+            depth: Bounces already run for this batch, counting from 0.
 
         Returns:
             Possibly compacted ray bundle.
@@ -396,17 +486,28 @@ class ArrayBackend(TracerBackend):
                 path_recorder.log_birth(rays, source_name)
 
                 depth = 0
+                self._live_count_cache = None
                 while True:
                     if not self._continue_bounce(rays, depth, max_depth):
                         break
+                    # Whatever live count was read for this bounce's
+                    # early-exit check described the state *before* the
+                    # bounce body, which is about to change it. Compaction
+                    # at the end of the bounce reads it again, once, and
+                    # that read is the one the next bounce's check reuses.
+                    self._live_count_cache = None
 
                     # --- traversal -------------------------------------
                     t_min, hit_normals, comp_idx, hit_n_geom = self.intersect_scene(
                         rays, scene.surfaces
                     )
-                    det_t_min, _det_normals, det_idx, det_absorb = intersect_detectors(
-                        rays, scene.detectors
-                    )
+                    (
+                        det_t_min,
+                        _det_normals,
+                        det_idx,
+                        det_absorb,
+                        det_n_geom,
+                    ) = intersect_detectors(rays, scene.detectors)
 
                     # Nearest hit: component vs detector
                     comp_closer = t_min <= det_t_min
@@ -467,14 +568,33 @@ class ArrayBackend(TracerBackend):
                     # transmissive: the hit is recorded (above) and the ray
                     # continues on its unchanged direction.
                     if not self._empty(det_first):
+                        # An absorbing detector is terminal, so the plain
+                        # global advance is all its rays' positions are ever
+                        # used for -- p + t*d carries u*|t| of rounding and
+                        # nothing reads it again.
+                        terminal = det_first & det_absorb
                         dx = det_t_safe * rays.L
                         dy = det_t_safe * rays.M
                         dz = det_t_safe * rays.N
-                        rays.x = be.where(det_first, rays.x + dx, rays.x)
-                        rays.y = be.where(det_first, rays.y + dy, rays.y)
-                        rays.z = be.where(det_first, rays.z + dz, rays.z)
+                        rays.x = be.where(terminal, rays.x + dx, rays.x)
+                        rays.y = be.where(terminal, rays.y + dy, rays.y)
+                        rays.z = be.where(terminal, rays.z + dz, rays.z)
+                        # A transmissive detector is not terminal: the ray
+                        # carries on from where this puts it and the next
+                        # bounce tests the same plane again. It therefore
+                        # gets a surface's treatment -- the hit point
+                        # rebuilt in the detector's own frame, then pushed
+                        # clear of the plane along the geometric normal, or
+                        # a grazing crossing is recorded twice (R-07-6,
+                        # docs/build/X7_grazing_exit.md section 6).
+                        for di, det in enumerate(scene.detectors):
+                            if det.absorb:
+                                continue
+                            crossed = det_first & (det_idx == di)
+                            det.advance_to_hit(rays, det_t_safe, crossed)
+                            det.offset_from_surface(rays, det_n_geom, crossed)
                         rays.bounce = be.where(det_first, rays.bounce + 1, rays.bounce)
-                        rays.alive = rays.alive & ~(det_first & det_absorb)
+                        rays.alive = rays.alive & ~terminal
 
                     # --- component interactions -------------------------
                     # Dispatched from the IR (ir.primitives[i].component_kind
@@ -608,8 +728,12 @@ class ArrayBackend(TracerBackend):
                         rays.medium_stack_underflows,
                     )
 
-                    rays = self._maybe_compact(rays)
+                    rays = self._maybe_compact(rays, depth)
                     depth += 1
+                    # A shape, not a value: free on every backend. With
+                    # compaction on, a bundle whose last ray has died comes
+                    # back at width 0 and the loop stops here without
+                    # anything being read.
                     if rays.num_rays == 0:
                         break
 
@@ -741,7 +865,10 @@ class ArrayBackend(TracerBackend):
         the moment nothing is alive. On a device backend the loop runs a
         fixed ``max_depth`` trips and consults the alive count only every
         :attr:`alive_check_every` bounces (0 = never), because each such
-        read is a device synchronisation.
+        read is a device synchronisation. The count comes through
+        :meth:`_live_count`, so when compaction ran at the end of the
+        previous bounce this check reuses that read instead of making its
+        own -- the state cannot have changed in between.
 
         Args:
             rays: Current ray bundle.
@@ -756,7 +883,7 @@ class ArrayBackend(TracerBackend):
         if depth >= max_depth:
             return False
         k = self.alive_check_every
-        if k and depth % k == 0 and rays.num_rays_alive == 0:
+        if k and depth % k == 0 and self._live_count(rays) == 0:
             return False
         return True
 

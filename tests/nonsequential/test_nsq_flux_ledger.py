@@ -237,3 +237,133 @@ class TestTorchAgrees:
             be.set_backend("numpy")
         assert result.flux_conservation_error < _CLOSURE_FAIL
         assert result.total_flux_coating > 0.9
+
+
+def _scattering_mirror(bsdf, scatter_fraction: float = 1.0) -> NSQScene:
+    """A beam onto one mirror carrying ``bsdf``, and a collector around it.
+
+    The mirror is perfectly reflective, so every watt the ledger books
+    against the surface came from the lobe's weight and nothing else.
+    """
+    scene = NSQScene()
+    scene.add_source(
+        "S",
+        CoordinateSystem(),
+        CollimatedSourceConfig(
+            spectrum=Spectrum.monochromatic(0.55),
+            total_flux=1.0,
+            aperture_radius=2.0,
+        ),
+    )
+    scene.add_component(
+        "M",
+        ReflectiveComponent(
+            CoordinateSystem(z=20.0),
+            PlaneGeometry(),
+            reflectance=1.0,
+            bsdf=bsdf,
+            name="M",
+            scatter_fraction=scatter_fraction,
+        ),
+    )
+    scene.add_detector(
+        "D",
+        CoordinateSystem(z=-40.0, rx=3.141592653589793),
+        IrradianceDetectorConfig(
+            width=400, height=400, num_pixels_x=8, num_pixels_y=8
+        ),
+    )
+    return scene
+
+
+def _tabulated_bsdf(tmp_path, transmissive_fraction: float = 0.0):
+    """A measured lobe whose weight varies strongly with the scatter angle."""
+    from optiland.nonsequential import TabulatedBSDF
+
+    path = tmp_path / "scatter.csv"
+    rows = []
+    for ti in (0.0, 45.0, 90.0):
+        for ts, value in ((0.0, 0.30), (45.0, 0.12), (90.0, 0.01)):
+            rows.append(f"{ti},{ts},{value}")
+    path.write_text("\n".join(rows) + "\n")
+    return TabulatedBSDF(path, transmissive_fraction=transmissive_fraction)
+
+
+class TestLobeWeightIsNotAlwaysAnAlbedo:
+    """``BaseBSDF.weight_is_albedo``: which bin ``1 - weight`` belongs in.
+
+    A lobe that draws its direction from one distribution and corrects with
+    ``f / pdf`` hands one ray far more than the surface's reflectance and
+    the next ray far less. Booking ``1 - weight`` as absorption then makes
+    the coating bin a random variable. The flag splits it: ``1 -
+    reflectance()`` is the physical loss and the rest is the event residual
+    of section 10.2.
+    """
+
+    def test_the_default_says_the_weight_is_an_albedo(self):
+        from optiland.nonsequential import (
+            HarveyShackBSDF,
+            LambertianBSDF,
+            SpecularBRDF,
+        )
+
+        assert LambertianBSDF().weight_is_albedo
+        assert SpecularBRDF().weight_is_albedo
+        assert HarveyShackBSDF(b0=1e-3, l0=0.05, s=2.0).weight_is_albedo
+
+    def test_the_tabulated_lobe_says_it_is_a_sampling_weight(self, tmp_path):
+        assert not _tabulated_bsdf(tmp_path).weight_is_albedo
+
+    def test_the_identity_still_closes(self, tmp_path):
+        """Whichever bin the flux lands in, the eight of them still sum."""
+        result = _scattering_mirror(_tabulated_bsdf(tmp_path)).trace(
+            num_rays=20_000, seed=5, max_depth=8, backend=NumpyBackend(seed=5)
+        )
+        assert result.flux_conservation_error < _CLOSURE_FAIL
+
+    def test_the_fluctuation_is_booked_as_a_residual_not_as_absorption(
+        self, tmp_path
+    ):
+        """The split puts something in each bin, and the residual shrinks.
+
+        With the flag off, every watt below would be in the coating bin and
+        the residual would be exactly the roulette term. The residual's
+        documented property is that it falls as the square root of the ray
+        count, so measuring it at two ray counts is the check that it is
+        sampling noise rather than a weight-update defect.
+        """
+        counts = (20_000, 320_000)
+        residuals = []
+        coatings = []
+        for n in counts:
+            result = _scattering_mirror(_tabulated_bsdf(tmp_path)).trace(
+                num_rays=n, seed=5, max_depth=8, backend=NumpyBackend(seed=5)
+            )
+            assert result.flux_conservation_error < _CLOSURE_FAIL
+            assert result.total_flux_coating > 0.0
+            residuals.append(abs(result.total_flux_sampling_residual))
+            coatings.append(result.total_flux_coating)
+        assert residuals[0] > 0.0
+        # 16x the rays, so 4x smaller if it is sampling noise. Allow a
+        # generous factor: the point is that it shrinks, not its constant.
+        assert residuals[1] < residuals[0] / 2.0
+
+    def test_the_physical_bin_stops_depending_on_the_ray_count(self, tmp_path):
+        """The measurement the flag exists for.
+
+        The coating bin is what the surface absorbed, so it must converge
+        immediately, not as the estimator does. Measured on this scene:
+        with the lobe declaring its weight an albedo the bin reads 0.579844
+        W at 20 000 rays and 0.582695 W at 1 280 000, still climbing toward
+        the surface's true 0.583052; with the flag set it reads 0.583025 and
+        0.583052 -- the same number at both counts, because the fluctuation
+        is in the residual where it belongs.
+        """
+        coatings = []
+        for n in (20_000, 320_000):
+            result = _scattering_mirror(_tabulated_bsdf(tmp_path)).trace(
+                num_rays=n, seed=5, max_depth=8, backend=NumpyBackend(seed=5)
+            )
+            coatings.append(result.total_flux_coating)
+        # 4e-5 apart with the flag set, 3.9e-3 apart without it.
+        assert coatings[1] == pytest.approx(coatings[0], rel=1e-3)

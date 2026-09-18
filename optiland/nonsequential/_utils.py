@@ -8,7 +8,9 @@ from __future__ import annotations
 import importlib.util
 from typing import TYPE_CHECKING, Any
 
-from optiland.backend.utils import to_numpy  # noqa: F401
+import numpy as np
+
+from optiland.backend.utils import is_torch_tensor, to_numpy  # noqa: F401
 
 if TYPE_CHECKING:
     from optiland._types import ScalarOrArrayT
@@ -217,3 +219,74 @@ def as_float(value: ScalarOrArrayT) -> float:
     if is_tensor(value):
         return float(to_numpy(value))
     return float(value)
+
+
+# ---------------------------------------------------------------------------
+# Integer index arithmetic that stays beside the ray state.
+#
+# A bin index, a pixel index, a table slot -- every one of these is a
+# discrete function of a continuous quantity, so none of them carries a
+# gradient. That is not a reason to compute them on the host, and computing
+# them there is a device-to-host copy per detector or per lobe per bounce.
+# ``be.clip``/``be.maximum`` push both operands through ``array()``, which
+# carries the backend's working *float* precision, so an integer clamp
+# written with them comes back as floats; these three do not.
+# ---------------------------------------------------------------------------
+
+
+def floor_to_int(x):
+    """Floor ``x`` to an integer array of the same library and device.
+
+    The bin a hit lands in is a discrete function of the landing position,
+    so it never carries a gradient -- but it does not have to be computed
+    on the host either, and computing it there is a device-to-host copy per
+    detector per bounce.
+
+    Args:
+        x: Continuous pixel coordinate, shape (N,).
+
+    Returns:
+        ``floor(x)`` as an int64 array/tensor beside ``x``.
+    """
+    if is_torch_tensor(x):
+        import torch  # noqa: PLC0415
+
+        return torch.floor(x).to(torch.int64)
+    return np.floor(x).astype(np.int64)
+
+
+def int_to_float_like(idx, like):
+    """Cast an integer index array back to ``like``'s float dtype.
+
+    Args:
+        idx: Integer array/tensor.
+        like: Array/tensor whose dtype and device to match.
+
+    Returns:
+        ``idx`` as a float array/tensor beside ``like``.
+    """
+    if is_torch_tensor(idx):
+        return idx.to(dtype=like.dtype)
+    return idx.astype(np.float64)
+
+
+def clamp_int(idx, lo: int, hi: int):
+    """Clamp an integer index array into ``[lo, hi]``.
+
+    ``be.clip``/``be.maximum`` push both operands through ``array()``, which
+    carries the working float precision -- so an integer clamp written with
+    them comes back as floats. ``be.where`` does not.
+
+    Args:
+        idx: Integer array/tensor.
+        lo: Lower bound, inclusive.
+        hi: Upper bound, inclusive.
+
+    Returns:
+        The clamped indices, still integer.
+    """
+    if is_torch_tensor(idx):
+        import torch  # noqa: PLC0415
+
+        return torch.clamp(idx, lo, hi)
+    return np.clip(idx, lo, hi)
