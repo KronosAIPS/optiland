@@ -81,6 +81,25 @@ class BaseComponent(ABC):
         # per-ray before use.
         self._local_root: tuple[np.ndarray, np.ndarray] | None = None
 
+    def refresh_backend_transform(self) -> None:
+        """Upload this component's placement to the array backend once, for the trace about to run.
+
+        The trace loop calls it after lowering the scene, so a component moved between two traces is
+        re-read; inside the loop the transform is then a resident pair of arrays and no host round trip
+        is made per bounce (the earlier per-call read and re-upload was the last synchronisation left).
+        """
+        translation, rot = _get_transform(self.cs)
+        self._be_transform = (be.array(translation), be.array(rot))
+        self._be_transform_key = _backend_key()
+
+    def backend_transform(self):
+        """The resident (translation, rotation) pair, refreshed if the backend configuration changed."""
+        cached = getattr(self, "_be_transform", None)
+        if cached is None or getattr(self, "_be_transform_key", None) != _backend_key():
+            self.refresh_backend_transform()
+            cached = self._be_transform
+        return cached
+
     def intersect(
         self, rays: NSQRayBundle
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -101,14 +120,11 @@ class BaseComponent(ABC):
                     surface normal in global frame, shape (N, 3). See
                     :meth:`ComponentGeometry.ray_intersect`.
         """
-        translation, rot = _get_transform(self.cs)
+        t_be, R_be = _resident_transform(self)
 
         # Global ray data as (N, 3) arrays
         positions_g = be.stack([rays.x, rays.y, rays.z], axis=1)
         directions_g = be.stack([rays.L, rays.M, rays.N], axis=1)
-
-        t_be = be.array(translation)
-        R_be = be.array(rot)
 
         # Transform to local frame
         positions_l = (positions_g - t_be) @ R_be
@@ -268,9 +284,7 @@ class BaseComponent(ABC):
             adv_safe = be.where(usable, t_adv, be.zeros_like(t_adv))
             loc_safe = be.where(usable, t_local, be.zeros_like(t_local))
 
-            translation, rot = _get_transform(self.cs)
-            t_be = be.array(translation)
-            R_be = be.array(rot)
+            t_be, R_be = _resident_transform(self)
             positions_g = be.stack([rays.x, rays.y, rays.z], axis=1)
             directions_l = be.stack([rays.L, rays.M, rays.N], axis=1) @ R_be
             # Bitwise the advanced origin intersect() solved from: same
@@ -394,3 +408,24 @@ def _get_transform(cs: CoordinateSystem) -> tuple[np.ndarray, np.ndarray]:
     translation = to_numpy(t_be).astype(np.float64)
     rotation = to_numpy(R_be).astype(np.float64)
     return translation, rotation
+
+
+def _resident_transform(component) -> tuple:
+    """The component's (translation, rotation) on the array backend: the per-trace cache where the object
+    carries one (a real component), else a direct upload (the detached proxies of the volume checks)."""
+    cached = getattr(component, "backend_transform", None)
+    if cached is not None:
+        return cached()
+    translation, rot = _get_transform(component.cs)
+    return be.array(translation), be.array(rot)
+
+
+def _backend_key() -> tuple:
+    """What a cached backend array depends on: the backend, its precision and its device."""
+    name = be.get_backend()
+    precision = be.get_precision()
+    try:
+        device = be.get_device()
+    except Exception:  # noqa: BLE001 - the numpy backend has no device
+        device = None
+    return (str(name), str(precision), str(device))

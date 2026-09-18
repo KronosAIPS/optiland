@@ -300,6 +300,8 @@ class ArrayBackend(TracerBackend):
         # The per-bounce interaction loop below is driven by this IR, not by
         # iterating scene.surfaces and branching on Python class identity.
         ir = lower(scene, strict=False)
+        for component in scene.surfaces:
+            component.refresh_backend_transform()
         self._check_sampling_support(ir)
 
         t_start = time.perf_counter()
