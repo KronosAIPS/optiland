@@ -120,12 +120,18 @@ class LinalgMixin:
         return torch.linalg.lstsq(a, b).solution
 
     def to_complex(self, x: Tensor) -> Tensor:
-        """Cast x to complex128.
+        """Cast x to the complex dtype of the current precision.
+
+        complex128 at float64 precision, complex64 at float32 -- the pair
+        ``get_complex_precision`` returns. A float32 trace on an ``mps``
+        device (Apple GPU) cannot hold complex128 at all (Metal has no
+        double type), and a float32 trace elsewhere gains nothing from a
+        128-bit complex intermediate that is cast back to float32.
 
         Args:
             x: Input tensor.
 
         Returns:
-            Tensor: Complex128 tensor.
+            Tensor: Complex tensor of the current precision.
         """
-        return x.to(torch.complex128)
+        return x.to(self.get_complex_precision())
