@@ -16,7 +16,11 @@ from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
-from optiland.nonsequential.detectors.base import BaseDetector
+from optiland.nonsequential.detectors.base import (
+    BaseDetector,
+    _accumulate_into,
+    _new_flat_accumulator,
+)
 from optiland.nonsequential.results.far_field_pattern import FarFieldPattern
 
 if TYPE_CHECKING:
@@ -63,7 +67,10 @@ class FarFieldDetector(BaseDetector):
         self.num_bins_theta = int(num_bins_theta)
         self.num_bins_phi = int(num_bins_phi)
 
-        self._intensity = np.zeros((num_bins_theta, num_bins_phi), dtype=np.float64)
+        # Flat accumulation buffer: shape (num_bins_theta * num_bins_phi,).
+        # Always float64, on the active backend and device, mutated in
+        # place by every record() call -- see detectors/base.py.
+        self._intensity = _new_flat_accumulator(num_bins_theta * num_bins_phi)
         self._num_rays_hit = 0
         self._total_flux = 0.0
 
@@ -119,7 +126,8 @@ class FarFieldDetector(BaseDetector):
         solid_angle = np.sin(theta_centres[i_theta]) * d_theta * d_phi
         solid_angle = np.where(solid_angle > 0, solid_angle, 1.0)
 
-        np.add.at(self._intensity, (i_theta, i_phi), flux_hit / solid_angle)
+        flat = (i_theta * self.num_bins_phi + i_phi).astype(np.int64)
+        _accumulate_into(self._intensity, flat, flux_hit / solid_angle)
         self._num_rays_hit += hit_mask_np.sum()
         # Track the radiometric flux separately: _intensity is divided by the
         # per-bin solid angle, so summing it gives W/sr, not W.
@@ -133,8 +141,11 @@ class FarFieldDetector(BaseDetector):
         """
         theta_centres = 0.5 * (self._theta_edges[:-1] + self._theta_edges[1:])
         phi_centres = 0.5 * (self._phi_edges[:-1] + self._phi_edges[1:])
+        intensity = to_numpy(self._intensity).reshape(
+            self.num_bins_theta, self.num_bins_phi
+        )
         return FarFieldPattern(
-            intensity=self._intensity.copy(),
+            intensity=intensity.copy(),
             theta=theta_centres,
             phi=phi_centres,
             total_flux=self._total_flux,
@@ -143,6 +154,6 @@ class FarFieldDetector(BaseDetector):
 
     def reset(self) -> None:
         """Clear accumulated data."""
-        self._intensity[:] = 0.0
+        self._intensity = _new_flat_accumulator(self.num_bins_theta * self.num_bins_phi)
         self._num_rays_hit = 0
         self._total_flux = 0.0
