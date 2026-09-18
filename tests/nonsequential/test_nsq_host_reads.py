@@ -185,7 +185,7 @@ def _singlet() -> NSQScene:
     return scene
 
 
-def _trace_and_count(num_rays: int, max_depth: int, alive_check_every: int):
+def _trace_and_count(num_rays: int, max_depth: int, alive_check_every):
     be.set_backend("torch")
     be.set_precision("float64")
     try:
@@ -229,9 +229,19 @@ class TestNoHostReadPerBounce:
         }
         assert recurring == {}, f"per-bounce host reads remain: {recurring}"
 
-    def test_alive_check_costs_one_read_every_k_bounces(self):
-        """The default is an every-k check, and k is what it costs."""
-        k = 4
+    def test_the_default_reads_only_the_alive_count(self):
+        """The shipped default keeps one read and drops every other."""
+        counter = _trace_and_count(100_000, max_depth=16, alive_check_every=None)
+        recurring = {
+            site: n
+            for site, n in counter.intervals_touched().items()
+            if _UNOWNED not in site and "num_rays_alive" not in site and n > 1
+        }
+        assert recurring == {}, f"per-bounce host reads remain: {recurring}"
+
+    @pytest.mark.parametrize("k", [1, 2, 4])
+    def test_alive_check_costs_one_read_every_k_bounces(self, k):
+        """An every-k check costs one read per k bounces and nothing else."""
         counter = _trace_and_count(100_000, max_depth=16, alive_check_every=k)
         alive_reads = sum(
             n

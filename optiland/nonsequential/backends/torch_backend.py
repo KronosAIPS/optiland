@@ -13,7 +13,8 @@ to running it on torch tensors on a device:
   boolean-mask gather (whose output shape is a device read).
 - **loop control**: ``host_reads_free = False`` tells the loop that
   reducing a per-ray mask to a Python bool is a synchronisation, so the
-  loop runs a fixed trip count and skips nothing.
+  loop skips nothing and takes a bounded trip count, asking whether any ray
+  is still alive at most once every ``alive_check_every`` bounces.
 - **capability**: bounded splitting grows the bundle and is refused.
 
 Memory scaling: O(num_rays x max_depth) activations when gradient_mode is
@@ -51,6 +52,16 @@ class TorchBackend(ArrayBackend):
     and participate in all operations as no-ops; the tensor shape stays fixed
     across bounces so the graph remains clean.
 
+    It stays disabled in forward-only mode too, which is a decision and not
+    an oversight. Compaction by boolean mask costs one device-to-host
+    synchronisation per bounce, because the width of its own output is a
+    property of the data -- which is the cost this backend exists to avoid,
+    and it would put back per bounce exactly what the rest of the loop gives
+    up. The saving is real and worth having: ``docs/theory/12_gpu_mapping.md``
+    R-12-6 gets it without the read by rounding the live count up to a fixed
+    ladder of bucketed widths, so the shape is chosen from a small known set
+    rather than measured. That is the next item, not this one.
+
     Gradient strategy is "autograd" (naive attached graph) in v1. A pluggable
     ``gradient_mode`` seam is provided for future Path Replay Backpropagation.
 
@@ -60,20 +71,36 @@ class TorchBackend(ArrayBackend):
         rng: Keyed PCG32 RNG for detached sampling decisions (see
             :mod:`optiland.nonsequential.rng`).
         alive_check_every: How often the loop may ask whether any ray is
-            still alive. Each such question is one device synchronisation.
-            0 is a strict fixed trip count -- zero synchronisations per
-            bounce, ``max_depth`` bounces always, which is what
-            ``docs/theory/12_gpu_mapping.md`` R-12-3 and R-12-4 ask for. The
-            default of 4 keeps the synchronisation count at one per four
-            bounces and wastes at most three bounces of all-dead work, which
-            on a scene whose rays die well before ``max_depth`` is the
-            cheaper of the two on a latency-bound device and much the
-            cheaper on a CPU.
+            still alive. Each such question is one device synchronisation,
+            and it is the only one the loop makes. 0 is a strict fixed trip
+            count -- no synchronisation at all, ``max_depth`` bounces
+            always, which is what ``docs/theory/12_gpu_mapping.md`` R-12-3
+            and R-12-4 ask for.
+
+            The default is 1, not 0, and the reason is measured rather than
+            assumed. A fixed trip count runs every bounce at full width
+            whether or not anything is still alive, and on a scene whose
+            rays die at bounce 3 of 16 that is four times the work. On the
+            quick-start singlet at 1e6 rays on this CPU, in float64:
+
+                period   host reads/bounce   rays/s
+                0                        0   68,067
+                1                        1   185,174
+                2                      0.5   174,604
+                4                     0.25   134,620
+
+            So the last synchronisation is worth keeping until the dead
+            rays stop costing anything, and what makes them stop costing is
+            compaction to bucketed widths (R-12-6), not the trip count.
+            Until that lands, 1 removes 96% of this engine's per-bounce
+            synchronisations and keeps the early exit that pays for the
+            other 4%; 0 is one argument away for a device run that would
+            rather have neither.
     """
 
     host_reads_free = False
     supports_splitting = False
-    alive_check_every = 4
+    alive_check_every = 1
 
     def __init__(
         self,
