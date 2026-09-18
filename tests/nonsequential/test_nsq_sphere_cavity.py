@@ -186,6 +186,29 @@ class TestPorts:
         # near one.
         assert t[0] == pytest.approx(130.0)
 
+    def test_the_port_cut_is_exactly_the_cap(self):
+        """Hit or miss agrees with the angular criterion for every ray.
+
+        The statistical escape-fraction test below measures the same thing
+        to a few parts in ten thousand; this one leaves no room at all, so a
+        port that was a flat disc rather than a cap -- the defect 11.4.17
+        exists to catch -- could not survive it.
+        """
+        axis = np.array([0.3, -0.5, 0.81])
+        axis = axis / np.linalg.norm(axis)
+        half_angle = 17.0
+        geometry = SphericalCavityGeometry(
+            RADIUS, [SphericalPort(tuple(axis), half_angle)]
+        )
+        directions = _isotropic(50_000, seed=6)
+
+        _t, _normals, hit, _n_geom = geometry.ray_intersect(
+            np.zeros_like(directions), directions
+        )
+
+        in_port = directions @ axis >= math.cos(math.radians(half_angle))
+        np.testing.assert_array_equal(np.asarray(hit), ~in_port)
+
     def test_the_escaping_fraction_is_the_port_area_fraction(self):
         """An isotropic bundle from the centre escapes with probability f."""
         fraction = 0.02
