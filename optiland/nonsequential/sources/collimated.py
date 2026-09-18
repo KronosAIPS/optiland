@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 import optiland.backend as be
+from optiland.backend.utils import to_numpy
 from optiland.nonsequential._utils import as_detached_param
 from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.ray_bundle import NSQRayBundle
@@ -103,8 +104,8 @@ class CollimatedSource(BaseNSQSource):
             lx, ly = self._sample_gaussian_disk(ray_id, bounce0, rng)
         else:
             # Uniform disk sampling
-            u1 = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1)
-            u2 = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2)
+            u1 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1))
+            u2 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2))
             r = self.aperture_radius * np.sqrt(u1)
             phi = 2.0 * np.pi * u2
             lx = r * np.cos(phi)
@@ -186,8 +187,12 @@ class CollimatedSource(BaseNSQSource):
         for attempt in range(_MAX_GAUSSIAN_ATTEMPTS):
             if not pending.any():
                 break
-            u1 = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1, offset=attempt)
-            u2 = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2, offset=attempt)
+            u1 = to_numpy(
+                rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1, offset=attempt)
+            )
+            u2 = to_numpy(
+                rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2, offset=attempt)
+            )
             # Box-Muller transform: (u1, u2) -> independent standard normals.
             r_bm = np.sqrt(-2.0 * np.log(np.maximum(u1, 1e-300)))
             theta_bm = 2.0 * np.pi * u2
@@ -203,13 +208,12 @@ class CollimatedSource(BaseNSQSource):
             # to the boundary along the last-drawn direction rather than
             # looping unboundedly or silently keeping an out-of-aperture
             # sample.
-            theta_fallback = (
-                2.0
-                * np.pi
-                * rng.uniform(
+            u_fallback = to_numpy(
+                rng.uniform(
                     ray_id, bounce0, EventSlot.SOURCE_U2, offset=_MAX_GAUSSIAN_ATTEMPTS
                 )
             )
+            theta_fallback = 2.0 * np.pi * u_fallback
             r_fallback = self.aperture_radius
             lx = np.where(pending, r_fallback * np.cos(theta_fallback), lx)
             ly = np.where(pending, r_fallback * np.sin(theta_fallback), ly)

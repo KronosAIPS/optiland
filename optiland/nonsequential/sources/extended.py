@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from optiland.backend.utils import to_numpy
 from optiland.nonsequential._utils import as_detached_param
 from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.ray_bundle import NSQRayBundle
@@ -96,16 +97,16 @@ class ExtendedSource(BaseNSQSource):
         # Sample positions on source surface (local x-y plane)
         if self.aperture_radius is not None:
             # Circular aperture: uniform disk sampling
-            u1 = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1)
-            u2 = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2)
+            u1 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1))
+            u2 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2))
             r = self.aperture_radius * np.sqrt(u1)
             phi_pos = 2.0 * np.pi * u2
             lx = r * np.cos(phi_pos)
             ly = r * np.sin(phi_pos)
         else:
             # Rectangular aperture
-            u1 = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1)
-            u2 = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2)
+            u1 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1))
+            u2 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2))
             lx = (u1 - 0.5) * self.width
             ly = (u2 - 0.5) * self.height
 
@@ -113,8 +114,8 @@ class ExtendedSource(BaseNSQSource):
 
         # Sample emission directions (Lambertian or cone)
         cos_max = np.cos(np.radians(self.half_angle_deg))
-        u1d = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U3)
-        u2d = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U4)
+        u1d = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U3))
+        u2d = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U4))
 
         if self.half_angle_deg >= 90.0:
             # Cosine-weighted hemisphere (Lambertian)

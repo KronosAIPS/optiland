@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from optiland.backend.utils import to_numpy
 from optiland.nonsequential._utils import as_detached_param
 from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.ray_bundle import NSQRayBundle
@@ -81,8 +82,8 @@ class PointSource(BaseNSQSource):
         # Sample directions in local frame (cone around +z)
         cos_max = np.cos(np.radians(self.half_angle_deg))
         # Uniform sampling on spherical cap
-        u1 = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1)
-        u2 = rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2)
+        u1 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1))
+        u2 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2))
         cos_theta = 1.0 - u1 * (1.0 - cos_max)
         sin_theta = np.sqrt(np.maximum(1.0 - cos_theta**2, 0.0))
         phi = 2.0 * np.pi * u2
