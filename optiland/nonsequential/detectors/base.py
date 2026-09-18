@@ -157,14 +157,14 @@ def _accumulate_into(buffer, flat_np, contribution) -> None:
     and the in-place ``index_add_``; ``buffer`` itself never needs to
     require grad on its own account (see :func:`_new_flat_accumulator`).
 
-    ``flat_np`` is always a plain NumPy int64 index array: the bin index is
-    a discrete function of the hit position (docs/theory/12_gpu_mapping.md
-    S12.5) and is computed on the host in every splatting detector,
-    gradient support or not -- this is unchanged from before this fix.
+    ``flat_np`` is an integer index array of whichever library the detector
+    computed it in: the bin index is a discrete function of the hit position
+    (docs/theory/12_gpu_mapping.md S12.5) and so carries no gradient, but it
+    is computed beside the ray state and stays there.
 
     Args:
         buffer: Persistent float64 accumulation buffer, shape (size,).
-        flat_np: Flat bin indices for each contribution, shape (K,), int64.
+        flat_np: Flat bin indices for each contribution, shape (K,), integer.
         contribution: Values to add, shape (K,), any array-like.
     """
     if is_torch_tensor(buffer):
@@ -230,6 +230,45 @@ class BaseDetector(ABC):
         self.name = name
         self.absorb = bool(absorb)
         self._frame = None
+        self._tables: dict[str, object] = {}
+        self._tables_key = None
+
+    def table(self, name: str, values):
+        """A constant lookup table of this detector's, resident on the backend.
+
+        Bin edges, bin centres and the like are scene data, not ray data:
+        they are built once from the detector's own configuration and never
+        change during a trace. A binning arithmetic written against them
+        therefore has no reason to leave the device -- but only if the table
+        is there too, which is what this uploads and keeps
+        (``docs/theory/12_gpu_mapping.md`` R-12-8, the same rule
+        :meth:`frame` follows for the placement).
+
+        The cache is keyed on the backend configuration, so a detector
+        reused across a NumPy trace and a Torch one gets the right array
+        each time, and it is dropped by :meth:`reset`.
+
+        Args:
+            name: Key for this table on this detector.
+            values: The table, as a NumPy array of float64 values.
+
+        Returns:
+            The table as an array of the active backend, in its working
+            dtype and on its device.
+        """
+        from optiland.nonsequential.components.base import (  # noqa: PLC0415
+            _backend_key,
+        )
+
+        key = _backend_key()
+        if self._tables_key != key:
+            self._tables = {}
+            self._tables_key = key
+        cached = self._tables.get(name)
+        if cached is None:
+            cached = be.array(np.asarray(values, dtype=np.float64))
+            self._tables[name] = cached
+        return cached
 
     def frame(self):
         """This detector's global->local transform, as backend arrays.
@@ -250,8 +289,10 @@ class BaseDetector(ABC):
         return self._frame
 
     def invalidate_frame(self) -> None:
-        """Drop the cached transform; the next bounce resolves it again."""
+        """Drop the cached transform and tables; the next trace rebuilds them."""
         self._frame = None
+        self._tables = {}
+        self._tables_key = None
 
     def intersect(
         self, rays: NSQRayBundle

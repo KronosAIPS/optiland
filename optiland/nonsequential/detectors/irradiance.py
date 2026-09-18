@@ -15,7 +15,6 @@ import numpy as np
 import optiland.backend as be
 from optiland.backend.utils import to_numpy
 from optiland.nonsequential._utils import as_float, as_param
-from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
@@ -142,22 +141,18 @@ class IrradianceDetector(BaseDetector):
         dx = self.width / nx
         dy = self.height / ny
 
+        # Every splat is index arithmetic in the active backend and one
+        # in-place scatter-add per touched pixel. A non-hit ray carries zero
+        # flux through all three and adds exactly zero, so none of them
+        # needs an early exit on an empty mask -- which is what lets a
+        # device backend call record() for every detector every bounce
+        # without asking whether any ray hit it.
         if self.splat == "bilinear":
-            # The default splat, and the only one written to stay on the
-            # device: index arithmetic in the active backend, one in-place
-            # scatter-add per neighbour. A non-hit ray carries zero flux
-            # through it and adds exactly zero, so an empty mask needs no
-            # early exit -- which is what lets a device backend call
-            # record() for every detector every bounce without asking
-            # whether any ray hit it.
             self._record_bilinear(hx_l, hy_l, flux_masked, nx, ny, dx, dy)
         elif self.splat == "gaussian":
             self._record_gaussian(hx_l, hy_l, flux_masked, nx, ny, dx, dy)
         else:
-            hit_mask_np = to_numpy(hit_mask).astype(bool)
-            if not hit_mask_np.any():
-                return
-            self._record_hard(hx_l, hy_l, flux_masked, hit_mask_np, nx, ny)
+            self._record_hard(hx_l, hy_l, flux_masked, nx, ny)
 
         self._num_rays_hit = self._num_rays_hit + masked_count(hit_mask)
 
@@ -166,37 +161,31 @@ class IrradianceDetector(BaseDetector):
         hx_l,
         hy_l,
         flux_masked,
-        hit_mask_np: np.ndarray,
         nx: int,
         ny: int,
     ) -> None:
-        """Hard-bin accumulation (forward-only, NumPy path).
+        """Hard-bin accumulation: each ray's whole flux into one pixel.
+
+        The bin is found by ``searchsorted`` against the stored edges rather
+        than by a floor of the continuous pixel coordinate. The two differ
+        at a pixel boundary -- an edge is representable, and which side of
+        it the division lands on is a rounding question -- so keeping
+        ``searchsorted`` keeps the bin assignment exactly what it was, with
+        the edges uploaded to the backend instead of the coordinates being
+        brought down to them.
 
         Args:
             hx_l: Local x coordinates, be-array shape (N,).
             hy_l: Local y coordinates, be-array shape (N,).
             flux_masked: Per-ray flux (non-hit rays zeroed), be-array.
-            hit_mask_np: Boolean NumPy mask, shape (N,).
             nx: Number of pixels along x.
             ny: Number of pixels along y.
         """
-        hx_np = to_numpy(hx_l)
-        hy_np = to_numpy(hy_l)
-        flux_np = to_numpy(flux_masked)
-        idx = np.where(hit_mask_np)[0]
-
-        ix = np.clip(
-            np.searchsorted(self._x_edges, hx_np[idx], side="right") - 1,
-            0,
-            nx - 1,
-        )
-        iy = np.clip(
-            np.searchsorted(self._y_edges, hy_np[idx], side="right") - 1,
-            0,
-            ny - 1,
-        )
-        flat = (iy * nx + ix).astype(np.int64)
-        _accumulate_into(self._data, flat, flux_np[idx])
+        x_edges = self.table("x_edges", self._x_edges)
+        y_edges = self.table("y_edges", self._y_edges)
+        ix = clamp_int(be.searchsorted(x_edges, hx_l, side="right") - 1, 0, nx - 1)
+        iy = clamp_int(be.searchsorted(y_edges, hy_l, side="right") - 1, 0, ny - 1)
+        _accumulate_into(self._data, iy * nx + ix, flux_masked)
 
     def _record_bilinear(
         self,
@@ -287,18 +276,17 @@ class IrradianceDetector(BaseDetector):
         """
         sigma = self.splat_sigma
         if sigma <= 0.0:
-            hit_mask_np = to_numpy(flux_masked) != 0.0
-            self._record_hard(hx_l, hy_l, flux_masked, hit_mask_np, nx, ny)
+            self._record_hard(hx_l, hy_l, flux_masked, nx, ny)
             return
 
         radius = max(1, int(np.ceil(3.0 * sigma)))
 
         px = (hx_l + self.width / 2.0) / dx - 0.5
         py = (hy_l + self.height / 2.0) / dy - 0.5
-        px_np = to_numpy(px)
-        py_np = to_numpy(py)
-        ix0_np = np.floor(px_np).astype(np.int64)
-        iy0_np = np.floor(py_np).astype(np.int64)
+        # Detached (an index carries no gradient) but not copied to the
+        # host: the kernel's own offsets are integers beside the ray state.
+        ix0 = floor_to_int(px)
+        iy0 = floor_to_int(py)
 
         offsets = range(-radius, radius + 1)
         gx: dict[int, object] = {}
@@ -306,25 +294,24 @@ class IrradianceDetector(BaseDetector):
         sx = be.zeros_like(px)
         sy = be.zeros_like(py)
         for d in offsets:
-            ddx = be.array((ix0_np + d).astype(np.float64)) - px
+            ddx = int_to_float_like(ix0 + d, px) - px
             wx = be.exp(-0.5 * (ddx / sigma) ** 2)
             gx[d] = wx
             sx = sx + wx
 
-            ddy = be.array((iy0_np + d).astype(np.float64)) - py
+            ddy = int_to_float_like(iy0 + d, py) - py
             wy = be.exp(-0.5 * (ddy / sigma) ** 2)
             gy[d] = wy
             sy = sy + wy
 
         norm = sx * sy  # separable kernel: total weight = Sx * Sy
         for dix in offsets:
-            ix_np = np.clip(ix0_np + dix, 0, nx - 1)
+            ix = clamp_int(ix0 + dix, 0, nx - 1)
             for diy in offsets:
-                iy_np = np.clip(iy0_np + diy, 0, ny - 1)
-                flat_np = (iy_np * nx + ix_np).astype(np.int64)
+                iy = clamp_int(iy0 + diy, 0, ny - 1)
                 weight = (gx[dix] * gy[diy]) / norm
                 contrib = flux_masked * weight
-                _accumulate_into(self._data, flat_np, contrib)
+                _accumulate_into(self._data, iy * nx + ix, contrib)
 
     def get_result(self) -> IrradianceMap:
         """Return the accumulated irradiance map.

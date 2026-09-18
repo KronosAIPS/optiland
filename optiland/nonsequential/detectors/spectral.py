@@ -11,8 +11,9 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
+import optiland.backend as be
+from optiland.nonsequential._tally import masked_count
 from optiland.nonsequential._utils import as_detached_param, to_numpy
-from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
@@ -20,6 +21,9 @@ from optiland.nonsequential.detectors.base import (
     BaseDetector,
     _accumulate_into,
     _new_flat_accumulator,
+    clamp_int,
+    floor_to_int,
+    int_to_float_like,
 )
 from optiland.nonsequential.results.spectral_result import SpectralResult
 
@@ -122,45 +126,40 @@ class SpectralDetector(BaseDetector):
     def record(self, rays: NSQRayBundle, t: np.ndarray, hit_mask: np.ndarray) -> None:
         """Accumulate per-wavelength flux from hit rays.
 
+        Written in the active backend's own operations throughout: the
+        placement comes from the per-trace cache
+        (:meth:`~optiland.nonsequential.detectors.base.BaseDetector.frame`),
+        the pixel and wavelength bin edges from tables uploaded once
+        (:meth:`~optiland.nonsequential.detectors.base.BaseDetector.table`),
+        and a ray that did not hit is masked to a zero landing position and
+        zero flux rather than gathered out -- so the method never asks how
+        many rays hit and costs no device-to-host transfer.
+
         Args:
             rays: Current ray bundle.
             t: Hit distances [mm], shape (N,).
-            hit_mask: Boolean mask of hitting rays, shape (N,).
+            hit_mask: Boolean mask of rays hitting this detector, shape (N,).
         """
-        hit_mask_np = to_numpy(hit_mask).astype(bool)
-        if not hit_mask_np.any():
-            return
+        translation, rot = self.frame()
 
-        translation, rot = _get_transform(self.cs)
-        t_vec = np.array(translation, dtype=float)
-        R = np.array(rot, dtype=float)
+        t_hit = be.where(hit_mask, t, be.zeros_like(t))
+        hx_g = rays.x + t_hit * rays.L
+        hy_g = rays.y + t_hit * rays.M
+        hz_g = rays.z + t_hit * rays.N
 
-        x_g = to_numpy(rays.x)
-        y_g = to_numpy(rays.y)
-        z_g = to_numpy(rays.z)
-        L_g = to_numpy(rays.L)
-        M_g = to_numpy(rays.M)
-        N_g = to_numpy(rays.N)
-        t_np = to_numpy(t)
-        flux_np = to_numpy(rays.flux)
-        wl_np = to_numpy(rays.wavelength)
+        pos_g = be.stack([hx_g, hy_g, hz_g], axis=1)
+        pos_l = (pos_g - translation) @ rot
+        # Mask the coordinate, not just the weight: a dead ray's origin can
+        # be infinite and inf * 0 is NaN, which no later multiplication by a
+        # zero flux undoes (docs/theory/08_precision.md R-08-8).
+        hx_l = be.where(hit_mask, pos_l[:, 0], be.zeros_like(pos_l[:, 0]))
+        hy_l = be.where(hit_mask, pos_l[:, 1], be.zeros_like(pos_l[:, 1]))
+        flux_masked = be.where(hit_mask, rays.flux, be.zeros_like(rays.flux))
 
-        idx = np.where(hit_mask_np)[0]
-        t_hit = t_np[idx]
-        hx_g = x_g[idx] + t_hit * L_g[idx]
-        hy_g = y_g[idx] + t_hit * M_g[idx]
-        hz_g = z_g[idx] + t_hit * N_g[idx]
-
-        pos_g = np.stack([hx_g, hy_g, hz_g], axis=1)
-        pos_l = (pos_g - t_vec) @ R
-
-        hx_l = pos_l[:, 0]
-        hy_l = pos_l[:, 1]
-        flux_hit = flux_np[idx]
-        wl_hit = wl_np[idx]
-
-        iwl = np.clip(
-            np.searchsorted(self.wavelength_bins, wl_hit, side="right") - 1,
+        # The wavelength bin is always hard-assigned; splatting is spatial.
+        wl_edges = self.table("wavelength_bins", self.wavelength_bins)
+        iwl = clamp_int(
+            be.searchsorted(wl_edges, rays.wavelength, side="right") - 1,
             0,
             self._n_lambda - 1,
         )
@@ -169,34 +168,33 @@ class SpectralDetector(BaseDetector):
         dx = self.width / nx
         dy = self.height / ny
         if self.splat == "hard":
-            self._record_hard(hx_l, hy_l, flux_hit, iwl, nx, ny)
+            self._record_hard(hx_l, hy_l, flux_masked, iwl, nx, ny)
         elif self.splat == "gaussian":
-            self._record_gaussian(hx_l, hy_l, flux_hit, iwl, nx, ny, dx, dy)
+            self._record_gaussian(hx_l, hy_l, flux_masked, iwl, nx, ny, dx, dy)
         else:
-            self._record_bilinear(hx_l, hy_l, flux_hit, iwl, nx, ny, dx, dy)
-        self._num_rays_hit += hit_mask_np.sum()
+            self._record_bilinear(hx_l, hy_l, flux_masked, iwl, nx, ny, dx, dy)
+        self._num_rays_hit = self._num_rays_hit + masked_count(hit_mask)
 
-    def _flat_index(self, iy, ix, iwl) -> np.ndarray:
+    def _flat_index(self, iy, ix, iwl):
         """Flatten (iy, ix, iwl) into the flux-map buffer's flat index."""
-        nx = self.num_pixels_x
-        n_lambda = self._n_lambda
-        return ((iy * nx + ix) * n_lambda + iwl).astype(np.int64)
+        return (iy * self.num_pixels_x + ix) * self._n_lambda + iwl
 
     def _record_hard(self, hx_l, hy_l, flux_hit, iwl, nx, ny) -> None:
         """Hard-bin spatial accumulation (see ``IrradianceDetector._record_hard``)."""
-        ix = np.clip(np.searchsorted(self._x_edges, hx_l, side="right") - 1, 0, nx - 1)
-        iy = np.clip(np.searchsorted(self._y_edges, hy_l, side="right") - 1, 0, ny - 1)
-        flat = self._flat_index(iy, ix, iwl)
-        _accumulate_into(self._flux_map, flat, flux_hit)
+        x_edges = self.table("x_edges", self._x_edges)
+        y_edges = self.table("y_edges", self._y_edges)
+        ix = clamp_int(be.searchsorted(x_edges, hx_l, side="right") - 1, 0, nx - 1)
+        iy = clamp_int(be.searchsorted(y_edges, hy_l, side="right") - 1, 0, ny - 1)
+        _accumulate_into(self._flux_map, self._flat_index(iy, ix, iwl), flux_hit)
 
     def _record_bilinear(self, hx_l, hy_l, flux_hit, iwl, nx, ny, dx, dy) -> None:
         """Bilinear spatial splat (see ``IrradianceDetector._record_bilinear``)."""
         px = (hx_l + self.width / 2.0) / dx - 0.5
         py = (hy_l + self.height / 2.0) / dy - 0.5
-        ix0 = np.floor(px).astype(np.int64)
-        iy0 = np.floor(py).astype(np.int64)
-        wx1 = px - ix0
-        wy1 = py - iy0
+        ix0 = floor_to_int(px)
+        iy0 = floor_to_int(py)
+        wx1 = px - int_to_float_like(ix0, px)
+        wy1 = py - int_to_float_like(iy0, py)
         wx0 = 1.0 - wx1
         wy0 = 1.0 - wy1
 
@@ -206,10 +204,11 @@ class SpectralDetector(BaseDetector):
             (0, 1, wx0, wy1),
             (1, 1, wx1, wy1),
         ):
-            ix = np.clip(ix0 + dix, 0, nx - 1)
-            iy = np.clip(iy0 + diy, 0, ny - 1)
-            flat = self._flat_index(iy, ix, iwl)
-            _accumulate_into(self._flux_map, flat, flux_hit * wx * wy)
+            ix = clamp_int(ix0 + dix, 0, nx - 1)
+            iy = clamp_int(iy0 + diy, 0, ny - 1)
+            _accumulate_into(
+                self._flux_map, self._flat_index(iy, ix, iwl), flux_hit * wx * wy
+            )
 
     def _record_gaussian(self, hx_l, hy_l, flux_hit, iwl, nx, ny, dx, dy) -> None:
         """Gaussian spatial splat, truncated and renormalised per ray so
@@ -223,23 +222,30 @@ class SpectralDetector(BaseDetector):
         radius = max(1, int(np.ceil(3.0 * sigma)))
         px = (hx_l + self.width / 2.0) / dx - 0.5
         py = (hy_l + self.height / 2.0) / dy - 0.5
-        ix0 = np.floor(px).astype(np.int64)
-        iy0 = np.floor(py).astype(np.int64)
+        ix0 = floor_to_int(px)
+        iy0 = floor_to_int(py)
 
         offsets = range(-radius, radius + 1)
-        gx = {d: np.exp(-0.5 * ((ix0 + d - px) / sigma) ** 2) for d in offsets}
-        gy = {d: np.exp(-0.5 * ((iy0 + d - py) / sigma) ** 2) for d in offsets}
+        gx = {
+            d: be.exp(-0.5 * ((int_to_float_like(ix0 + d, px) - px) / sigma) ** 2)
+            for d in offsets
+        }
+        gy = {
+            d: be.exp(-0.5 * ((int_to_float_like(iy0 + d, py) - py) / sigma) ** 2)
+            for d in offsets
+        }
         sx = sum(gx.values())
         sy = sum(gy.values())
         norm = sx * sy
 
         for dix in offsets:
-            ix = np.clip(ix0 + dix, 0, nx - 1)
+            ix = clamp_int(ix0 + dix, 0, nx - 1)
             for diy in offsets:
-                iy = np.clip(iy0 + diy, 0, ny - 1)
+                iy = clamp_int(iy0 + diy, 0, ny - 1)
                 weight = (gx[dix] * gy[diy]) / norm
-                flat = self._flat_index(iy, ix, iwl)
-                _accumulate_into(self._flux_map, flat, flux_hit * weight)
+                _accumulate_into(
+                    self._flux_map, self._flat_index(iy, ix, iwl), flux_hit * weight
+                )
 
     def get_result(self) -> SpectralResult:
         """Return accumulated spectral result.
@@ -266,7 +272,7 @@ class SpectralDetector(BaseDetector):
             y_coords=y_centres,
             wavelengths=wl_centres,
             total_flux=float(flux_map_np.sum()),
-            num_rays_hit=self._num_rays_hit,
+            num_rays_hit=int(to_numpy(self._num_rays_hit)),
         )
 
     def reset(self) -> None:
