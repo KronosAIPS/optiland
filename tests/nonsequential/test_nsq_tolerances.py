@@ -13,7 +13,6 @@ irradiance detector at z = 150.
 
 from __future__ import annotations
 
-import hashlib
 import io
 import pathlib
 import tokenize
@@ -35,6 +34,7 @@ from optiland.nonsequential import (
     IrradianceDetectorConfig,
     LensConfig,
     NSQScene,
+    RayDatabaseConfig,
     Spectrum,
 )
 from optiland.nonsequential import _tol as tol
@@ -213,24 +213,41 @@ class TestFloat32Singlet:
 
 
 class TestFloat64Unchanged:
-    """No float64 answer changes: every threshold that was an absolute
-    constant is replaced by one that is smaller than it at float64
-    coordinates of this size, so the same roots are accepted.
+    """No float64 statistic changes.
+
+    Every threshold that was an absolute constant is replaced by one that is
+    smaller than it at float64 coordinates of this size, so the same roots
+    are accepted. The origin advance re-parametrizes the solve, which is
+    mathematically equivalent but adds one floating-point operation, so the
+    accumulated detector image differs in its last representable digit while
+    every reported statistic is identical to all sixteen.
     """
 
-    def test_detector_image_and_flux_are_bit_identical(self):
+    def test_reported_statistics_are_bit_identical(self):
+        result = _singlet().trace(
+            num_rays=100_000, seed=42, backend=NumpyBackend(seed=42)
+        )
+        # Recorded on the unmodified tree at the commit this work starts
+        # from, same seed, same ray count.
+        assert float(result.total_flux_detected).hex() == "0x1.d56abebe8aa38p-1"
+        assert float(result.total_flux_escaped).hex() == "0x1.515c8488c4ec4p-4"
+        assert float(result.flux_conservation_error).hex() == "0x1.ad00000000000p-48"
+
+    def test_detector_image_totals_the_same(self):
+        """Individual pixels move by their last bit; the total does not.
+
+        The origin advance is a re-parametrization of the same solve, so the
+        pixel a ray lands in and the weight it carries are unchanged to
+        within the rounding of one extra addition. The image total is
+        bit-identical to the detected flux, and both match the unmodified
+        tree.
+        """
         result = _singlet().trace(
             num_rays=100_000, seed=42, backend=NumpyBackend(seed=42)
         )
         image = np.asarray(result.detectors["D1"].data, dtype=np.float64)
-        digest = hashlib.sha256(image.tobytes()).hexdigest()[:16]
-
-        # Recorded on the unmodified tree at the same commit this branch
-        # starts from, same seed, same ray count.
-        assert digest == "cf1e64a79107efaa"
-        assert float(result.total_flux_detected).hex() == "0x1.d56abebe8aa38p-1"
-        assert float(result.total_flux_escaped).hex() == "0x1.515c8488c4ec4p-4"
-        assert float(result.flux_conservation_error).hex() == "0x1.ad00000000000p-48"
+        assert int((image > 0).sum()) == 130
+        assert float(image.sum()).hex() == "0x1.d56abebe8aa38p-1"
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +332,90 @@ class TestNoBareToleranceLiterals:
             "Use optiland.nonsequential._tol.tiny_for, or mask the denominator's "
             "input instead of adding an epsilon to it."
         )
+
+
+def _singlet_raydb(source_z: float) -> NSQScene:
+    """The same singlet with a ray-database detector, source at ``source_z``."""
+    scene = NSQScene()
+    scene.add_source(
+        "S1",
+        CoordinateSystem(z=source_z),
+        CollimatedSourceConfig(
+            spectrum=Spectrum.monochromatic(0.55),
+            total_flux=1.0,
+            aperture_radius=5.0,
+        ),
+    )
+    scene.add_lens(
+        "L1",
+        CoordinateSystem(z=50),
+        LensConfig(
+            r1=100,
+            r2=-100,
+            thickness=5,
+            material="N-BK7",
+            front_aperture_radius=12.5,
+        ),
+    )
+    scene.add_detector(
+        "D1", CoordinateSystem(z=150), RayDatabaseConfig(width=20, height=20)
+    )
+    return scene
+
+
+def _direct_cluster_rms(db, n_clip: int = 4, k_sigma: float = 3.0):
+    """Flux-weighted rms radius [mm] after iterative sigma clipping.
+
+    Isolates the focused core from the ghost and aberrated-halo rays, so the
+    figure compared across source distances is the same population.
+    """
+    x = np.asarray(db.x, dtype=np.float64)
+    y = np.asarray(db.y, dtype=np.float64)
+    w = np.asarray(db.flux, dtype=np.float64)
+    mask = np.ones(x.shape, dtype=bool)
+    for _ in range(n_clip):
+        xw, yw, ww = x[mask], y[mask], w[mask]
+        total = ww.sum()
+        cx = (xw * ww).sum() / total
+        cy = (yw * ww).sum() / total
+        r = np.sqrt((xw - cx) ** 2 + (yw - cy) ** 2)
+        rms = np.sqrt((ww * r**2).sum() / total)
+        new_mask = np.sqrt((x - cx) ** 2 + (y - cy) ** 2) < k_sigma * rms
+        if new_mask.sum() == mask.sum():
+            mask = new_mask
+            break
+        mask = new_mask
+    xw, yw, ww = x[mask], y[mask], w[mask]
+    total = ww.sum()
+    cx = (xw * ww).sum() / total
+    cy = (yw * ww).sum() / total
+    r2 = (xw - cx) ** 2 + (yw - cy) ** 2
+    return float(np.sqrt((ww * r2).sum() / total)), int(mask.sum()), int(x.size)
+
+
+class TestLongPathOriginAdvance:
+    """A collimated source far behind the singlet.
+
+    Without the origin advance the rms spot radius at the detector grows
+    from 12.4 um with the source at z = 0 to hundreds of microns at
+    z = -1e5 and -1e6 mm, because the ray-conic discriminant loses accuracy
+    as (L/R)^2 for the long throw L. With the advance the answer must be the
+    z = 0 answer at every distance.
+    """
+
+    @pytest.mark.parametrize("source_z", [0.0, -1e5, -1e6])
+    def test_rms_radius_independent_of_source_distance(self, source_z):
+        be.set_backend("numpy")
+        result = _singlet_raydb(source_z).trace(num_rays=200_000, seed=42, max_depth=8)
+        rms_mm, n_direct, n_total = _direct_cluster_rms(result.detectors["D1"])
+        assert n_direct > 0.95 * n_total
+        assert rms_mm * 1000.0 == pytest.approx(12.4358, abs=0.01)
+
+    def test_flux_and_ray_count_independent_of_source_distance(self):
+        be.set_backend("numpy")
+        near = _singlet_raydb(0.0).trace(num_rays=200_000, seed=42, max_depth=8)
+        far = _singlet_raydb(-1e6).trace(num_rays=200_000, seed=42, max_depth=8)
+        assert far.total_flux_detected == pytest.approx(
+            near.total_flux_detected, rel=1e-4
+        )
+        assert len(far.detectors["D1"].x) == len(near.detectors["D1"].x)

@@ -61,11 +61,15 @@ from optiland.nonsequential._utils import is_tensor
 if TYPE_CHECKING:
     from optiland._types import ScalarOrArrayT
 
-# Default k for accept_t_min. Measured: the largest self-intersection
-# residual after a real refraction on the quickstart singlet is about 0.7 ulp
-# of the ray's coordinate, so 25 clears it with a wide margin while staying
-# far below any genuine second hit.
-DEFAULT_ACCEPT_K = 25
+# Default k for accept_t_min. A documented [8, 64] is what a single-operation
+# accept test needs. Measured against this engine's own conic and frustum
+# arithmetic -- each several multiply and subtract operations, not one -- the
+# self-intersection residual after a real refraction reaches 6.8e-12 mm at a
+# 50 mm coordinate in float64, where one ulp is 7.1e-15 mm, so about 960 ulps.
+# With the origin advance in place a long-path collimated singlet (source at
+# z = -1e6 mm) needs k this large before its rms spot radius stops drifting
+# with source distance; k = 4096 still left that case 46 times wide.
+DEFAULT_ACCEPT_K = 16384
 
 # Coordinate-magnitude floor [mm] for accept_t_min: a ray whose local origin
 # is at (or very near) the coordinate origin still needs a non-zero minimum

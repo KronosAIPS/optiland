@@ -109,6 +109,23 @@ class BaseComponent(ABC):
         positions_l = (positions_g - t_be) @ R_be
         directions_l = directions_g @ R_be
 
+        # Origin advance: before
+        # solving the ray-surface quadratic, advance the local origin along
+        # the ray to the point closest to the surface's vertex (the local
+        # coordinate origin, which every analytic geometry here is centred
+        # or based on), so the quadratic is solved with a small residual
+        # rather than the ray's full, possibly scene-scale, local coordinate.
+        # The removed distance is carried separately (t_adv) and added back
+        # once the small local solve returns. The ray-conic discriminant
+        # loses accuracy as (L/R)^2 for a throw of length L onto a surface
+        # of radius R; this replaces L
+        # with an O(part size) residual, removing the term rather than
+        # reducing it. No-op in effect when the origin is already near the
+        # vertex (t_adv is then already small), which is the common case of
+        # a ray freshly leaving the surface it is about to test again.
+        t_adv = -(positions_l * directions_l).sum(axis=1)
+        positions_adv = positions_l + t_adv[:, None] * directions_l
+
         # Self-intersection accept threshold: k ulps of the ray's own
         # *global*-frame coordinate magnitude, not a fixed
         # absolute length -- a bare 1e-9 mm is below the float32 step at 50
@@ -122,13 +139,34 @@ class BaseComponent(ABC):
         # tracked position, reintroducing self-hit instability rather than
         # removing it.
         t_min = _tol.accept_t_min(be.abs(positions_g).max())
-        t_hit, normals_l, hit_mask, n_geom_l = self.geometry.ray_intersect(
-            positions_l, directions_l, eps=t_min
+        # A geometry's own root-validity tests compare the LOCAL parameter
+        # (t_local) against eps, e.g. "t_local > eps"; what must actually
+        # hold is "t_local + t_adv > t_min" (a genuine forward hit in the
+        # ray's real, unshifted parametrization -- the advance is a re-
+        # parametrization, not a change of which points are ahead of the
+        # ray). Shifting the threshold by t_adv makes the geometry's
+        # existing "t_local > eps_shifted" tests exactly equivalent, with no
+        # change to any geometry's internal comparisons: the true surface
+        # point can land on either side of the advanced origin (a curved
+        # surface's sag is not zero at the advance point in general), so a
+        # plain "t_local > 0" requirement would wrongly reject a genuine hit
+        # the advance happened to step past.
+        eps_shifted = t_min - t_adv
+        t_local, normals_l, hit_mask, n_geom_l = self.geometry.ray_intersect(
+            positions_adv, directions_l, eps=eps_shifted
         )
+        t_hit = t_local + t_adv
 
+        # Note the accept/reject decision before overwriting t_hit: checking
+        # the *post*-overwrite value here would always read back either the
+        # original t_hit (t_hit > t_min already true) or +inf (which is also
+        # > t_min), so it could never actually reject anything -- a
+        # pre-existing latent bug that a threshold tight enough to matter
+        # (the one this module replaces) never used to trigger.
+        accepted = t_hit > t_min
         inf_like = be.ones_like(t_hit) * be.inf
-        t_hit = be.where(t_hit > t_min, t_hit, inf_like)
-        hit_mask = hit_mask & (t_hit > t_min)
+        t_hit = be.where(accepted, t_hit, inf_like)
+        hit_mask = hit_mask & accepted
 
         # Dead rays can't hit
         t_hit = be.where(rays.alive, t_hit, inf_like)

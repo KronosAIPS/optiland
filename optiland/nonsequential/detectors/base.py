@@ -102,8 +102,12 @@ class BaseDetector(ABC):
         normals_l = be.array(normals_l)
         hit_mask = be.array(hit_mask)
 
-        t_hit = be.where(t_hit > t_min, t_hit, be.full_like(t_hit, be.inf))
-        hit_mask = hit_mask & (t_hit > t_min)
+        # Note the accept/reject decision before overwriting t_hit -- see
+        # BaseComponent.intersect for why checking the post-overwrite value
+        # would be vacuous.
+        accepted = t_hit > t_min
+        t_hit = be.where(accepted, t_hit, be.full_like(t_hit, be.inf))
+        hit_mask = hit_mask & accepted
 
         alive_be = be.array(rays.alive)
         t_hit = be.where(alive_be, t_hit, be.full_like(t_hit, be.inf))
