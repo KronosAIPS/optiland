@@ -294,6 +294,8 @@ class ArrayBackend(TracerBackend):
         for comp in scene.surfaces:
             if isinstance(comp, AbsorbingComponent):
                 comp.reset_stats()
+            if hasattr(comp, "reset_ledger"):
+                comp.reset_ledger()
 
         # The per-bounce interaction loop below is driven by this IR, not by
         # iterating scene.surfaces and branching on Python class identity.
@@ -324,6 +326,11 @@ class ArrayBackend(TracerBackend):
         # would hide which mechanism a large loss actually came from.
         total_flux_depth_killed = Tally()
         total_flux_rr_killed = Tally()
+        # Ch. 10 sec 10.1: the sampling residual that makes (10.1) close on
+        # every realisation rather than only in expectation. The surfaces
+        # book their own share of it; this tally holds the loop's, which is
+        # roulette.
+        total_flux_sampling_residual = Tally()
         total_medium_stack_underflows = Tally(is_int=True)
         # Per-primitive nearest-hit counts, accumulated on the device and
         # read once at the end (the unreached-geometry diagnostic, and the
@@ -544,6 +551,19 @@ class ArrayBackend(TracerBackend):
                         rays.bounce,
                         fast_path=self.host_reads_free,
                     )
+                    # Ch. 10 (10.2): roulette does not preserve weight on a
+                    # realisation. A killed ray takes its whole weight out
+                    # of the trace and a survivor is handed -w(1-q)/q that
+                    # came from nowhere; both are the event residual, and
+                    # booking only the first is the 3.13% error of sec 10.2.
+                    # flux is left untouched on a killed ray, so the first
+                    # term below is zero there and the second picks it up.
+                    total_flux_sampling_residual.add(
+                        be.sum(flux_before_rr - rays.flux)
+                    )
+                    total_flux_sampling_residual.add_masked_sum(
+                        flux_before_rr, rr_killed
+                    )
                     if not self._empty(rr_killed):
                         num_rays_flux_killed.add_count(rr_killed)
                         total_flux_rr_killed.add_masked_sum(
@@ -567,6 +587,9 @@ class ArrayBackend(TracerBackend):
                             if culled_np.any():
                                 num_rays_flux_killed.add(int(culled_np.sum()))
                                 total_flux_rr_killed.add(float(culled_flux_np.sum()))
+                                total_flux_sampling_residual.add(
+                                    float(culled_flux_np.sum())
+                                )
                         if spawned.num_rays > 0:
                             rays = NSQRayBundle.concat([rays, spawned])
 
@@ -600,9 +623,24 @@ class ArrayBackend(TracerBackend):
                 total_flux_absorbed += float(to_numpy(comp._absorbed_flux))
                 num_rays_absorbed += int(to_numpy(comp._absorbed_count))
 
-        # Collect detector results
+        # Collect the mirror and coating loss, and each surface's share of
+        # the sampling residual, from the surfaces that booked them.
+        coating_loss = 0.0
+        for comp in scene.surfaces:
+            if hasattr(comp, "coating_loss"):
+                coating_loss += comp.coating_loss
+                total_flux_sampling_residual.add(comp.sampling_residual)
+
+        # Collect detector results. Ch. 10 sec 10.1 books flux where it
+        # *leaves* the trace. A transmissive (absorb=False) detector reads
+        # the beam and lets it continue, so the same watt is still in the
+        # trace and will be booked again at whatever finally absorbs it;
+        # counting the tap in the identity books it twice. The reading is
+        # reported as it always was, and reported separately, so the
+        # identity can leave it out.
         detector_results: dict[str, object] = {}
         total_flux_detected = 0.0
+        total_flux_tapped = 0.0
         det_names = get_detector_names(scene)
         for i, det in enumerate(scene.detectors):
             name = det_names[i] if i < len(det_names) else (det.name or f"detector_{i}")
@@ -611,26 +649,35 @@ class ArrayBackend(TracerBackend):
             if hasattr(result, "total_flux"):
                 # IrradianceMap.total_flux may be an attached backend array;
                 # SimulationResult's aggregate stays a plain float.
-                total_flux_detected += float(to_numpy(result.total_flux))
+                flux_here = float(to_numpy(result.total_flux))
+                total_flux_detected += flux_here
+                if not getattr(det, "absorb", True):
+                    total_flux_tapped += flux_here
 
         escaped = total_flux_escaped.value()
         bulk = total_flux_bulk_absorbed.value()
         depth_killed = total_flux_depth_killed.value()
         rr_killed_flux = total_flux_rr_killed.value()
+        sampling_residual = total_flux_sampling_residual.value()
         total_flux_lost = depth_killed + rr_killed_flux
 
-        # Every launched watt ends up detected, absorbed, escaped, or killed
-        # by the flux/depth cutoffs. Omitting total_flux_lost makes the metric
-        # report a large error for any scene that depth-kills rays, which is
-        # exactly the stray-light case this diagnostic exists to serve.
+        # Ch. 10 (10.1). Every watt a source emitted is detected at a
+        # detector that removed the ray, absorbed at a surface, lost in a
+        # mirror or coating, absorbed in the bulk, escaped, truncated by the
+        # depth cap, or booked into the sampling residual. Roulette-killed
+        # flux is not a separate term: it is part of the residual, together
+        # with the boost handed to the rays that survived, and adding it
+        # again here is the 3.13% error of sec 10.2 with the sign reversed.
         flux_err = (
             abs(
                 total_flux_in
-                - total_flux_detected
+                - (total_flux_detected - total_flux_tapped)
                 - total_flux_absorbed
+                - coating_loss
                 - bulk
                 - escaped
-                - total_flux_lost
+                - depth_killed
+                - sampling_residual
             )
             / total_flux_in
             if total_flux_in > 0
@@ -657,6 +704,8 @@ class ArrayBackend(TracerBackend):
             split_budget_saturated,
             detector_results,
             medium_stack_underflows=total_medium_stack_underflows.value(),
+            coating_loss=coating_loss,
+            sampling_residual=sampling_residual,
         )
 
         return SimulationResult(
@@ -668,10 +717,13 @@ class ArrayBackend(TracerBackend):
             num_rays_depth_killed=num_rays_depth_killed.value(),
             total_flux_in=total_flux_in,
             total_flux_detected=total_flux_detected,
+            total_flux_tapped=total_flux_tapped,
             total_flux_absorbed=total_flux_absorbed,
+            total_flux_coating=coating_loss,
             total_flux_bulk_absorbed=bulk,
             total_flux_escaped=escaped,
             total_flux_lost=total_flux_lost,
+            total_flux_sampling_residual=sampling_residual,
             flux_conservation_error=flux_err,
             trace_time_sec=t_end - t_start,
             ray_paths=ray_paths,
