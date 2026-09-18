@@ -19,7 +19,11 @@ from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
-from optiland.nonsequential.detectors.base import BaseDetector
+from optiland.nonsequential.detectors.base import (
+    BaseDetector,
+    _accumulate_into,
+    _new_flat_accumulator,
+)
 from optiland.nonsequential.results.irradiance_map import IrradianceMap
 
 if TYPE_CHECKING:
@@ -80,8 +84,12 @@ class IrradianceDetector(BaseDetector):
         self.splat = splat
         self.splat_sigma = as_float(splat_sigma)
 
-        # Flat accumulation buffer: shape (ny * nx,)
-        self._data = be.zeros(num_pixels_y * num_pixels_x)
+        # Flat accumulation buffer: shape (ny * nx,). Always float64 (the
+        # accumulation dtype A), whatever the working/traversal dtype T is
+        # (docs/theory/08_precision.md R-08-1) -- and mutated in place by
+        # every record() call (see _accumulate_into in detectors/base.py),
+        # so a bounce never reallocates the pixel buffer.
+        self._data = _new_flat_accumulator(num_pixels_y * num_pixels_x)
         self._num_rays_hit: int = 0
 
         # Pixel bin edges (NumPy, used for index arithmetic -- always detached)
@@ -174,9 +182,7 @@ class IrradianceDetector(BaseDetector):
             ny - 1,
         )
         flat = (iy * nx + ix).astype(np.int64)
-        data_np = to_numpy(self._data).copy()
-        np.add.at(data_np, flat, flux_np[idx])
-        self._data = be.array(data_np)
+        _accumulate_into(self._data, flat, flux_np[idx])
 
     def _record_bilinear(
         self,
@@ -237,7 +243,7 @@ class IrradianceDetector(BaseDetector):
             flat_np = (iy_np * nx + ix_np).astype(np.int64)
 
             contrib = flux_masked * wx * wy  # attached
-            self._data = be.index_add(self._data, 0, self._flat_index(flat_np), contrib)
+            _accumulate_into(self._data, flat_np, contrib)
 
     def _record_gaussian(
         self,
@@ -309,30 +315,7 @@ class IrradianceDetector(BaseDetector):
                 flat_np = (iy_np * nx + ix_np).astype(np.int64)
                 weight = (gx[dix] * gy[diy]) / norm
                 contrib = flux_masked * weight
-                self._data = be.index_add(
-                    self._data, 0, self._flat_index(flat_np), contrib
-                )
-
-    def _flat_index(self, flat_np: np.ndarray):
-        """Convert a flat NumPy pixel-index array to the active backend's format.
-
-        Args:
-            flat_np: Flat pixel indices, shape (N,), int64.
-
-        Returns:
-            ``flat_np`` unchanged for NumPy; a ``LongTensor`` on the same
-            device as ``self._data`` for Torch.
-        """
-        try:
-            import torch  # noqa: PLC0415
-
-            if isinstance(self._data, torch.Tensor):
-                return torch.from_numpy(flat_np).to(
-                    device=self._data.device, dtype=torch.long
-                )
-        except ImportError:
-            pass
-        return flat_np
+                _accumulate_into(self._data, flat_np, contrib)
 
     def get_result(self) -> IrradianceMap:
         """Return the accumulated irradiance map.
@@ -365,8 +348,8 @@ class IrradianceDetector(BaseDetector):
     def reset(self) -> None:
         """Clear accumulated data.
 
-        Re-initialises the internal buffer to a fresh ``be.zeros`` array,
+        Re-initialises the internal buffer to a fresh float64 accumulator,
         disconnecting it from the previous trace's computation graph.
         """
-        self._data = be.zeros(self.num_pixels_y * self.num_pixels_x)
+        self._data = _new_flat_accumulator(self.num_pixels_y * self.num_pixels_x)
         self._num_rays_hit = 0
