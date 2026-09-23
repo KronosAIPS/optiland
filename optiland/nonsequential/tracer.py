@@ -71,6 +71,16 @@ class SimulationResult:
         ray_paths: Optional per-ray event log dict (``{"events":
             structured_array}``), populated when ``record_paths`` is
             truthy -- see :mod:`optiland.nonsequential.path_recording`.
+        absorbed_by_component: Power each component absorbed [W], keyed by
+            its registry name: ``{"bulk", "coating", "absorber",
+            "total"}``, plus ``"ambient"`` (bulk loss travelled outside
+            every component) and ``"unassigned"`` (bulk loss of segments
+            that ended on a detector). The component bulk books sum to
+            ``total_flux_bulk_absorbed`` and the coating books to
+            ``total_flux_coating``. See
+            :mod:`optiland.nonsequential.deposition`.
+        deposition: One :class:`~optiland.nonsequential.deposition.DepositionMap`
+            per tally the scene registered (``NSQScene.add_deposition_tally``).
         diagnostics: Self-diagnosing summary of this trace --
             depth truncation, roulette loss, unreached geometry, per
             -detector sampling quality, and a threshold-based warning list.
@@ -95,6 +105,8 @@ class SimulationResult:
     flux_conservation_error: float = 0.0
     trace_time_sec: float = 0.0
     ray_paths: dict | None = None
+    absorbed_by_component: dict = field(default_factory=dict)
+    deposition: dict = field(default_factory=dict)
     diagnostics: Diagnostics = field(default_factory=Diagnostics)
 
     def report(self) -> str:
