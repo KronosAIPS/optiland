@@ -247,13 +247,14 @@ def sequential_to_nonsequential(
             i = j + 1
             continue
 
-        # Standalone air-air surface (e.g. pure aperture stop in air).
-        raise ConversionError(
-            f"Surface at index {i} is an air-to-air surface "
-            "(not reflective, not entering glass). "
-            "Standalone aperture stops in air are not supported by the converter. "
-            "Move the stop to a glass surface or remove it before converting."
-        )
+        # Standalone air-air surface (e.g. a pure aperture stop in air):
+        # issue #13, item 3. Not a material transition to convert, but a
+        # diaphragm -- an opaque plane with a hole -- is exactly what an
+        # absorbing annulus already models.
+        _add_stop(scene, optic, surf, i, report)
+        elem_idx += 1
+        i += 1
+        continue
 
     _add_sources(scene, optic, beam_diameter, half_angle_deg)
 
@@ -381,6 +382,37 @@ def _material_name(surf) -> str:
     )
 
 
+def _material_for_nsq(surf) -> str | object:
+    """Return what ``LensConfig.material``/``DoubletConfig.material1/2`` accepts.
+
+    Issue #13, item 2: a prescription given only as index and Abbe number
+    (a patent numerical example, say) has no catalogue name to extract --
+    ``_material_name`` refused it outright with "Cannot extract material
+    name from AbbeMaterial", even though the engine already traces both
+    ``AbbeMaterial`` and ``IdealMaterial`` directly (``NSQMaterial`` is a
+    thin adapter over any ``optiland.materials.BaseMaterial``, not just a
+    catalogue lookup). A named catalogue glass still resolves to its name
+    (unchanged, and cheaper: ``NSQMaterial.from_glass`` caches by name);
+    anything else -- ``AbbeMaterial``, ``IdealMaterial``, or any other
+    ``BaseMaterial`` the sequential surface carries -- is wrapped as-is.
+
+    Args:
+        surf: Sequential Surface object.
+
+    Returns:
+        The catalogue name (``str``) if ``surf.material_post`` is a named
+        catalogue material, else an ``NSQMaterial`` wrapping it directly.
+    """
+    from optiland.nonsequential.materials.nsq_material import (  # noqa: PLC0415
+        NSQMaterial,
+    )
+
+    mat = surf.material_post
+    if hasattr(mat, "name"):
+        return mat.name
+    return NSQMaterial(optiland_material=mat)
+
+
 def _surface_z(surf) -> float:
     """Return the global z-position of a surface vertex.
 
@@ -455,6 +487,23 @@ def _surface_semi_diameter(
             return float(ap.radius.item()), False
         except AttributeError:
             return float(ap.radius), False
+    # optiland.physical_apertures.RadialAperture -- the aperture class every
+    # caller in this codebase actually attaches via
+    # ``surf.aperture = RadialAperture(r_max=...)`` (see
+    # bench/demo_lens_ghosts.py's sequential_optic(), and every converter
+    # test that sets an explicit aperture) -- carries its radius as
+    # ``r_max``, not ``radius``: no aperture class in
+    # optiland.physical_apertures has ever had a ``.radius`` attribute, so
+    # the check above never actually matched a real aperture, and an
+    # explicit RadialAperture silently fell through to the paraxial
+    # fallback below regardless of what radius was set (found while
+    # writing issue #13's converter tests, item 3: a standalone stop's
+    # explicit aperture was not being read).
+    if ap is not None and hasattr(ap, "r_max"):
+        try:
+            return float(ap.r_max.item()), False
+        except AttributeError:
+            return float(ap.r_max), False
     # Fall back to semi_aperture if set
     if surf.semi_aperture is not None:
         try:
@@ -480,6 +529,95 @@ def _surface_semi_diameter(
             pass
 
     return 10.0, True  # Default if not set
+
+
+def _system_envelope_radius(optic, skip_index: int) -> float:
+    """The largest semi-diameter of any other real surface in the system.
+
+    Sizes a standalone stop's absorbing annulus (see :func:`_add_stop`,
+    issue #13, item 3): the converter has no barrel or mount geometry to
+    bound the annulus by the way a hand-built scene can (stopping it
+    exactly where a neighbouring element's own edge reaches that plane,
+    as ``docs/build/Z2_lens_ghosts.md`` section 4.1 does), so instead the
+    annulus is sized off the system's own overall envelope -- the widest
+    clear aperture anywhere else in the prescription.
+
+    Args:
+        optic: Sequential Optic.
+        skip_index: The stop's own surface index, excluded from the scan.
+
+    Returns:
+        The largest semi-diameter [mm] found among the system's other
+        surfaces, or 0.0 if the optic has none (a bare stop with nothing
+        else in the system) -- the caller then falls back to a multiple
+        of the stop's own radius.
+    """
+    surfs = optic.surfaces.surfaces
+    radii = []
+    for idx in range(1, len(surfs) - 1):
+        if idx == skip_index:
+            continue
+        try:
+            r, _ = _surface_semi_diameter(surfs[idx], optic, idx)
+        except Exception:
+            continue
+        if r > 0.0:
+            radii.append(r)
+    return max(radii) if radii else 0.0
+
+
+def _add_stop(scene, optic, surf, index: int, report: ConversionReport) -> None:
+    """Add a standalone air-to-air aperture stop as an absorbing annulus.
+
+    Issue #13, item 3: the converter used to refuse every air-to-air
+    surface outright ("Standalone aperture stops in air are not supported
+    by the converter"). A stop carries no material transition, but it is
+    exactly the physical object a diaphragm already is -- an opaque plane
+    with a hole -- which ``AnnularPlaneGeometry`` plus ``AbsorbingComponent``
+    already models (the same construction ``bench/demo_lens_ghosts.py``
+    builds by hand in KronosNSRT for this same lens's own stop).
+
+    The inner radius is the stop's own explicit aperture/semi-aperture when
+    set, else the paraxial marginal-ray radius at that surface --
+    ``_surface_semi_diameter`` already applies exactly this rule to every
+    lens face's own aperture, so a stop is sized the same way as any other
+    surface in the system, not by a separate convention. The outer radius
+    is sized off the system's overall envelope (:func:`_system_envelope_
+    radius`) with a margin, so the annulus is never itself the limiting
+    aperture.
+
+    Args:
+        scene: NSQScene to add to.
+        optic: Sequential Optic (for the paraxial-ray and envelope fallback).
+        surf: The stop's sequential Surface object.
+        index: Surface index within ``optic``.
+        report: ConversionReport to record fidelity notes into.
+    """
+    from optiland.coordinate_system import CoordinateSystem  # noqa: PLC0415
+    from optiland.nonsequential.components.absorbing import (  # noqa: PLC0415
+        AbsorbingComponent,
+    )
+    from optiland.nonsequential.components.geometry.analytic.annulus import (  # noqa: PLC0415
+        AnnularPlaneGeometry,
+    )
+
+    name = f"STOP{index}"
+    inner_r, estimated = _surface_semi_diameter(surf, optic, index)
+    if estimated:
+        report.estimated_apertures.append(name)
+
+    envelope_r = _system_envelope_radius(optic, skip_index=index)
+    outer_r = max(4.0 * inner_r, 1.5 * envelope_r, inner_r + 1.0)
+
+    z = _surface_z(surf)
+    scene.add_component(
+        name,
+        AbsorbingComponent(
+            CoordinateSystem(z=z),
+            AnnularPlaneGeometry(inner_radius=inner_r, outer_radius=outer_r),
+            name=name,
+        ),
+    )
 
 
 def _surface_coating(surf) -> object | None:
@@ -611,7 +749,7 @@ def _add_lens(
         r1=_surface_radius(s_front),
         r2=_surface_radius(s_back),
         thickness=thickness,
-        material=_material_name(s_front),
+        material=_material_for_nsq(s_front),
         front_aperture_radius=front_ap,
         back_aperture_radius=back_ap,
         conic1=_surface_conic(s_front),
@@ -696,8 +834,8 @@ def _add_doublet(
         r3=_surface_radius(s_back),
         thickness1=thickness1,
         thickness2=thickness2,
-        material1=_material_name(s_front),
-        material2=_material_name(s_cement),
+        material1=_material_for_nsq(s_front),
+        material2=_material_for_nsq(s_cement),
         aperture_radius=ap_r,
         conic1=_surface_conic(s_front),
         conic2=_surface_conic(s_cement),

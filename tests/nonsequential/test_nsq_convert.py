@@ -395,3 +395,116 @@ def test_image_height_field_raises():
 
     with pytest.raises(ConversionError, match="paraxial_image_height"):
         sequential_to_nonsequential(optic)
+
+
+# ---------------------------------------------------------------------------
+# Issue #13: ideal-index materials and a standalone stop in air
+# ---------------------------------------------------------------------------
+
+
+def _canon_ef50_f18_ii_optic():
+    """The front three elements and the stop of the Canon EF 50mm f/1.8 II.
+
+    Patent JP-S62-087922 ("Gaussian lens", Canon Inc.), numerical example 1
+    (transcription: PhotonsToPhotos Optical Bench Hub, data file
+    JP1987-087922_Example01P.txt) -- the same public double-Gauss
+    prescription and the same cited record as
+    ``cases/lenses/canon_ef50_f18_ii.yaml`` in KronosNSRT and
+    ``docs/build/Z2_lens_ghosts.md``. A truncated prefix (elements E1-E3
+    and the iris stop, dropped before the cemented doublet and E6) --
+    enough to exercise a standalone air-to-air stop between two ideal-glass
+    singlets, without needing the full eleven-surface system in a unit
+    test. Radii and thicknesses in millimetres; glass as (nd, vd), built as
+    ideal Abbe materials -- the patent gives no catalogue glass.
+    """
+    from optiland.materials import AbbeMaterial
+    from optiland.optic import Optic
+    from optiland.physical_apertures import RadialAperture
+
+    def glass(nd, vd):
+        return AbbeMaterial(n=nd, abbe=vd, model="buchdahl")
+
+    o = Optic()
+    o.surfaces.add(index=0, radius=float("inf"), thickness=float("inf"))
+    # E1: positive meniscus
+    o.surfaces.add(index=1, radius=34.30, thickness=4.50,
+                    material=glass(1.62280, 57.0), aperture=RadialAperture(r_max=16.28))
+    o.surfaces.add(index=2, radius=247.65, thickness=2.40,
+                    aperture=RadialAperture(r_max=16.28))
+    # E2: positive meniscus (the deep-meniscus element of issue #13, item 1)
+    o.surfaces.add(index=3, radius=21.51, thickness=4.35,
+                    material=glass(1.70154, 41.2), aperture=RadialAperture(r_max=13.53))
+    o.surfaces.add(index=4, radius=40.31, thickness=0.92,
+                    aperture=RadialAperture(r_max=13.53))
+    # E3: negative meniscus
+    o.surfaces.add(index=5, radius=78.44, thickness=1.40,
+                    material=glass(1.67270, 32.1), aperture=RadialAperture(r_max=11.17))
+    o.surfaces.add(index=6, radius=15.32, thickness=6.75,
+                    aperture=RadialAperture(r_max=11.17))
+    # The iris stop: a standalone air-to-air surface (issue #13, item 3).
+    o.surfaces.add(index=7, radius=float("inf"), thickness=4.95, is_stop=True,
+                    aperture=RadialAperture(r_max=9.66))
+    o.surfaces.add(index=8)
+    o.set_aperture(aperture_type="imageFNO", value=1.85)
+    o.fields.set_type("angle")
+    o.fields.add(y=0.0)
+    o.wavelengths.add(value=0.5876, is_primary=True)
+    return o
+
+
+def test_ideal_glass_material_accepted():
+    """AbbeMaterial (nd/vd only, no catalogue name) must convert, not raise
+    "Cannot extract material name from AbbeMaterial" -- issue #13, item 2.
+    """
+    from optiland.nonsequential.materials.nsq_material import NSQMaterial
+
+    optic = _canon_ef50_f18_ii_optic()
+    with pytest.warns(UserWarning, match="Fresnel"):
+        scene = sequential_to_nonsequential(optic)
+
+    import numpy as np
+
+    e1 = scene.component_registry.get("L1")
+    assert isinstance(e1._config.material, NSQMaterial)
+    # Same nd at the d line as the patent's own numerical example 1, E1.
+    nd = float(np.asarray(e1._config.material.n(0.5876)).reshape(-1)[0])
+    assert nd == pytest.approx(1.62280, abs=1e-4)
+
+
+def test_standalone_stop_in_air_converts_to_absorbing_annulus():
+    """A standalone air-to-air stop must convert to an absorbing annulus,
+    not raise "Standalone aperture stops in air are not supported by the
+    converter" -- issue #13, item 3. Its inner radius is the stop's own
+    explicit aperture (set on this optic), not a paraxial estimate.
+    """
+    from optiland.nonsequential.components.absorbing import AbsorbingComponent
+    from optiland.nonsequential.components.geometry.analytic.annulus import (
+        AnnularPlaneGeometry,
+    )
+
+    optic = _canon_ef50_f18_ii_optic()
+    with pytest.warns(UserWarning, match="Fresnel"):
+        scene = sequential_to_nonsequential(optic)
+
+    names = list(scene.component_registry._registry)
+    stop_names = [n for n in names if n.startswith("STOP")]
+    assert len(stop_names) == 1
+    stop = scene.component_registry.get(stop_names[0])
+    stop_surface = stop.surfaces[0]
+    assert isinstance(stop_surface, AbsorbingComponent)
+    assert isinstance(stop_surface.geometry, AnnularPlaneGeometry)
+    assert float(stop_surface.geometry.inner_radius) == pytest.approx(9.66, abs=1e-6)
+    # The outer radius must be wide enough that it is never itself the
+    # limiting aperture against the rest of the system (largest element
+    # semi-diameter here is E1 at 16.28 mm).
+    assert float(stop_surface.geometry.outer_radius) > 16.28
+
+
+def test_double_gauss_with_air_stop_full_structure():
+    """The whole prescription converts to exactly the expected components:
+    three singlets and one standalone-stop annulus, in surface order."""
+    optic = _canon_ef50_f18_ii_optic()
+    with pytest.warns(UserWarning, match="Fresnel"):
+        scene = sequential_to_nonsequential(optic)
+
+    assert list(scene.component_registry._registry) == ["L1", "L3", "L5", "STOP7"]
