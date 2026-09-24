@@ -215,13 +215,15 @@ class SamplingPolicy:
             and under autograd -- the branch decision is always drawn from
             a detached probability with a compensating attached weight, so
             only the *variance* changes, never the expectation.
-        split_depth: NumPy forward engine only; bounded bounce-splitting
-            depth (see
-            :mod:`optiland.nonsequential.backends.array_backend`). ``0`` =
-            never split (the only mode the Torch backend supports -- it
-            forces ``split_depth=0`` and warns if the scene sets a nonzero
-            value, since fixed tensor shapes are required for the autograd
-            graph).
+        split_depth: Bounded bounce-splitting depth (see
+            :mod:`optiland.nonsequential.backends.array_backend`): a
+            refractive hit below this many interactions follows both Fresnel
+            children with weights R and T (the exhaustive split). ``0`` =
+            never split. Honoured by the NumPy backend, and by the Torch
+            backend in forward-only mode when built with
+            ``allow_splitting=True``; a default Torch backend, or any Torch
+            trace in gradient mode, warns and ignores it, since fixed tensor
+            shapes are required for the autograd graph.
         split_budget: Cap on live rays during splitting, as a multiple of
             ``batch_size``. Unused while ``split_depth=0``. Rays spawned
             beyond the cap are Russian-rouletted, not dropped.

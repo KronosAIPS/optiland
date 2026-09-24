@@ -14,12 +14,13 @@ Two independent mechanisms, both keyed off ``SceneIR.sampling``
   hard kill below ``min_flux`` with an unbiased stochastic kill +
   boost, on both backends.
 
-Bounded splitting (also part of D2/PR11) is NumPy-forward-engine-only and
-lives in :mod:`optiland.nonsequential.ir.interpreter` and
-:mod:`optiland.nonsequential.backends.array_backend`, since it requires
-growing the live ray bundle -- a NumPy-only operation (the Torch backend
-keeps a fixed-shape bundle for the autograd graph and forces
-``split_depth=0``).
+Bounded splitting (also part of D2/PR11) lives in
+:mod:`optiland.nonsequential.ir.interpreter` and
+:mod:`optiland.nonsequential.backends.array_backend`, since it grows the
+live ray bundle. The NumPy backend always honours it; the Torch backend only
+in forward-only mode and only when built with ``allow_splitting=True`` (in
+gradient mode it keeps a fixed-shape bundle for the autograd graph and
+ignores ``split_depth`` with a warning).
 
 Kramer Harrison, 2026
 """
