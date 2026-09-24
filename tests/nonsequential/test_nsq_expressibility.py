@@ -75,6 +75,11 @@ def each_backend(request):
     if request.param == "torch":
         be.set_device("cpu")
         be.set_precision("float64")
+        # Gradient mode is global state on the torch backend and the
+        # sequential suite's ``set_test_backend`` fixture enables it without
+        # disabling it again; splitting is refused in gradient mode, so the
+        # tests here state the mode they need instead of inheriting it.
+        be.grad_mode.disable()
     yield request.param
     if request.param == "torch":
         be.grad_mode.disable()
