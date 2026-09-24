@@ -104,6 +104,21 @@ class NSQMaterial:
             ) from exc
         return cls(optiland_material=mat)
 
+    def reset_memo(self) -> None:
+        """Clear the identity memo of both ``n()`` and ``k()``.
+
+        Called once per material at the start of every trace (see
+        ``ArrayBackend.trace``), so a wavelength array object reused across
+        two separate traces -- the same ray bundle traced twice, with the
+        material's own parameters changed in between -- cannot read a
+        result computed under the old parameters. Within one trace nothing
+        calls this: the memo stays valid for the trace's whole bounce loop,
+        which is what makes it effective. A plain attribute write, no host
+        read.
+        """
+        self._n_memo = (None, None)
+        self._k_memo = (None, None)
+
     def n(self, wavelength_um: WavelengthInput) -> WavelengthInput:
         """Refractive index at the given wavelength(s).
 

@@ -387,6 +387,21 @@ class ArrayBackend(TracerBackend):
             if hasattr(comp, "reset_ledger"):
                 comp.reset_ledger()
 
+        # Clear every material's n()/k() identity memo (NSQMaterial.reset_memo)
+        # so a wavelength array object reused across two separate trace()
+        # calls -- the same ray bundle traced twice, with a material's own
+        # parameters changed in between -- cannot read back a result computed
+        # under the old parameters. One attribute write per distinct
+        # material, no host read; a component's material_front/material_back
+        # are frequently the same NSQMaterial instance shared with a
+        # neighbour, so this is deduplicated by object identity.
+        seen_material_ids: set[int] = set()
+        for comp in scene.surfaces:
+            for mat in (comp.material_front, comp.material_back):
+                if id(mat) not in seen_material_ids:
+                    seen_material_ids.add(id(mat))
+                    mat.reset_memo()
+
         # The per-bounce interaction loop below is driven by this IR, not by
         # iterating scene.surfaces and branching on Python class identity.
         ir = lower(scene, strict=False)
