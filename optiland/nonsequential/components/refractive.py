@@ -53,6 +53,60 @@ if TYPE_CHECKING:
     from optiland.nonsequential.rng import NSQRng
 
 
+def refraction_cosine(sin2_t):
+    """Cosine of the refraction angle, and the total-internal-reflection mask.
+
+    ``cos(theta_t) = sqrt(w)`` with ``w = 1 - sin^2(theta_t)``. Two rules,
+    both from docs/theory/08_precision.md:
+
+    * **The domain test is in the dtype's own units** (section 8.7, the
+      radicand row; R-08-7). A radicand below ``k u_T``
+      (:func:`optiland.nonsequential._tol.radicand_min`, ``k = 4``) cannot be
+      told from zero in the working dtype, so no transmitted wave is asserted
+      there: the ray is totally reflected. The Fresnel transmittance is
+      continuous at the critical angle (it goes to zero with ``cos(theta_t)``),
+      so this moves the transmittance by at most its value at
+      ``w = k u_T`` -- about 5.7 ``sqrt(4 u_T)``, 2.8e-3 at float32 and 1.2e-7
+      at float64 for N-BK7 against vacuum -- and only for incidence within
+      ``k u_T / (r^2 sin 2 theta_i)`` of the critical angle (1.0e-7 rad at
+      float32, 2.0e-16 rad at float64).
+    * **The input is masked, not the output** (section 8.8; R-08-8). Lanes
+      that are totally reflected take the square root of 1 and discard it,
+      so the backward pass never meets ``sqrt'(0)``; every other lane has
+      ``w >= k u_T`` and a finite derivative.
+
+    What this replaces. The radicand used to be clamped to
+    ``_tol.radicand_floor``, a float64 budget of 1e-12 scaled by the dtype's
+    ulp ratio: 1e-12 at float64, but 5.37e-4 at float32, so ``cos(theta_t)``
+    never fell below 0.0232 and every refraction within 1.33 degrees of
+    grazing was bent and weighted as if it were 1.33 degrees from grazing.
+    One millidegree inside the critical angle of N-BK7 against vacuum that
+    gave a transmittance of 0.124 where float64 reads 0.0373 on the same
+    rays; the float32 radicand itself was right to 0.1 u_T. [measured,
+    benchmarks/nonsequential/float32_mechanisms.py]
+
+    At float64 the two rules agree bit for bit wherever ``w >= 1e-12``: the
+    clamp returned ``w`` there and ``sqrt(w)`` is formed from the same value.
+    They differ only within ``4.4e-13`` rad of the critical angle, where the
+    old clamp asserted a transmitted wave with ``cos(theta_t) = 1e-6`` (a
+    transmittance of 5.8e-6 at N-BK7's critical angle) and this one
+    reflects totally when ``w`` is below ``4 u_64``.
+
+    Args:
+        sin2_t: ``(n1 / n2)^2 sin^2(theta_i)`` per ray, in the working
+            backend and dtype.
+
+    Returns:
+        ``(tir, cos_t)``: the boolean total-internal-reflection mask and the
+        cosine of the refraction angle (0 where ``tir``).
+    """
+    w = 1.0 - sin2_t
+    tir = w < _tol.radicand_min(w)
+    w_safe = be.where(tir, be.ones_like(w), w)
+    cos_t = be.where(tir, be.zeros_like(w), w_safe**0.5)
+    return tir, cos_t
+
+
 class RefractiveComponent(BaseComponent, LedgerBooking):
     """Refractive optical element (lens, prism, window).
 
@@ -238,16 +292,10 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         # docs/theory/08_precision.md sec 8.8.
         n_ratio = n1 / (n2 + _tol.tiny_for(n2))
         sin2_t = n_ratio**2 * (1.0 - cos_theta_i**2)
-        tir = sin2_t > 1.0
-        # Epsilon-clamp the radicand (not 0): sqrt's infinite derivative at 0
-        # combined with be.where yields a 0 * inf = NaN gradient at the TIR
-        # boundary. Calibrated float64 budget, scaled for lower precision --
-        # sec 8.7, and see optiland.nonsequential._tol.radicand_floor.
-        cos_theta_t = be.where(
-            tir,
-            be.zeros_like(sin2_t),
-            be.maximum(1.0 - sin2_t, _tol.radicand_floor(be.ones_like(sin2_t))) ** 0.5,
-        )
+        # TIR is decided on the radicand the dtype can resolve, and every
+        # radicand it does resolve is square-rooted as it is -- see
+        # refraction_cosine below for the float32 failure the old clamp made.
+        tir, cos_theta_t = refraction_cosine(sin2_t)
 
         rs_denom = n1 * cos_theta_i + n2 * cos_theta_t
         rs = (n1 * cos_theta_i - n2 * cos_theta_t) / (
