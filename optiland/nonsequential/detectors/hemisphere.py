@@ -61,6 +61,7 @@ class HemisphereDetector(FarFieldDetector):
         num_bins_phi: int = 36,
         name: str = "",
         absorb: bool = True,
+        reflection_bins: int = 0,
     ) -> None:
         """Initialize HemisphereDetector.
 
@@ -71,6 +72,9 @@ class HemisphereDetector(FarFieldDetector):
             num_bins_phi: Number of azimuthal bins over -180 to 180 degrees.
             name: Optional label.
             absorb: Whether a hit terminates the ray (default True).
+            reflection_bins: Also book the arriving flux by reflection count
+                (0, the default, keeps no histogram). See
+                :meth:`BaseDetector.record_reflections`.
         """
         super().__init__(
             cs,
@@ -79,6 +83,7 @@ class HemisphereDetector(FarFieldDetector):
             num_bins_phi=num_bins_phi,
             name=name,
             absorb=absorb,
+            reflection_bins=reflection_bins,
         )
         # Replaces the flat aperture the far-field detector builds: the
         # shell is closed, so no `side` flag is needed to keep the beam

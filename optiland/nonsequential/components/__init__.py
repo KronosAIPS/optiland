@@ -10,11 +10,15 @@ from .configs import (
     InteractionType,
     LensConfig,
     MirrorConfig,
+    ParaxialLensConfig,
+    PrismConfig,
     SurfaceConfig,
 )
 from .doublet import Doublet
 from .lens import Lens
 from .mirror import Mirror
+from .paraxial import ParaxialLens, ParaxialLensComponent
+from .prism import Prism
 from .reflective import ReflectiveComponent
 from .refractive import RefractiveComponent
 from .registry import ComponentRegistry
@@ -33,6 +37,11 @@ __all__ = [
     "Mirror",
     "MirrorConfig",
     "NonWatertightVolumeError",
+    "ParaxialLens",
+    "ParaxialLensComponent",
+    "ParaxialLensConfig",
+    "Prism",
+    "PrismConfig",
     "RefractiveComponent",
     "ReflectiveComponent",
     "SurfaceConfig",

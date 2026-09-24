@@ -179,4 +179,5 @@ class RayDatabaseDetector(BaseDetector):
         self._wavelength.clear()
         self._total_flux = 0.0
         self._num_rays_hit = 0
+        self.reset_reflection_tally()
         self.invalidate_frame()

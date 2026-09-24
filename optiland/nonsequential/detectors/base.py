@@ -13,6 +13,7 @@ import numpy as np
 import optiland.backend as be
 from optiland.backend.utils import is_torch_tensor, to_numpy
 from optiland.nonsequential import _tol
+from optiland.nonsequential._utils import clamp_int
 from optiland.nonsequential.components.base import (
     _get_transform,
     advance_to_hit_in_frame,
@@ -242,6 +243,15 @@ class BaseDetector(ABC):
     instead of absorbing it before it ever reaches the surface under test
     (``docs/theory/11_validation_catalogue.md`` 11.4.18).
 
+    Any detector can also **book arriving flux by ghost order**:
+    ``reflection_bins=K`` keeps, beside the detector's own record, the flux
+    that arrives with exactly ``k`` reflections in its history for
+    ``k = 0 .. K-1`` and the flux with ``K`` or more in one overflow bin
+    (:meth:`record_reflections`, :meth:`reflection_histogram`). The order is
+    the ray's own ``reflections`` count, carried in the ray state, so a
+    ghost is separated from the direct beam even where the two land on the
+    same pixel (``docs/theory/11_validation_catalogue.md`` 11.4.6, 11.4.21).
+
     Attributes:
         cs: Coordinate system defining detector position and orientation.
         geometry: Surface geometry that defines the detector area.
@@ -250,6 +260,8 @@ class BaseDetector(ABC):
             recorded and passes through unaffected.
         side: Which side of the surface is live -- ``"both"`` (default),
             ``"front"``, or ``"back"``. See :meth:`intersect`.
+        reflection_bins: Number of exact reflection-count bins (0, the
+            default, keeps no histogram).
     """
 
     def __init__(
@@ -259,6 +271,7 @@ class BaseDetector(ABC):
         name: str = "",
         absorb: bool = True,
         side: str = "both",
+        reflection_bins: int = 0,
     ) -> None:
         """Initialize BaseDetector.
 
@@ -273,19 +286,29 @@ class BaseDetector(ABC):
                 ``"back"``. The front is the side the surface normal points
                 toward: for every flat detector here that is the placement's
                 own normal, local +z.
+            reflection_bins: Keep a histogram of arriving flux by reflection
+                count, with this many exact bins (``0 .. K-1``) and one
+                overflow bin. 0 (the default) keeps none and costs nothing.
 
         Raises:
-            ValueError: If ``side`` is not one of the three accepted values.
+            ValueError: If ``side`` is not one of the three accepted values,
+                or ``reflection_bins`` is negative.
         """
         if side not in ("both", "front", "back"):
             raise ValueError(
                 f"side must be 'both', 'front', or 'back'; got {side!r}."
+            )
+        if int(reflection_bins) < 0:
+            raise ValueError(
+                f"reflection_bins must be 0 or positive; got {reflection_bins!r}."
             )
         self.cs = cs
         self.geometry = geometry
         self.name = name
         self.absorb = bool(absorb)
         self.side = side
+        self.reflection_bins = int(reflection_bins)
+        self.reset_reflection_tally()
         self._frame = None
         self._be_tables: dict[str, object] = {}
         self._be_tables_key = None
@@ -466,6 +489,87 @@ class BaseDetector(ABC):
             hit_mask: Rays that crossed this detector, shape (N,).
         """
         offset_origin_from_surface(rays, n_geom, hit_mask)
+
+    # ------------------------------------------------------------------
+    # Arriving flux by reflection count (ghost order)
+    # ------------------------------------------------------------------
+
+    def reset_reflection_tally(self) -> None:
+        """Clear the reflection-count histogram.
+
+        Three accumulators of ``reflection_bins + 1`` entries -- the flux,
+        the flux squared and the hit count per bin, the last entry being
+        the overflow bin -- in :func:`accumulator_dtype`, on the active
+        backend and device. Every subclass's :meth:`reset` calls this, so a
+        trace starts from zero exactly as the detector's own record does.
+        """
+        if self.reflection_bins > 0:
+            size = self.reflection_bins + 1
+            self._refl_flux = _new_flat_accumulator(size)
+            self._refl_flux_sq = _new_flat_accumulator(size)
+            self._refl_hits = _new_flat_accumulator(size)
+        else:
+            self._refl_flux = None
+            self._refl_flux_sq = None
+            self._refl_hits = None
+
+    def record_reflections(self, rays: NSQRayBundle, hit_mask) -> None:
+        """Book each hit ray's flux in the bin of its reflection count.
+
+        Called by the trace loop beside :meth:`record`, for the same rays.
+        A ray with ``k < reflection_bins`` reflections lands in bin ``k``; one
+        with more lands in the overflow bin, so the bins always sum to the
+        flux the detector received and nothing is dropped from the count.
+        Index arithmetic and one in-place scatter-add per accumulator,
+        beside the ray state: no host read, and a no-op (without asking the
+        mask anything) when the detector keeps no histogram.
+
+        The flux squared per bin is kept for the standard error of a bin
+        whose contributions are independent draws -- the sum of squared
+        weights per cell of ``docs/theory/03_monte_carlo.md`` R-03-7 -- which
+        holds when each launched ray reaches the detector at most once (see
+        :meth:`ReflectionHistogram.standard_error`).
+
+        Args:
+            rays: Current ray bundle.
+            hit_mask: Rays recorded on this detector this bounce, shape (N,).
+        """
+        if self.reflection_bins <= 0:
+            return
+        bins = clamp_int(rays.reflections, 0, self.reflection_bins)
+        zero = be.zeros_like(rays.flux)
+        weight = be.where(hit_mask, rays.flux, zero)
+        hits = be.where(hit_mask, be.ones_like(rays.flux), zero)
+        _accumulate_into(self._refl_flux, bins, weight)
+        _accumulate_into(self._refl_flux_sq, bins, weight * weight)
+        _accumulate_into(self._refl_hits, bins, hits)
+
+    def reflection_histogram(self):
+        """The arriving flux by reflection count, or ``None`` without bins.
+
+        Returns:
+            A :class:`~optiland.nonsequential.results.reflection_histogram
+            .ReflectionHistogram`, read back once (a host copy), or ``None``
+            when the detector was built with ``reflection_bins=0``.
+        """
+        if self.reflection_bins <= 0:
+            return None
+        from optiland.nonsequential.results.reflection_histogram import (  # noqa: PLC0415
+            ReflectionHistogram,
+        )
+
+        flux = np.asarray(to_numpy(self._refl_flux), dtype=np.float64)
+        flux_sq = np.asarray(to_numpy(self._refl_flux_sq), dtype=np.float64)
+        hits = np.rint(np.asarray(to_numpy(self._refl_hits), dtype=np.float64))
+        return ReflectionHistogram(
+            flux=flux[:-1].copy(),
+            flux_sq=flux_sq[:-1].copy(),
+            num_rays_hit=hits[:-1].astype(np.int64),
+            overflow_flux=float(flux[-1]),
+            overflow_flux_sq=float(flux_sq[-1]),
+            overflow_num_rays_hit=int(hits[-1]),
+            data=self._refl_flux,
+        )
 
     @abstractmethod
     def record(self, rays: NSQRayBundle, t: np.ndarray, hit_mask: np.ndarray) -> None:

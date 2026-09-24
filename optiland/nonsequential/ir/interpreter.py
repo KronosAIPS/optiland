@@ -133,6 +133,50 @@ def assert_bsdf_matches(bsdf: object | None, bsdf_ir: BsdfIR) -> None:
         )
 
 
+def ray_side(rays: NSQRayBundle, n_geom: object) -> object:
+    """Signed component of each ray's direction along a geometric normal.
+
+    Args:
+        rays: Ray bundle.
+        n_geom: Geometric (unflipped) surface normal per ray, shape (N, 3).
+
+    Returns:
+        ``d . n_geom`` per ray, shape (N,), in the working backend.
+    """
+    return rays.L * n_geom[:, 0] + rays.M * n_geom[:, 1] + rays.N * n_geom[:, 2]
+
+
+def count_reflections(
+    rays: NSQRayBundle, n_geom: object, side_in: object, hit_mask: object
+) -> None:
+    """Add one to ``rays.reflections`` for every ray that was reflected.
+
+    A reflection is an interaction after which the ray leaves the surface on
+    the side it arrived from: its direction's component along the geometric
+    normal changed sign. One rule for every component kind -- a Fresnel or
+    total internal reflection at a refractive surface, a mirror, a scatter
+    lobe on the reflecting side -- read off the geometry rather than off
+    each component's own branch variables, so a component added later is
+    counted without touching this function. A transmission keeps the sign
+    (Snell's law does not reverse the normal component), an absorption
+    leaves the direction alone, and a ray grazing exactly in the surface
+    plane (a zero product) is not counted.
+
+    Elementwise and masked, so it costs no host read on a device backend.
+
+    Args:
+        rays: Ray bundle, updated in place. Directions must be the outgoing
+            ones.
+        n_geom: The geometric normal the interaction was resolved against,
+            shape (N, 3).
+        side_in: :func:`ray_side` of the incoming directions against the
+            same normal, taken before the interaction, shape (N,).
+        hit_mask: Rays that interacted this bounce, shape (N,).
+    """
+    reflected = hit_mask & (side_in * ray_side(rays, n_geom) < 0.0)
+    rays.reflections = be.where(reflected, rays.reflections + 1, rays.reflections)
+
+
 def apply_primitive_interactions(
     rays: NSQRayBundle,
     ir: SceneIR,
@@ -184,9 +228,13 @@ def apply_primitive_interactions(
             ``_log_hits`` closure.
         ray_id_allocator: ``(n) -> int64 ndarray`` of ``n`` fresh, previously
             -unused ray ids. Required to enable bounded splitting (D2, PR11,
-            ``ir.sampling.split_depth > 0``) -- omit (the default) on the
-            Torch backend, which forces ``split_depth=0`` and never spawns
-            rays (fixed tensor shapes are required for the autograd graph).
+            ``ir.sampling.split_depth > 0``) -- omitted (the default) when
+            the backend does not split: the Torch backend in gradient mode,
+            or without ``allow_splitting`` (fixed tensor shapes keep the
+            autograd graph one chain, and a device loop that splits reads
+            the split rows back to the host every bounce). When given, the
+            split works on either array library: the rows are chosen on the
+            host and gathered on the bundle's own library and device.
         skip_unhit: Skip a primitive no ray hit this bounce. Deciding that
             means reducing the primitive's mask to a Python bool, which is
             free on a host array and a device synchronisation on a device
@@ -216,6 +264,11 @@ def apply_primitive_interactions(
     from optiland.nonsequential._tally import masked_count  # noqa: PLC0415
 
     spawned_chunks: list[NSQRayBundle] = []
+
+    # Each ray meets at most one primitive a bounce, so the incoming side of
+    # every ray is taken once here and the reflection count settled once
+    # after every primitive has run (see count_reflections).
+    side_in = ray_side(rays, hit_n_geom)
 
     for i, primitive in enumerate(ir.primitives):
         mask_i = comp_first_np & (comp_idx == i)
@@ -250,8 +303,11 @@ def apply_primitive_interactions(
             )
             continue
 
-        # Bounded splitting is the host forward engine only: it selects
-        # rows, which needs a host-resident index list.
+        # Bounded splitting selects rows, which needs the index list on the
+        # host: the masks are read back here (a synchronisation on a device
+        # backend, which is why a device backend only splits when asked to),
+        # and the rows are then gathered on the bundle's own library and
+        # device, so the children never leave it.
         mask_i_np = np.asarray(be.to_numpy(mask_i), dtype=bool)
         bounce_np = np.asarray(be.to_numpy(rays.bounce))
         split_eligible_np = mask_i_np & (bounce_np < ir.sampling.split_depth)
@@ -276,12 +332,18 @@ def apply_primitive_interactions(
         #    (fresh ray ids, so its RNG stream is independent of the sibling
         #    that keeps the original id) before either branch mutates
         #    anything.
-        new_ids = ray_id_allocator(split_idx.size)
-        transmit_snapshot = rays.select(split_idx, ray_id=new_ids)
-        snap_t = np.asarray(t_min)[split_idx]
-        snap_normals = np.asarray(hit_normals)[split_idx]
-        snap_n_geom = np.asarray(hit_n_geom)[split_idx]
-        snap_mask = be.array(np.ones(split_idx.size, dtype=bool))
+        from optiland.nonsequential.ray_bundle import (  # noqa: PLC0415
+            backend_bool_full,
+            backend_rows,
+        )
+
+        rows = backend_rows(split_idx, like=rays.x)
+        new_ids = backend_rows(ray_id_allocator(split_idx.size), like=rays.x)
+        transmit_snapshot = rays.select(rows, ray_id=new_ids)
+        snap_t = t_min[rows]
+        snap_normals = hit_normals[rows]
+        snap_n_geom = hit_n_geom[rows]
+        snap_mask = backend_bool_full((split_idx.size,), True, like=rays.alive)
 
         # 2) Non-splitting remainder of this primitive's hits (if any):
         #    normal single-branch draw.
@@ -313,6 +375,7 @@ def apply_primitive_interactions(
 
         # 4) Transmit child: force the other branch on the snapshot, which
         #    becomes a newly spawned ray in the live bundle.
+        snap_side_in = ray_side(transmit_snapshot, snap_n_geom)
         component.interact(
             transmit_snapshot,
             snap_t,
@@ -324,7 +387,10 @@ def apply_primitive_interactions(
             sampling=ir.sampling,
             forced_branch="transmit",
         )
+        count_reflections(transmit_snapshot, snap_n_geom, snap_side_in, snap_mask)
         spawned_chunks.append(transmit_snapshot)
+
+    count_reflections(rays, hit_n_geom, side_in, comp_first_np)
 
     if not spawned_chunks:
         return None

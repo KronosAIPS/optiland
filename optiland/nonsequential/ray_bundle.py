@@ -98,6 +98,37 @@ def backend_bool_full(shape, fill_value: bool, like=None):
     return np.full(tuple(shape), bool(fill_value), dtype=bool)
 
 
+def backend_rows(index, like=None):
+    """An int64 row index on the same array library and device as ``like``.
+
+    Bounded splitting chooses its rows on the host (a list of positions, or
+    fresh ray ids); this puts them beside the ray state they index, so the
+    gather and the new ids stay on the bundle's own library and device. A
+    NumPy ``like`` (or ``None``) returns a NumPy int64 array; a torch one a
+    ``LongTensor`` on its device. An index already of the right kind is
+    returned as it is.
+
+    Args:
+        index: Integer positions or ids, a NumPy array, a sequence, or a
+            tensor.
+        like: Array whose library and device the result follows.
+
+    Returns:
+        The index as an int64 array/tensor of the matching library.
+    """
+    if be.is_torch_tensor(like):
+        import torch  # noqa: PLC0415
+
+        if be.is_torch_tensor(index):
+            return index.to(device=like.device, dtype=torch.int64)
+        return torch.as_tensor(
+            np.asarray(index, dtype=np.int64), dtype=torch.int64, device=like.device
+        )
+    if be.is_torch_tensor(index):
+        return np.asarray(index.detach().cpu().numpy(), dtype=np.int64)
+    return np.asarray(index, dtype=np.int64)
+
+
 def backend_masked_fill(table, mask, value: int):
     """Write ``value`` into every entry of ``table`` where ``mask`` is True.
 
@@ -271,6 +302,19 @@ class NSQRayBundle:
             ``MEDIUM_STACK_MAX_DEPTH``. Shape (N,), int32, same library and
             device as ``medium_stack``; summed across all rays into
             ``Diagnostics.medium_stack_underflows`` at the end of a trace.
+        reflections: Number of reflections in the ray's history so far,
+            shape (N,), int32, same library and device as ``medium_depth``.
+            A reflection is an interaction after which the ray leaves the
+            surface on the side it arrived from -- a Fresnel or total
+            internal reflection, a mirror, a reflective scatter lobe --
+            decided from the geometric normal, so every component kind is
+            counted by the one rule of
+            :func:`optiland.nonsequential.ir.interpreter.count_reflections`.
+            A transmission, an absorption and a transmissive detector
+            crossing leave it unchanged. Unlike ``bounce``, which counts
+            every interaction, this is the ghost order a path belongs to; a
+            detector built with ``reflection_bins`` books arriving flux by
+            it (``docs/theory/11_validation_catalogue.md`` 11.4.6, 11.4.21).
     """
 
     x: np.ndarray
@@ -289,6 +333,7 @@ class NSQRayBundle:
     medium_stack: np.ndarray | None = None
     medium_depth: np.ndarray | None = None
     medium_stack_underflows: np.ndarray | None = None
+    reflections: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         if self.k_current is None:
@@ -315,6 +360,10 @@ class NSQRayBundle:
             )
         if self.medium_stack_underflows is None:
             self.medium_stack_underflows = backend_int_full(
+                (self.num_rays,), 0, like=self.n_current, bits=32
+            )
+        if self.reflections is None:
+            self.reflections = backend_int_full(
                 (self.num_rays,), 0, like=self.n_current, bits=32
             )
 
@@ -362,6 +411,7 @@ class NSQRayBundle:
             medium_stack=self.medium_stack[mask],
             medium_depth=self.medium_depth[mask],
             medium_stack_underflows=self.medium_stack_underflows[mask],
+            reflections=self.reflections[mask],
         )
         if self.ray_id is not None:
             kwargs["ray_id"] = self.ray_id[mask]
@@ -406,6 +456,7 @@ class NSQRayBundle:
             medium_stack=self.medium_stack[idx],
             medium_depth=self.medium_depth[idx],
             medium_stack_underflows=self.medium_stack_underflows[idx],
+            reflections=self.reflections[idx],
         )
         if self.ray_id is not None:
             kwargs["ray_id"] = self.ray_id[idx]
@@ -444,7 +495,12 @@ class NSQRayBundle:
         """
         # Every field goes through the same library-neutral row copy: the
         # medium stack is a Tensor whenever the rest of the bundle is, and a
-        # Tensor has no .copy().
+        # Tensor has no .copy(). The index, and any fresh ids, are put on the
+        # bundle's own library and device first, so a host-chosen row list
+        # gathers a device bundle without the rows leaving the device.
+        idx = backend_rows(idx, like=self.x)
+        if ray_id is not None:
+            ray_id = backend_rows(ray_id, like=self.x)
         alive = _rows_copy(self.alive, idx)
         alive[...] = True
         kwargs: dict = dict(
@@ -463,6 +519,7 @@ class NSQRayBundle:
             medium_stack=_rows_copy(self.medium_stack, idx),
             medium_depth=_rows_copy(self.medium_depth, idx),
             medium_stack_underflows=_rows_copy(self.medium_stack_underflows, idx),
+            reflections=_rows_copy(self.reflections, idx),
         )
         if ray_id is not None:
             kwargs["ray_id"] = ray_id
@@ -504,6 +561,7 @@ class NSQRayBundle:
             medium_stack_underflows=_rows_concat(
                 [b.medium_stack_underflows for b in bundles]
             ),
+            reflections=_rows_concat([b.reflections for b in bundles]),
         )
         if all(b.ray_id is not None for b in bundles):
             kwargs["ray_id"] = _rows_concat([b.ray_id for b in bundles])

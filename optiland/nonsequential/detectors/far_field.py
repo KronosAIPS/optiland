@@ -52,6 +52,7 @@ class FarFieldDetector(BaseDetector):
         name: str = "",
         absorb: bool = True,
         side: str = "both",
+        reflection_bins: int = 0,
     ) -> None:
         """Initialize FarFieldDetector.
 
@@ -66,9 +67,19 @@ class FarFieldDetector(BaseDetector):
             side: Which side of the plane is live -- ``"both"`` (default),
                 ``"front"``, or ``"back"``. See
                 :meth:`BaseDetector.intersect`.
+            reflection_bins: Also book the arriving flux by reflection count
+                (0, the default, keeps no histogram). See
+                :meth:`BaseDetector.record_reflections`.
         """
         geometry = FinitePlaneGeometry(aperture_radius=aperture_radius)
-        super().__init__(cs, geometry, name=name, absorb=absorb, side=side)
+        super().__init__(
+            cs,
+            geometry,
+            name=name,
+            absorb=absorb,
+            side=side,
+            reflection_bins=reflection_bins,
+        )
         self.num_bins_theta = int(num_bins_theta)
         self.num_bins_phi = int(num_bins_phi)
 
@@ -202,4 +213,5 @@ class FarFieldDetector(BaseDetector):
         self._intensity = _new_flat_accumulator(self.num_bins_theta * self.num_bins_phi)
         self._num_rays_hit = 0
         self._total_flux = Tally()
+        self.reset_reflection_tally()
         self.invalidate_frame()

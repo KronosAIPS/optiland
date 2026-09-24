@@ -17,7 +17,10 @@ to running it on torch tensors on a device:
   reducing a per-ray mask to a Python bool is a synchronisation, so the
   loop skips nothing and takes a bounded trip count, asking whether any ray
   is still alive at most once every ``alive_check_every`` bounces.
-- **capability**: bounded splitting grows the bundle and is refused.
+- **capability**: bounded splitting grows the bundle. It is refused by
+  default, and in gradient mode always; ``TorchBackend(allow_splitting=True)``
+  runs it in forward-only mode, at the cost of reading the split rows back
+  to the host at every bounce that splits.
 
 Memory scaling: O(num_rays x max_depth) activations when gradient_mode is
 "autograd". The recommended envelope is ~1e5 rays at depth 16 on a single
@@ -111,6 +114,16 @@ class TorchBackend(ArrayBackend):
             width. ``None`` (the default) follows ``alive_check_every``, so
             the two share their one read. Set it explicitly only to measure
             one without the other.
+        supports_splitting: Whether this backend honours
+            ``SamplingPolicy.split_depth``. False unless the backend was
+            built with ``allow_splitting=True``, and even then only in
+            forward-only mode (:meth:`_splitting_enabled`). Off by default
+            for the reason the loop avoids every other host read: the rows
+            to split are chosen on the host, so a bounce that splits reads
+            its hit masks back from the device. The exhaustive split is the
+            estimator a deterministic ghost series needs (every order to
+            floating point, ``docs/theory/03_monte_carlo.md`` 3.6), so a
+            device run that needs it can ask for it.
     """
 
     host_reads_free = False
@@ -123,6 +136,7 @@ class TorchBackend(ArrayBackend):
         gradient_mode: Literal["autograd"] = "autograd",
         alive_check_every: int | None = None,
         compact_every: int | None = None,
+        allow_splitting: bool = False,
     ) -> None:
         """Initialize TorchBackend.
 
@@ -135,9 +149,14 @@ class TorchBackend(ArrayBackend):
             compact_every: Override the compaction period, which otherwise
                 follows ``alive_check_every``. 0 disables compaction, which
                 is what gradient mode does for itself.
+            allow_splitting: Honour ``SamplingPolicy.split_depth`` in
+                forward-only mode (default False: warn and fall back to the
+                single-branch draw, as before). In gradient mode splitting
+                is refused whatever this says.
         """
         self.seed = seed
         self.gradient_mode = gradient_mode
+        self.supports_splitting = bool(allow_splitting)
         # Detached sampling uses a keyed RNG (sampling decisions are detached)
         self.rng = NSQRng(seed)
         if alive_check_every is not None:
@@ -207,18 +226,49 @@ class TorchBackend(ArrayBackend):
         perm = backend_live_permutation(rays.alive, n_live)
         return rays.take(perm[:width])
 
+    def _splitting_enabled(self) -> bool:
+        """Split only when asked to, and only in forward-only mode.
+
+        Gradient mode keeps the bundle at one fixed width for the whole
+        trace, so the autograd graph is a single chain of fixed-shape
+        operations -- the same reason compaction is off there.
+
+        Returns:
+            True when ``allow_splitting`` was given and the backend's
+            gradient mode is off.
+        """
+        if not self.supports_splitting:
+            return False
+        try:
+            grad_on = bool(be.grad_mode.requires_grad)
+        except Exception:  # noqa: BLE001 - a backend with no grad mode cannot be in it
+            grad_on = False
+        return not grad_on
+
     def _check_sampling_support(self, ir) -> None:
-        """Refuse bounded splitting, loudly.
+        """Refuse bounded splitting loudly where it is not honoured.
 
         Bounded splitting grows the live ray bundle, which conflicts with
-        the fixed tensor shapes this backend's autograd graph requires.
-        Never silently ignored -- warn and fall back to importance-biased
-        single-branch sampling, which this backend always uses regardless of
-        ``split_depth``.
+        the fixed tensor shapes this backend's autograd graph requires, and
+        on a device costs a host read per splitting bounce. Unless the
+        backend was built with ``allow_splitting=True`` and the trace is
+        forward-only, a non-zero ``split_depth`` is never silently ignored:
+        warn and fall back to importance-biased single-branch sampling.
 
         Args:
             ir: The scene's lowered IR.
         """
+        if ir.sampling.split_depth > 0 and self.supports_splitting:
+            if not self._splitting_enabled():
+                warnings.warn(
+                    f"TorchBackend does not split in gradient mode "
+                    f"(sampling_policy.split_depth={ir.sampling.split_depth}); "
+                    "fixed tensor shapes are required for the autograd graph. "
+                    "Falling back to importance-biased single-branch sampling "
+                    "(split_depth is ignored for this trace).",
+                    stacklevel=2,
+                )
+            return
         if ir.sampling.split_depth > 0:
             warnings.warn(
                 f"TorchBackend does not support bounded splitting "
@@ -313,6 +363,8 @@ class TorchBackend(ArrayBackend):
         rays.medium_stack_underflows = _to_int(
             rays.medium_stack_underflows, _torch.int32
         )
+        # The reflection count is ray state too, beside the bounce count.
+        rays.reflections = _to_int(rays.reflections, _torch.int32)
         return rays
 
     def _to_numpy(self, arr: object) -> np.ndarray:

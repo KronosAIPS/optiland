@@ -27,6 +27,10 @@ class IrradianceDetectorConfig:
             a ray crossing from either side is recorded), 'front' (only
             rays arriving on the side the placement's normal points
             toward), or 'back'.
+        reflection_bins: Also book the arriving flux by the rays'
+            reflection count: this many exact bins (0 .. K-1) and one
+            overflow bin, read with ``SimulationResult
+            .reflection_histograms[name]``. 0 (default) keeps none.
     """
 
     width: float
@@ -37,6 +41,7 @@ class IrradianceDetectorConfig:
     splat_sigma: float = 0.5
     absorb: bool = True
     side: Literal["both", "front", "back"] = "both"
+    reflection_bins: int = 0
 
 
 @dataclass
@@ -85,12 +90,15 @@ class FarFieldDetectorConfig:
         absorb: Whether a hit terminates the ray.
         side: Which side of the detector plane is live: 'both' (default),
             'front', or 'back'. See ``IrradianceDetectorConfig.side``.
+        reflection_bins: Book the arriving flux by reflection count. See
+            ``IrradianceDetectorConfig.reflection_bins``.
     """
 
     num_theta: int = 90
     num_phi: int = 360
     absorb: bool = True
     side: Literal["both", "front", "back"] = "both"
+    reflection_bins: int = 0
 
 
 @dataclass
@@ -107,12 +115,15 @@ class HemisphereDetectorConfig:
         num_theta: Number of polar bins over 0-90 degrees.
         num_phi: Number of azimuthal bins.
         absorb: Whether a hit terminates the ray.
+        reflection_bins: Book the arriving flux by reflection count. See
+            ``IrradianceDetectorConfig.reflection_bins``.
     """
 
     radius: float
     num_theta: int = 18
     num_phi: int = 36
     absorb: bool = True
+    reflection_bins: int = 0
 
 
 @dataclass
