@@ -311,7 +311,8 @@ class TestCriticalAngleFloat32:
         budget of docs/theory/08_precision.md section 8.2(d): the relative error
         of sqrt(w) is dw / (2 w), and T is proportional to cos(theta_t) here to
         first order. dw is allowed 16 u32 -- the formula's own (3 + r^2) u = 5.3 u
-        plus three ulps of cos(theta_i) at 3.5 u each. Measured: 7.3e-5."""
+        plus three ulps of cos(theta_i) at 3.5 u each. Measured: 7.1e-5 against a
+        budget of 1.2e-2."""
         t64 = _per_ray_transmittance(self.THETA, "float64")
         t32 = _per_ray_transmittance(self.THETA, "float32")
         expected = _fresnel_t(self.THETA, N_GLASS, 1.0)
@@ -323,7 +324,7 @@ class TestCriticalAngleFloat32:
         assert abs(t32[0] - t64[0]) / t64[0] < budget
 
     def test_per_ray_transmittance_control(self, old_clamp):
-        """Control: with the clamp back, float32 T is 3.3 times float64's."""
+        """Control: with the clamp back, float32 T is 3.5 times float64's (measured 3.477)."""
         t64 = _per_ray_transmittance(self.THETA, "float64")
         t32 = _per_ray_transmittance(self.THETA, "float32")
         assert t32[0] / t64[0] > 3.0

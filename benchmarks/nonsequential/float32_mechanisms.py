@@ -29,8 +29,8 @@ be read.
 
 Usage::
 
-    python -m benchmarks.nonsequential.float32_mechanisms            # both cases
-    python -m benchmarks.nonsequential.float32_mechanisms --case critical --rays 20000
+    python -m benchmarks.nonsequential.float32_mechanisms  # both cases
+    python -m benchmarks.nonsequential.float32_mechanisms --case critical
     python -m benchmarks.nonsequential.float32_mechanisms --json out.json
 
 Not part of the pytest suite; the tests that pin the mechanisms are in
@@ -66,6 +66,9 @@ from optiland.nonsequential import (
 from optiland.nonsequential.backends import array_backend as _ab
 from optiland.nonsequential.components import refractive as _refractive
 from optiland.nonsequential.components.base import coordinate_magnitude
+from optiland.nonsequential.components.geometry.analytic.plane import (
+    PlaneGeometry,
+)
 
 #: Catalogue index of N-BK7 at the d-line, pinned exactly as the catalogue does.
 NBK7_N = 1.5168
@@ -73,11 +76,13 @@ NBK7_N = 1.5168
 LAMBDA_UM = 0.5876
 #: The pencil the catalogue runner uses [mm].
 APERTURE_MM = 0.02
-#: The interface's and the detector's positions along z [mm], as the runner has them.
+#: The interface's and the detector's positions along z [mm], as in the runner.
 Z_INTERFACE = 10.0
 Z_DETECTOR = 10.001
 
 CRITICAL_DEG = math.degrees(math.asin(1.0 / NBK7_N))
+
+_NAN = float("nan")
 
 
 def configure(backend: str, precision: str) -> None:
@@ -88,7 +93,9 @@ def configure(backend: str, precision: str) -> None:
     be.set_precision(precision)
 
 
-def build_scene(case: str, theta_deg: float, z_detector: float = Z_DETECTOR) -> NSQScene:
+def build_scene(
+    case: str, theta_deg: float, z_detector: float = Z_DETECTOR
+) -> NSQScene:
     """The catalogue runner's scene for one angle.
 
     Args:
@@ -115,7 +122,7 @@ def build_scene(case: str, theta_deg: float, z_detector: float = Z_DETECTOR) -> 
         "IF",
         RefractiveComponent(
             CoordinateSystem(z=Z_INTERFACE, rx=rx),
-            _plane(),
+            PlaneGeometry(),
             material_front=front,
             material_back=back,
         ),
@@ -128,14 +135,6 @@ def build_scene(case: str, theta_deg: float, z_detector: float = Z_DETECTOR) -> 
         ),
     )
     return scene
-
-
-def _plane():
-    from optiland.nonsequential.components.geometry.analytic.plane import (  # noqa: PLC0415
-        PlaneGeometry,
-    )
-
-    return PlaneGeometry()
 
 
 def _np(x: Any) -> np.ndarray:
@@ -155,16 +154,15 @@ def clamped_refraction_cosine(sin2_t):
     a test can put the old rule back as a control.
     """
     tir = sin2_t > 1.0
+    floor = _tol.radicand_floor(be.ones_like(sin2_t))
     cos_t = be.where(
-        tir,
-        be.zeros_like(sin2_t),
-        be.maximum(1.0 - sin2_t, _tol.radicand_floor(be.ones_like(sin2_t))) ** 0.5,
+        tir, be.zeros_like(sin2_t), be.maximum(1.0 - sin2_t, floor) ** 0.5
     )
     return tir, cos_t
 
 
 def _refraction_cosine(sin2_t):
-    """Whichever rule the engine in use applies (the module attribute, so a patch is seen)."""
+    """Whichever rule the engine applies (looked up per call, so a patch is seen)."""
     rule = getattr(_refractive, "refraction_cosine", clamped_refraction_cosine)
     return rule(sin2_t)
 
@@ -217,9 +215,19 @@ def fresnel_replica(dirs, normals, n_geom, n_front, n_back):
 class Record:
     """Everything the instrumented trace saw, as float64/int NumPy arrays."""
 
-    interactions: list[dict[str, np.ndarray]] = field(default_factory=list)
-    components: list[dict[str, np.ndarray]] = field(default_factory=list)
-    detectors: list[dict[str, np.ndarray]] = field(default_factory=list)
+    interactions: list[dict[str, Any]] = field(default_factory=list)
+    components: list[dict[str, Any]] = field(default_factory=list)
+    detectors: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _pass_record(rays, t, idx) -> dict[str, np.ndarray]:
+    return {
+        "ray_id": _np(rays.ray_id),
+        "bounce": _np(rays.bounce),
+        "alive": _np(rays.alive).astype(bool),
+        "t": _f64(t),
+        "idx": _np(idx),
+    }
 
 
 @contextlib.contextmanager
@@ -229,20 +237,19 @@ def instrument(record: Record):
     orig_scene = _ab.ArrayBackend.intersect_scene
     orig_det = _ab.intersect_detectors
 
-    def interact(self, rays, t, normals, hit_mask, rng, bsdf_ir, n_geom, sampling=None, forced_branch=None):
+    def interact(self, rays, t, normals, hit_mask, rng, bsdf_ir, n_geom, **kw):
         ids = _np(rays.ray_id)
         bounce = _np(rays.bounce)
         dirs = be.stack([rays.L, rays.M, rays.N], axis=1)
         wl = rays.wavelength
-        orig_interact(self, rays, t, normals, hit_mask, rng, bsdf_ir, n_geom, sampling, forced_branch)
-        rep = fresnel_replica(dirs, normals, n_geom, self.material_front.n(wl), self.material_back.n(wl))
-        out = be.stack([rays.L, rays.M, rays.N], axis=1)
+        orig_interact(self, rays, t, normals, hit_mask, rng, bsdf_ir, n_geom, **kw)
+        n_front = self.material_front.n(wl)
+        n_back = self.material_back.n(wl)
+        rep = fresnel_replica(dirs, normals, n_geom, n_front, n_back)
+        out_np = _np(be.stack([rays.L, rays.M, rays.N], axis=1))
         hm = _np(hit_mask).astype(bool)
-        out_np = _np(out)
-        refl_np = _np(rep["reflected"])
-        refr_np = _np(rep["refracted"])
-        is_refl = np.all(out_np == refl_np, axis=1)
-        is_refr = np.all(out_np == refr_np, axis=1)
+        is_refl = np.all(out_np == _np(rep["reflected"]), axis=1)
+        is_refr = np.all(out_np == _np(rep["refracted"]), axis=1)
         pos = np.stack([_np(rays.x), _np(rays.y), _np(rays.z)], axis=1)
         entry = {
             "ray_id": ids[hm],
@@ -265,18 +272,12 @@ def instrument(record: Record):
 
     def intersect_scene(self, rays, surfaces):
         res = orig_scene(self, rays, surfaces)
-        record.components.append(
-            {"ray_id": _np(rays.ray_id), "bounce": _np(rays.bounce), "alive": _np(rays.alive).astype(bool),
-             "t": _f64(res[0]), "idx": _np(res[2])}
-        )
+        record.components.append(_pass_record(rays, res[0], res[2]))
         return res
 
     def intersect_detectors(rays, detectors):
         res = orig_det(rays, detectors)
-        record.detectors.append(
-            {"ray_id": _np(rays.ray_id), "bounce": _np(rays.bounce), "alive": _np(rays.alive).astype(bool),
-             "t": _f64(res[0]), "idx": _np(res[1])}
-        )
+        record.detectors.append(_pass_record(rays, res[0], res[1]))
         return res
 
     RefractiveComponent.interact = interact
@@ -290,8 +291,15 @@ def instrument(record: Record):
         _ab.intersect_detectors = orig_det
 
 
-def trace(case: str, theta_deg: float, backend: str, precision: str, rays: int, seed: int,
-          z_detector: float = Z_DETECTOR) -> tuple[Record, Any]:
+def trace(
+    case: str,
+    theta_deg: float,
+    backend: str,
+    precision: str,
+    rays: int,
+    seed: int,
+    z_detector: float = Z_DETECTOR,
+) -> tuple[Record, Any]:
     """One instrumented trace of the catalogue scene."""
     configure(backend, precision)
     scene = build_scene(case, theta_deg, z_detector)
@@ -302,7 +310,7 @@ def trace(case: str, theta_deg: float, backend: str, precision: str, rays: int, 
 
 
 def _concat(entries: list[dict[str, Any]], keep) -> dict[str, Any]:
-    """Concatenate per-call records (one per batch) after masking each with ``keep``."""
+    """Concatenate per-call records (one per batch), each masked with ``keep``."""
     out: dict[str, Any] = {}
     for e in entries:
         m = keep(e)
@@ -311,110 +319,156 @@ def _concat(entries: list[dict[str, Any]], keep) -> dict[str, Any]:
                 out.setdefault(k, []).append(v[m])
             else:
                 out[k] = v
-    return {k: (np.concatenate(v) if isinstance(v, list) else v) for k, v in out.items()}
+    return {
+        k: (np.concatenate(v) if isinstance(v, list) else v) for k, v in out.items()
+    }
+
+
+def _sorted_by_id(ev: dict[str, Any]) -> dict[str, Any]:
+    order = np.argsort(ev["ray_id"])
+    return {k: (v[order] if isinstance(v, np.ndarray) else v) for k, v in ev.items()}
 
 
 def _events(record: Record, bounce: int) -> dict[str, Any]:
     """Every interface interaction at the given bounce, sorted by ray id."""
     ev = _concat(record.interactions, lambda e: e["bounce"] == bounce)
-    if not ev:
-        return {}
-    order = np.argsort(ev["ray_id"])
-    return {k: (v[order] if isinstance(v, np.ndarray) else v) for k, v in ev.items()}
+    return _sorted_by_id(ev) if ev else {}
 
 
 def _next_hits(record: Record, bounce: int) -> dict[str, np.ndarray]:
-    """The intersection distances of the pass whose live rays have ``bounce`` hits, per ray id."""
-    comp = _concat(record.components, lambda e: e["alive"] & (e["bounce"] == bounce))
-    det = _concat(record.detectors, lambda e: e["alive"] & (e["bounce"] == bounce))
+    """Intersection distances of the pass whose live rays have ``bounce`` hits."""
+
+    def live(e):
+        return e["alive"] & (e["bounce"] == bounce)
+
+    comp = _concat(record.components, live)
+    det = _concat(record.detectors, live)
     if not comp or comp["ray_id"].size == 0:
         return {}
-    oc = np.argsort(comp["ray_id"])
-    od = np.argsort(det["ray_id"])
-    if not np.array_equal(comp["ray_id"][oc], det["ray_id"][od]):
+    comp, det = _sorted_by_id(comp), _sorted_by_id(det)
+    if not np.array_equal(comp["ray_id"], det["ray_id"]):
         raise RuntimeError("component and detector passes saw different rays")
-    return {"ray_id": comp["ray_id"][oc], "t_comp": comp["t"][oc], "t_det": det["t"][od]}
+    return {"ray_id": comp["ray_id"], "t_comp": comp["t"], "t_det": det["t"]}
 
 
-def summarise(case: str, theta_deg: float, rays: int, seed: int, sample: int = 6,
-              z_detector: float = Z_DETECTOR) -> dict[str, Any]:
-    """The same rays at float64 (numpy and torch) and float32 (torch), side by side."""
-    legs = {}
-    for backend, precision in (("numpy", "float64"), ("torch", "float64"), ("torch", "float32")):
-        record, result = trace(case, theta_deg, backend, precision, rays, seed, z_detector)
-        ev = _events(record, 0)
-        nxt = _next_hits(record, 1)
-        legs[f"{backend}/{precision}"] = (record, result, ev, nxt)
+def _mean(mask: np.ndarray) -> float:
+    return float(mask.mean()) if mask.size else _NAN
 
-    out: dict[str, Any] = {"case": case, "theta_deg": theta_deg, "rays": rays, "seed": seed,
-                           "z_detector": z_detector, "legs": {}}
-    for name, (record, result, ev, nxt) in legs.items():
-        n_hit = ev["ray_id"].size
-        detected = float(result.total_flux_detected / result.total_flux_in)
-        leg = {
-            "detected_fraction": detected,
-            "hit_rays": int(n_hit),
-            "replica_matches": float(ev["replica_ok"].mean()) if n_hit else float("nan"),
-            "transmitted_fraction": float(ev["transmitted"].mean()) if n_hit else float("nan"),
-            "tir_fraction": float(ev["tir"].mean()) if n_hit else float("nan"),
-            "mean_R": float(ev["R"].mean()) if n_hit else float("nan"),
-            "w_min": float(ev["w"].min()), "w_max": float(ev["w"].max()),
-            "cos_t_min": float(ev["cos_t"].min()), "cos_t_max": float(ev["cos_t"].max()),
-            "dtype": ev["dtype"],
-        }
-        if nxt:
-            tr_ids = ev["ray_id"][ev["transmitted"]]
-            sel = np.isin(nxt["ray_id"], tr_ids)
-            t_det = nxt["t_det"][sel]
-            t_comp = nxt["t_comp"][sel]
-            leg["transmitted_seen_by_detector"] = float(np.isfinite(t_det).mean()) if sel.any() else float("nan")
-            leg["transmitted_rehit_interface"] = float(np.isfinite(t_comp).mean()) if sel.any() else float("nan")
-            rf_sel = np.isin(nxt["ray_id"], ev["ray_id"][ev["reflected"]])
-            leg["reflected_rehit_interface"] = (
-                float(np.isfinite(nxt["t_comp"][rf_sel]).mean()) if rf_sel.any() else float("nan")
-            )
-        out["legs"][name] = leg
-    # Per-ray table: the first `sample` rays by id, float64 and float32 side by side.
-    ev64 = legs["torch/float64"][2]
-    ev32 = legs["torch/float32"][2]
-    common = np.intersect1d(ev64["ray_id"], ev32["ray_id"])[:sample]
+
+def _leg_summary(result, ev, nxt) -> dict[str, Any]:
+    """One leg's counts: branch fractions, Fresnel values, next-pass hits."""
+    leg: dict[str, Any] = {
+        "detected_fraction": float(result.total_flux_detected / result.total_flux_in),
+        "hit_rays": int(ev["ray_id"].size),
+        "replica_matches": _mean(ev["replica_ok"]),
+        "transmitted_fraction": _mean(ev["transmitted"]),
+        "tir_fraction": _mean(ev["tir"]),
+        "mean_R": float(ev["R"].mean()),
+        "w_min": float(ev["w"].min()),
+        "w_max": float(ev["w"].max()),
+        "cos_t_min": float(ev["cos_t"].min()),
+        "cos_t_max": float(ev["cos_t"].max()),
+        "dtype": ev["dtype"],
+    }
+    if nxt:
+        tr = np.isin(nxt["ray_id"], ev["ray_id"][ev["transmitted"]])
+        rf = np.isin(nxt["ray_id"], ev["ray_id"][ev["reflected"]])
+        leg["transmitted_seen_by_detector"] = _mean(np.isfinite(nxt["t_det"][tr]))
+        leg["transmitted_rehit_interface"] = _mean(np.isfinite(nxt["t_comp"][tr]))
+        leg["reflected_rehit_interface"] = _mean(np.isfinite(nxt["t_comp"][rf]))
+    return leg
+
+
+def _side_by_side(ev64, ev32, sample: int) -> list[dict[str, Any]]:
+    """The first ``sample`` rays by id, float64 and float32 next to each other."""
     rows = []
-    for rid in common:
+    for rid in np.intersect1d(ev64["ray_id"], ev32["ray_id"])[:sample]:
         a = int(np.searchsorted(ev64["ray_id"], rid))
         b = int(np.searchsorted(ev32["ray_id"], rid))
-        rows.append({
-            "ray_id": int(rid),
-            "dir_in_f64": ev64["dir_in"][a].tolist(), "dir_in_f32": ev32["dir_in"][b].tolist(),
-            "cos_i_f64": float(ev64["cos_i"][a]), "cos_i_f32": float(ev32["cos_i"][b]),
-            "w_f64": float(ev64["w"][a]), "w_f32": float(ev32["w"][b]),
-            "cos_t_f64": float(ev64["cos_t"][a]), "cos_t_f32": float(ev32["cos_t"][b]),
-            "R_f64": float(ev64["R"][a]), "R_f32": float(ev32["R"][b]),
-            "branch_f64": "T" if ev64["transmitted"][a] else "R",
-            "branch_f32": "T" if ev32["transmitted"][b] else "R",
-            "dir_out_f64": ev64["dir_out"][a].tolist(), "dir_out_f32": ev32["dir_out"][b].tolist(),
-        })
-    out["rays_side_by_side"] = rows
-    # The detector gap at the hit, in the working dtype's own step.
-    n = np.array([0.0, -math.sin(math.radians(theta_deg)), math.cos(math.radians(theta_deg))])
-    for name in ("torch/float64", "torch/float32"):
-        ev = legs[name][2]
-        dt = np.float32 if name.endswith("float32") else np.float64
-        tr = ev["transmitted"]
-        if not tr.any():
-            continue
-        p = ev["pos_out"][tr]
-        d = ev["dir_out"][tr]
-        gap = (np.array([0.0, 0.0, z_detector]) - p) @ n  # perpendicular, origin to detector
-        t_det = gap / (d @ n)
-        ulp = np.spacing(np.maximum(ev["mag_out"][tr], 1.0).astype(dt)).astype(np.float64)
-        thr = _tol.DEFAULT_ACCEPT_K * ulp
-        out["legs"][name]["detector_gap_perp_ulps_median"] = float(np.median(gap / ulp))
-        out["legs"][name]["detector_t_over_threshold_median"] = float(np.median(t_det / thr))
-        out["legs"][name]["detector_t_below_threshold_fraction"] = float((t_det <= thr).mean())
+        row: dict[str, Any] = {"ray_id": int(rid)}
+        for key in ("dir_in", "dir_out"):
+            row[f"{key}_f64"] = ev64[key][a].tolist()
+            row[f"{key}_f32"] = ev32[key][b].tolist()
+        for key in ("cos_i", "w", "cos_t", "R"):
+            row[f"{key}_f64"] = float(ev64[key][a])
+            row[f"{key}_f32"] = float(ev32[key][b])
+        row["branch_f64"] = "T" if ev64["transmitted"][a] else "R"
+        row["branch_f32"] = "T" if ev32["transmitted"][b] else "R"
+        rows.append(row)
+    return rows
+
+
+def _detector_gap(ev, theta_deg: float, z_detector: float, dtype) -> dict:
+    """Where the detector sits from a transmitted ray's outgoing origin.
+
+    The perpendicular gap in ulps of the ray's own coordinate, and the path to
+    the detector over the accept threshold (below 1: the detector is not seen).
+    """
+    tr = ev["transmitted"]
+    if not tr.any():
+        return {}
+    rx = math.radians(theta_deg)
+    n = np.array([0.0, -math.sin(rx), math.cos(rx)])
+    p = ev["pos_out"][tr]
+    d = ev["dir_out"][tr]
+    gap = (np.array([0.0, 0.0, z_detector]) - p) @ n
+    t_det = gap / (d @ n)
+    mag = np.maximum(ev["mag_out"][tr], 1.0).astype(dtype)
+    ulp = np.spacing(mag).astype(np.float64)
+    thr = _tol.DEFAULT_ACCEPT_K * ulp
+    return {
+        "detector_gap_perp_ulps_median": float(np.median(gap / ulp)),
+        "detector_t_over_threshold_median": float(np.median(t_det / thr)),
+        "detector_t_below_threshold_fraction": float((t_det <= thr).mean()),
+    }
+
+
+def summarise(
+    case: str,
+    theta_deg: float,
+    rays: int,
+    seed: int,
+    sample: int = 6,
+    z_detector: float = Z_DETECTOR,
+) -> dict[str, Any]:
+    """The same rays at float64 (numpy and torch) and float32 (torch), side by side."""
+    legs = {}
+    plan = (("numpy", "float64"), ("torch", "float64"), ("torch", "float32"))
+    for backend, precision in plan:
+        record, result = trace(
+            case, theta_deg, backend, precision, rays, seed, z_detector
+        )
+        legs[f"{backend}/{precision}"] = (
+            result,
+            _events(record, 0),
+            _next_hits(record, 1),
+        )
+
+    out: dict[str, Any] = {
+        "case": case,
+        "theta_deg": theta_deg,
+        "rays": rays,
+        "seed": seed,
+        "z_detector": z_detector,
+        "legs": {name: _leg_summary(*leg) for name, leg in legs.items()},
+    }
+    ev64 = legs["torch/float64"][1]
+    ev32 = legs["torch/float32"][1]
+    out["rays_side_by_side"] = _side_by_side(ev64, ev32, sample)
+    for name, ev, dtype in (
+        ("torch/float64", ev64, np.float64),
+        ("torch/float32", ev32, np.float32),
+    ):
+        out["legs"][name].update(_detector_gap(ev, theta_deg, z_detector, dtype))
     return out
 
 
+def _fmt(k: str, v: Any) -> str:
+    return f"{k}={v:.6g}" if isinstance(v, float) else f"{k}={v}"
+
+
 def main(argv: list[str] | None = None) -> int:
+    """Run both cases (or one) and print a line per leg."""
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--case", choices=["external", "critical", "both"], default="both")
     ap.add_argument("--rays", type=int, default=20_000)
@@ -433,8 +487,7 @@ def main(argv: list[str] | None = None) -> int:
         results.append(s)
         print(f"\n== {case} {theta:.9f} deg, {args.rays} rays, seed {args.seed}")
         for name, leg in s["legs"].items():
-            print(f"  {name:14s} " + ", ".join(f"{k}={v:.6g}" if isinstance(v, float) else f"{k}={v}"
-                                              for k, v in leg.items()))
+            print(f"  {name:14s} " + ", ".join(_fmt(k, v) for k, v in leg.items()))
     if args.json:
         with open(args.json, "w") as fh:
             json.dump(results, fh, indent=1)
