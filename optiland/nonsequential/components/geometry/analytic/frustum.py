@@ -164,8 +164,22 @@ class CylindricalFrustumGeometry(AnalyticGeometry):
             )
             return (disc >= 0.0) & (t > eps) & in_z
 
-        valid1 = _valid(t1)
-        valid2 = _valid(t2)
+        # t1/t2 come from the masked quadratic formula, which forces
+        # inv2a to 0 (not the true 1/(2a)) whenever a_small: every ray
+        # this affects gets the SAME spurious pair t1 = t2 = 0, regardless
+        # of b or c. That is not a root of the ray-frustum equation -- for
+        # a ray parallel to a constant-radius tube's axis (a = b = 0
+        # exactly), disc = b^2 - 4ac = 0 trivially no matter what c is, so
+        # nothing about t1/t2 or disc distinguishes a ray that misses the
+        # tube (c != 0) from one running along its wall (c == 0): both
+        # produced an accepted hit at t = 0 whenever the origin advance
+        # (BaseComponent.intersect) shifted eps negative and landed the
+        # advanced origin inside the axial window (issue #14). The only
+        # geometrically meaningful root in the a_small regime is the
+        # linear one, t_lin = -c/b, used below when b is not also small;
+        # t1/t2 must never be trusted here.
+        valid1 = _valid(t1) & ~a_small
+        valid2 = _valid(t2) & ~a_small
         valid_lin = _valid(t_lin)
 
         # Pick the smallest valid t

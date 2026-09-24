@@ -83,6 +83,69 @@ class TestLensAndDoubletBuildVolumes:
         assert len({s.name for s in d.surfaces}) == 5
 
 
+class TestDeepMeniscusVolume:
+    """Issue #13, item 1: the closed-volume check's interior point used to
+    be the mean of the rim points, which lies outside a deep meniscus (both
+    faces curving the same way, closely spaced) on the axis -- refusing any
+    semi-diameter above a limit far inside the beam the element actually
+    needs to pass. The fix takes the interior point on the axis between the
+    two vertices instead (inside the glass by construction whenever the
+    centre thickness is positive), falling back to the rim-point mean only
+    when fewer than two conic vertex surfaces bound the volume.
+
+    E2 of the Canon EF 50mm f/1.8 II (patent JP-S62-087922 example 1,
+    ``cases/lenses/canon_ef50_f18_ii.yaml`` in KronosNSRT): r1=21.51,
+    r2=40.31, thickness=4.35 mm, a positive meniscus. Before the fix, the
+    rim-mean interior point failed the ray-parity check above about 10.76 mm
+    of semi-diameter (docs/build/Z2_lens_ghosts.md section 4.1); this lens
+    needs 13.53 mm.
+    """
+
+    def test_deep_meniscus_beyond_the_old_rim_mean_limit_builds(self):
+        lens = Lens(
+            "E2",
+            CoordinateSystem(z=0),
+            LensConfig(
+                r1=21.51,
+                r2=40.31,
+                thickness=4.35,
+                material=_glass(),
+                front_aperture_radius=13.53,
+            ),
+        )
+        assert lens._volume.name == "E2"
+
+    def test_vertex_axis_candidate_used_before_rim_mean(self):
+        """The on-axis vertex-mean candidate -- not the rim-point mean --
+        is what makes the check pass here: a semi-diameter well beyond the
+        rim-mean's old ~10.76 mm limit still builds.
+        """
+        from optiland.nonsequential.components.volume import (
+            _vertex_axis_candidate,
+        )
+
+        lens = Lens(
+            "E2",
+            CoordinateSystem(z=0),
+            LensConfig(
+                r1=21.51,
+                r2=40.31,
+                thickness=4.35,
+                material=_glass(),
+                front_aperture_radius=13.53,
+            ),
+        )
+        vertex_mid = _vertex_axis_candidate(lens._volume.boundary)
+        assert vertex_mid is not None
+        # On-axis, halfway between the front vertex (z=0) and back vertex
+        # (z=4.35): inside the glass by construction, independent of the
+        # rim -- unlike the rim-point mean this replaces as the primary
+        # candidate.
+        import numpy as np  # noqa: PLC0415
+
+        np.testing.assert_allclose(vertex_mid, [0.0, 0.0, 2.175], atol=1e-9)
+
+
 class TestWatertightnessCatchesGaps:
     def test_lens_missing_its_edge_is_not_watertight(self):
         """Front and back faces alone leave an open annular gap between

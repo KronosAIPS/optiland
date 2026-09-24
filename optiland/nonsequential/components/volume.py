@@ -408,6 +408,49 @@ def _count_crossings(
     return count
 
 
+def _vertex_axis_candidate(boundary: list[BaseComponent]) -> np.ndarray | None:
+    """The mean of every boundary surface's own on-axis vertex, in global
+    coordinates -- the fix for issue #14's sibling gap (issue #13, item 1):
+    the rim-point mean used to be the sole interior-point estimate, and for
+    a deep meniscus (front and back both curving the same way, closely
+    spaced) that mean falls outside the glass on the axis, so the volume's
+    own ray-parity check refused any element beyond a semi-diameter far
+    inside the beam the element actually needs to pass.
+
+    A :class:`~optiland.nonsequential.components.geometry.analytic.conic.
+    ConicGeometry` face -- the only "vertex" surface ``Lens``/``Doublet``
+    build -- sits at its own coordinate system's origin by construction (a
+    conic's local vertex is local (0, 0, 0)), so its global vertex position
+    is exactly that surface's own translation: no sag evaluation needed.
+    For the two (or, for a cemented group folded into one volume, more)
+    conic faces bounding one glass volume, the mean of their vertices is a
+    point on the shared optical axis, strictly between the front-most and
+    back-most vertex -- inside the glass by construction whenever the
+    centre thickness between them is positive, regardless of how deep the
+    meniscus is, because it never depends on the rim at all.
+
+    Args:
+        boundary: The volume's boundary surfaces.
+
+    Returns:
+        The mean vertex position, or ``None`` if fewer than two boundary
+        surfaces are conic (nothing on-axis to average -- the caller falls
+        back to its other candidates).
+    """
+    from optiland.nonsequential.components.geometry.analytic.conic import (  # noqa: PLC0415
+        ConicGeometry,
+    )
+
+    vertices = [
+        np.asarray(_get_transform(comp.cs)[0], dtype=float)
+        for comp in boundary
+        if isinstance(comp.geometry, ConicGeometry)
+    ]
+    if len(vertices) < 2:
+        return None
+    return np.mean(vertices, axis=0)
+
+
 def _check_normals_outward(
     boundary: list[BaseComponent],
     centroid: np.ndarray,
@@ -483,12 +526,25 @@ class Volume:
                 f"Volume '{self.name}' has no boundary surfaces."
             )
         rim_points = _check_watertight(self.boundary)
+
+        # Interior-point candidates, tried in order until the ray-parity
+        # check accepts one (issue #13, item 1). The on-axis vertex mean
+        # goes first: unlike the rim-point mean, it is inside the glass by
+        # construction whenever the centre thickness is positive, so it
+        # does not fail for a deep meniscus. The rim-point mean and the
+        # per-surface-origin mean stay as fallbacks for a boundary with
+        # fewer than two conic vertex surfaces (an edge-only union, a
+        # light pipe, a single closed sphere), where they already worked.
+        candidates: list[np.ndarray] = []
+        vertex_mid = _vertex_axis_candidate(self.boundary)
+        if vertex_mid is not None:
+            candidates.append(vertex_mid)
         if rim_points is not None and len(rim_points) > 0:
-            centroid = rim_points.mean(axis=0)
-        else:
-            # No surface exposed a finite rim (e.g. a single closed sphere):
-            # fall back to the mean of each surface's own coordinate origin.
-            centroid = np.mean([_get_transform(c.cs)[0] for c in self.boundary], axis=0)
+            candidates.append(rim_points.mean(axis=0))
+        candidates.append(
+            np.mean([_get_transform(c.cs)[0] for c in self.boundary], axis=0)
+        )
+
         # This check calls component.intersect(), which dispatches through
         # optiland.backend (be.*). The check is purely discrete geometry --
         # never differentiated -- so it always runs on the numpy backend,
@@ -500,7 +556,23 @@ class Volume:
         previous_backend = be.get_backend()
         try:
             be.set_backend("numpy")
-            _check_normals_outward(self.boundary, centroid)
+            last_error: NonWatertightVolumeError | None = None
+            for centroid in candidates:
+                try:
+                    _check_normals_outward(self.boundary, centroid)
+                    break
+                except NonWatertightVolumeError as exc:
+                    last_error = exc
+            else:
+                assert last_error is not None
+                raise NonWatertightVolumeError(
+                    f"Volume '{self.name}' failed the inside/outside "
+                    f"ray-parity check from every one of "
+                    f"{len(candidates)} candidate interior points tried "
+                    f"(the on-axis vertex mean, the rim-point mean, and "
+                    f"the per-surface-origin mean, whichever applied). "
+                    f"Last candidate's error: {last_error}"
+                ) from last_error
         finally:
             be.set_backend(previous_backend)
 
