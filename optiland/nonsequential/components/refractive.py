@@ -332,8 +332,22 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         # TIR, non-zero under importance biasing. The two sum to
         # w(1 - weight), the whole change in flux, so nothing is counted
         # twice and nothing is left over.
-        self.book_loss(rays.flux, 1.0 - R_used - T_used, hit_mask)
-        self.book_residual(rays.flux, R_used + T_used - weight, hit_mask)
+        #
+        # A forced branch is one half of an exhaustive split: this call and
+        # its sibling start from the same incoming weight w and hand on wR
+        # and wT, so together they preserve w(R + T) exactly and the event
+        # residual is zero term by term (docs/theory/10_ledger_and_
+        # diagnostics.md 10.1: an exhaustive split with physical weights has
+        # delta = 0). The split's one loss, w(1 - R - T), is booked once, on
+        # the reflect child; the transmit child books nothing. Booking each
+        # child as if it were a single draw -- what this did before -- put
+        # w into the residual per split, so every split trace reported a
+        # conservation error of order the split count.
+        if forced_branch is None:
+            self.book_loss(rays.flux, 1.0 - R_used - T_used, hit_mask)
+            self.book_residual(rays.flux, R_used + T_used - weight, hit_mask)
+        elif forced_branch == "reflect":
+            self.book_loss(rays.flux, 1.0 - R_used - T_used, hit_mask)
 
         # Apply weight to flux for hit rays
         rays.flux = rays.flux * be.where(hit_mask, weight, be.ones_like(weight))

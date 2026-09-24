@@ -294,6 +294,7 @@ from optiland.nonsequential.results import (
     FarFieldPattern,
     IrradianceMap,
     RayDatabase,
+    ReflectionHistogram,
     SpectralResult,
 )
 
@@ -397,6 +398,7 @@ __all__ = [
     "FarFieldPattern",
     "IrradianceMap",
     "RayDatabase",
+    "ReflectionHistogram",
     "SpectralResult",
     # RNG
     "EventSlot",

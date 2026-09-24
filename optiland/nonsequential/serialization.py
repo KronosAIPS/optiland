@@ -604,6 +604,7 @@ def _serialize_detector(name: str, detector: Any) -> dict:
             "splat_sigma": _to_float(detector.splat_sigma),
             "absorb": bool(detector.absorb),
             "side": detector.side,
+            "reflection_bins": int(detector.reflection_bins),
         }
 
     if isinstance(detector, SpectralDetector):
@@ -636,6 +637,7 @@ def _serialize_detector(name: str, detector: Any) -> dict:
             "num_bins_theta": int(detector.num_bins_theta),
             "num_bins_phi": int(detector.num_bins_phi),
             "absorb": bool(detector.absorb),
+            "reflection_bins": int(detector.reflection_bins),
         }
 
     if isinstance(detector, FarFieldDetector):
@@ -647,6 +649,7 @@ def _serialize_detector(name: str, detector: Any) -> dict:
             "num_bins_phi": int(detector.num_bins_phi),
             "absorb": bool(detector.absorb),
             "side": detector.side,
+            "reflection_bins": int(detector.reflection_bins),
         }
 
     if isinstance(detector, RayDatabaseDetector):
@@ -700,6 +703,7 @@ def _deserialize_detector(d: dict, scene: NSQScene) -> None:
             splat_sigma=d.get("splat_sigma", 0.5),
             absorb=d.get("absorb", True),
             side=d.get("side", "both"),
+            reflection_bins=d.get("reflection_bins", 0),
         )
         scene.add_detector(name, cs, config)
 
@@ -724,6 +728,7 @@ def _deserialize_detector(d: dict, scene: NSQScene) -> None:
             num_phi=d.get("num_bins_phi", 360),
             absorb=d.get("absorb", True),
             side=d.get("side", "both"),
+            reflection_bins=d.get("reflection_bins", 0),
         )
         scene.add_detector(name, cs, config)
 
@@ -733,6 +738,7 @@ def _deserialize_detector(d: dict, scene: NSQScene) -> None:
             num_theta=d.get("num_bins_theta", 18),
             num_phi=d.get("num_bins_phi", 36),
             absorb=d.get("absorb", True),
+            reflection_bins=d.get("reflection_bins", 0),
         )
         scene.add_detector(name, cs, config)
 

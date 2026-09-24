@@ -544,6 +544,7 @@ def _build_detector(cs: CoordinateSystem, config) -> object:
             splat_sigma=config.splat_sigma,
             absorb=config.absorb,
             side=config.side,
+            reflection_bins=config.reflection_bins,
         )
     if isinstance(config, SpectralDetectorConfig):
         wl_bins = be.linspace(config.wl_min, config.wl_max, config.num_bins + 1)
@@ -566,6 +567,7 @@ def _build_detector(cs: CoordinateSystem, config) -> object:
             num_bins_phi=config.num_phi,
             absorb=config.absorb,
             side=config.side,
+            reflection_bins=config.reflection_bins,
         )
     if isinstance(config, HemisphereDetectorConfig):
         return HemisphereDetector(
@@ -574,6 +576,7 @@ def _build_detector(cs: CoordinateSystem, config) -> object:
             num_bins_theta=config.num_theta,
             num_bins_phi=config.num_phi,
             absorb=config.absorb,
+            reflection_bins=config.reflection_bins,
         )
     if isinstance(config, RayDatabaseConfig):
         from optiland.nonsequential.components.geometry.analytic.plane import (  # noqa: PLC0415

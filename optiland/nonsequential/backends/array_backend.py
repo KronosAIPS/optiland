@@ -259,6 +259,16 @@ class ArrayBackend(TracerBackend):
         """
         return
 
+    def _splitting_enabled(self) -> bool:
+        """Whether this trace may split rays (``split_depth > 0`` honoured).
+
+        Returns:
+            :attr:`supports_splitting` by default; a backend that can split
+            only in some modes (the Torch backend: forward-only, and only
+            when asked) narrows it.
+        """
+        return bool(self.supports_splitting)
+
     # ------------------------------------------------------------------
     # Shared per-bounce pieces
     # ------------------------------------------------------------------
@@ -459,7 +469,7 @@ class ArrayBackend(TracerBackend):
             _next_ray_id[0] += n
             return np.arange(start, start + n, dtype=np.int64)
 
-        allocator = _alloc_ray_ids if self.supports_splitting else None
+        allocator = _alloc_ray_ids if self._splitting_enabled() else None
 
         # Main trace loop
         for source_idx, (source, source_num_rays) in enumerate(
@@ -562,6 +572,9 @@ class ArrayBackend(TracerBackend):
                             rays, mask_di, det_name, t_offset=det_t_safe
                         )
                         det.record(rays, det_t_safe, mask_di)
+                        # Arriving flux by ghost order; a no-op unless the
+                        # detector was built with reflection_bins.
+                        det.record_reflections(rays, mask_di)
 
                     # Advance detector-hit rays. Absorbing detectors
                     # terminate the ray; absorb=False detectors are
@@ -699,6 +712,31 @@ class ArrayBackend(TracerBackend):
                     # Spawned rays start fresh at the next iteration's
                     # intersect_scene call, same as any other live ray.
                     if spawned is not None and spawned.num_rays > 0:
+                        # The depth cap binds a spawned child exactly as it
+                        # binds its sibling, which kept the parent's row and
+                        # met the check above: a child that has just made its
+                        # max_depth-th interaction is truncated here, not
+                        # merged. Without this a transmit child ran one
+                        # interaction past the cap on a host backend (whose
+                        # loop continues while any ray is alive) and was
+                        # dropped unbooked on a device backend (whose loop
+                        # stops after max_depth trips), so the two
+                        # backends truncated a split tree differently and
+                        # the device ledger did not close.
+                        # Splitting already chose its rows on the host, so
+                        # reading this mask back costs nothing new.
+                        over_depth = spawned.bounce >= max_depth
+                        over_np = np.asarray(be.to_numpy(over_depth), dtype=bool)
+                        if over_np.any():
+                            num_rays_depth_killed.add_count(over_depth)
+                            total_flux_depth_killed.add_masked_sum(
+                                spawned.flux, over_depth
+                            )
+                            path_recorder.log_deaths(
+                                spawned, over_depth, "depth_killed"
+                            )
+                            spawned = spawned.select(np.where(~over_np)[0])
+                    if spawned is not None and spawned.num_rays > 0:
                         budget = int(ir.sampling.split_budget * batch_size)
                         headroom = max(0, budget - rays.num_rays_alive)
                         if spawned.num_rays > headroom:
@@ -765,6 +803,7 @@ class ArrayBackend(TracerBackend):
         # reported as it always was, and reported separately, so the
         # identity can leave it out.
         detector_results: dict[str, object] = {}
+        reflection_histograms: dict[str, object] = {}
         total_flux_detected = 0.0
         total_flux_tapped = 0.0
         det_names = get_detector_names(scene)
@@ -772,6 +811,9 @@ class ArrayBackend(TracerBackend):
             name = det_names[i] if i < len(det_names) else (det.name or f"detector_{i}")
             result = det.get_result()
             detector_results[name] = result
+            histogram = det.reflection_histogram()
+            if histogram is not None:
+                reflection_histograms[name] = histogram
             if hasattr(result, "total_flux"):
                 # IrradianceMap.total_flux may be an attached backend array;
                 # SimulationResult's aggregate stays a plain float.
@@ -854,6 +896,7 @@ class ArrayBackend(TracerBackend):
             trace_time_sec=t_end - t_start,
             ray_paths=ray_paths,
             diagnostics=diagnostics,
+            reflection_histograms=reflection_histograms,
         )
 
     def _continue_bounce(

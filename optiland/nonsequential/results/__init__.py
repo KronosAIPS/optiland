@@ -5,11 +5,13 @@ from __future__ import annotations
 from .far_field_pattern import FarFieldPattern
 from .irradiance_map import IrradianceMap
 from .ray_database import RayDatabase
+from .reflection_histogram import ReflectionHistogram
 from .spectral_result import SpectralResult
 
 __all__ = [
     "FarFieldPattern",
     "IrradianceMap",
     "RayDatabase",
+    "ReflectionHistogram",
     "SpectralResult",
 ]

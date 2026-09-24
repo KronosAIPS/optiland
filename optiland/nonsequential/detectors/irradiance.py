@@ -64,6 +64,7 @@ class IrradianceDetector(BaseDetector):
         name: str = "",
         absorb: bool = True,
         side: str = "both",
+        reflection_bins: int = 0,
     ) -> None:
         """Initialize IrradianceDetector.
 
@@ -85,9 +86,20 @@ class IrradianceDetector(BaseDetector):
                 ``"front"`` (only rays arriving on the side the placement's
                 normal, local +z, points toward), or ``"back"``. See
                 :meth:`BaseDetector.intersect`.
+            reflection_bins: Also book the arriving flux by the rays'
+                reflection count, in this many exact bins and one overflow
+                bin (0, the default, keeps no histogram). See
+                :meth:`BaseDetector.record_reflections`.
         """
         geometry = FinitePlaneGeometry(width=width, height=height)
-        super().__init__(cs, geometry, name=name, absorb=absorb, side=side)
+        super().__init__(
+            cs,
+            geometry,
+            name=name,
+            absorb=absorb,
+            side=side,
+            reflection_bins=reflection_bins,
+        )
         self.width = as_param(width)
         self.height = as_param(height)
         self.num_pixels_x = int(num_pixels_x)
@@ -359,4 +371,5 @@ class IrradianceDetector(BaseDetector):
         """
         self._data = _new_flat_accumulator(self.num_pixels_y * self.num_pixels_x)
         self._num_rays_hit = 0
+        self.reset_reflection_tally()
         self.invalidate_frame()

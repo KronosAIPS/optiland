@@ -473,6 +473,9 @@ def _lower_detector(idx: int, detector: object) -> SensorIR:
             f"No scene-IR lowering registered for detector type "
             f"{type(detector).__name__}."
         )
+    # A base-detector option, so every sensor kind carries it: the number of
+    # exact reflection-count bins its flux is also booked by (0 = none).
+    params["reflection_bins"] = int(getattr(detector, "reflection_bins", 0))
 
     return SensorIR(
         id=idx,
