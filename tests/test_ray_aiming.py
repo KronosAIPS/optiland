@@ -371,10 +371,11 @@ def test_epl_is_zero_when_stop_is_surface_1_with_shifted_optic(set_test_backend)
 @pytest.mark.parametrize("dz", [25.0, -15.0])
 def test_epd_invariant_under_translation(set_test_backend, build, dz):
     """``EPD()`` is a length, unchanged by rigid translation."""
-    epd_ref = float(build().paraxial.EPD())
+    # EPD may be a scalar or a size-one backend array.
+    epd_ref = be.to_numpy(build().paraxial.EPD()).item()
     shifted = build()
     _shift_optic(shifted, dz)
-    assert_allclose(float(shifted.paraxial.EPD()), epd_ref)
+    assert_allclose(be.to_numpy(shifted.paraxial.EPD()).item(), epd_ref)
 
 
 @pytest.mark.parametrize(
@@ -462,10 +463,11 @@ def test_float_by_stop_epd_invariant_under_translation(set_test_backend, dz):
     systems. After the fix the computed EPD must match the reference and stay
     positive."""
     optic_ref = _issue_613_reproducer()
-    epd_ref = float(optic_ref.aperture.compute_epd(optic_ref.paraxial))
+    # Extract exactly one element without NumPy's deprecated array-to-float cast.
+    epd_ref = be.to_numpy(optic_ref.aperture.compute_epd(optic_ref.paraxial)).item()
     shifted = _issue_613_reproducer()
     _shift_optic(shifted, dz)
-    epd_shifted = float(shifted.aperture.compute_epd(shifted.paraxial))
+    epd_shifted = be.to_numpy(shifted.aperture.compute_epd(shifted.paraxial)).item()
     assert_allclose(epd_shifted, epd_ref)
     assert epd_shifted > 0
 

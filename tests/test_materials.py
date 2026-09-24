@@ -20,6 +20,9 @@ from .utils import assert_allclose
 class TestBaseMaterial:
     def test_caching(self, set_test_backend):
         class DummyMaterial(BaseMaterial):
+            def _cache_state(self):
+                return ()
+
             def _calculate_n(self, wavelength, **kwargs):
                 pass
 
@@ -67,11 +70,11 @@ class TestBaseMaterial:
         assert BaseMaterial._detach_if_tensor(1.5) == 1.5
         assert BaseMaterial._detach_if_tensor(None) is None
 
-    def test_large_array_cache_key_runtime_is_sublinear(self, set_test_backend):
-        """Regression guard for O(N) array cache-key construction.
+    def test_large_array_cache_key_avoids_python_scalar_overhead(self, set_test_backend):
+        """Bound Python overhead for large-array content checks.
 
-        Large wavelength arrays should use metadata-based keys rather than
-        materializing every array element into a Python tuple.
+        Mutable arrays require O(N) inspection on every lookup. A digest should
+        still cost much less than constructing a tuple of 200,000 Python scalars.
         """
 
         class DummyMaterial(BaseMaterial):
@@ -104,7 +107,7 @@ class TestBaseMaterial:
 
         ratio = large_avg_s / max(small_avg_s, 1e-9)
         assert ratio < 40.0, (
-            "Large-array cache-key generation appears to scale linearly with array size "
+            "Large-array content checks incur excessive per-element overhead "
             f"(ratio={ratio:.2f}, small_avg={small_avg_s:.3e}s, large_avg={large_avg_s:.3e}s)"
         )
 
@@ -167,14 +170,15 @@ class TestBaseMaterial:
 
         assert material._create_cache_key(a) != material._create_cache_key(b)
 
-    def test_large_array_digest_cache_evicts_dead_arrays(self, set_test_backend):
-        """#630: the per-array digest memo is weak -- entries are dropped when
-        the array is collected, so id() reuse cannot surface a stale digest and
-        the memo cannot grow without bound.
-        """
-        from optiland.materials.base import _ARRAY_DIGEST_CACHE
+    def test_large_array_cache_does_not_reuse_dead_array_content(self, set_test_backend):
+        """#630: recycled array addresses must never return an old optical value.
 
+        Content is re-inspected; no per-array identity memo is retained.
+        """
         class DummyMaterial(BaseMaterial):
+            def _cache_state(self):
+                return ()
+
             def _calculate_n(self, wavelength, **kwargs):
                 return float(np.asarray(wavelength)[1])
 
@@ -185,7 +189,6 @@ class TestBaseMaterial:
         n = 2_000
 
         gc.collect()
-        baseline = len(_ARRAY_DIGEST_CACHE)
         for i in range(50):
             arr = np.zeros(n, dtype=np.float64)
             # content (and so the expected n) differs each round; the +1 keeps
@@ -196,7 +199,7 @@ class TestBaseMaterial:
             gc.collect()  # free the buffer so the next array may reuse its address
 
         gc.collect()
-        assert len(_ARRAY_DIGEST_CACHE) <= baseline + 2
+        assert len(material._n_cache) == 50
 
     def test_large_array_key_handles_non_weakref_sequence(self, set_test_backend):
         """list/tuple wavelengths are content-addressed too, but cannot be
@@ -250,6 +253,9 @@ class TestUniformWavelengthFastPath:
     @staticmethod
     def _dispersive_dummy():
         class DummyMaterial(BaseMaterial):
+            def _cache_state(self):
+                return ()
+
             def _calculate_n(self, wavelength, **kwargs):
                 return 1.0 + 0.1 * wavelength**2
 
@@ -294,7 +300,7 @@ class TestUniformWavelengthFastPath:
 
     def test_inference_mode_does_not_crash(self, set_test_backend):
         """Torch inference tensors have no version counter; the cache-key
-        builder must treat them as immutable rather than raising."""
+        builder must inspect their content without raising."""
         if be.get_backend() != "torch":
             pytest.skip("torch-only regression")
         import torch
@@ -317,6 +323,7 @@ class TestBaseMaterialTorchCaching:
 
     @pytest.fixture(autouse=True)
     def _setup_torch(self):
+        pytest.importorskip("torch")
         be.set_backend("torch")
         be.set_device("cpu")
         be.grad_mode.enable()

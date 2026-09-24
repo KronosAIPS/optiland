@@ -111,15 +111,8 @@ class OpticalSystemModule(nn.Module if nn is not None else object):
         with torch.no_grad():  # Operations here shouldn't be part of the gradient graph
             for i, param in enumerate(self.params):
                 var = self._original_variables[i]
+                # Params and var.bounds are both in scaled space already
                 min_val, max_val = var.bounds
-
-                # Inverse scale the parameter data
-                min_val = (
-                    var.variable.inverse_scale(min_val) if min_val is not None else None
-                )
-                max_val = (
-                    var.variable.inverse_scale(max_val) if max_val is not None else None
-                )
 
                 # Clamp the parameter data to the defined bounds
                 if min_val is not None and max_val is not None:

@@ -451,6 +451,16 @@ class TestOptic:
         with pytest.raises(ValueError):
             _ = lens.total_track
 
+    def test_total_track_non_monotonic_positions(self, set_test_backend):
+        """total_track is the span of the positions, not last minus first."""
+        lens = Optic()
+        lens.surfaces.add(index=0, radius=be.inf, thickness=be.inf)
+        lens.surfaces.add(index=1, radius=be.inf, thickness=10.0, is_stop=True)
+        lens.surfaces.add(index=2, radius=be.inf, thickness=-15.0)
+        lens.surfaces.add(index=3)
+        # positions of surfaces 1..3: 0, 10, -5
+        assert_allclose(lens.total_track, 15.0)
+
     def test_polarization_state_property(self, set_test_backend):
         lens = HeliarLens()
         assert lens.polarization_state is None

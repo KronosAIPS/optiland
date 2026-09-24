@@ -8,6 +8,7 @@ Kramer Harrison, 2024
 
 from __future__ import annotations
 
+import operator
 from typing import Any
 
 import optiland.backend as be
@@ -76,6 +77,10 @@ class ZemaxToOpticConverter(BaseOpticReader):
 
         Returns:
             The fully-configured Optic instance.
+
+        Raises:
+            ValueError: If nonempty wavelength data has an explicitly invalid
+                primary index, including None, a non-integer, or an out-of-range value.
         """
         self.optic = Optic(self.data.get("name"))
         self._configure_surfaces()
@@ -331,8 +336,15 @@ class ZemaxToOpticConverter(BaseOpticReader):
 
     def _configure_wavelengths(self) -> None:
         """Configure the wavelength group on the optic."""
-        primary_idx = self.data["wavelengths"]["primary_index"]
         wl_data = self.data["wavelengths"]["data"]
+        if len(wl_data) == 0:
+            return
+        try:
+            primary_idx = operator.index(self.data["wavelengths"]["primary_index"])
+        except TypeError as exc:
+            raise ValueError("Primary wavelength index must be an integer.") from exc
+        if not 0 <= primary_idx < len(wl_data):
+            raise ValueError("Primary wavelength is not present in the active data.")
         wl_weights = self.data["wavelengths"].get("weights", [1.0] * len(wl_data))
         for idx, value in enumerate(wl_data):
             self.optic.wavelengths.add(

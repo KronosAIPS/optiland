@@ -29,10 +29,10 @@ class TestOsloDataParser:
         assert parser.data_model.scaling == 1.0
         assert parser.data_model.num_surfaces == 5
 
-    def test_read_ebr(self):
-        parser = OsloDataParser("dummy")
-        parser._read_ebr(["EBR", "5.0"])
-        assert parser.data_model.aperture["EPD"] == 10.0
+    def test_read_ebr(self, tmp_path):
+        path = tmp_path / "aperture.len"
+        path.write_text('LEN NEW "test" 1 1\nEBR 5\nNXT\nEND 1\n', encoding="utf-8")
+        assert OsloDataParser(path).parse().aperture["EPD"] == 10.0
 
     def test_read_rd(self):
         parser = OsloDataParser("dummy")
@@ -40,10 +40,12 @@ class TestOsloDataParser:
         assert parser._current_surf_data["RD"] == 50.0
 
     # ISSUE-P1: DES command stored in notes (quotes are stripped by implementation)
-    def test_issue_p1_des_stored_in_notes(self):
-        parser = OsloDataParser("dummy")
-        parser._read_des(["DES", '"OpticDesigner"'])
-        assert parser.data_model.notes["DES"] == "OpticDesigner"
+    def test_issue_p1_des_stored_in_notes(self, tmp_path):
+        path = tmp_path / "designer.len"
+        path.write_text(
+            'LEN NEW "test" 1 1\nDES "OpticDesigner"\nNXT\nEND 1\n', encoding="utf-8"
+        )
+        assert OsloDataParser(path).parse().notes["DES"] == "OpticDesigner"
 
     def test_issue_p1_des_in_dispatch_table(self):
         parser = OsloDataParser("dummy")
@@ -118,9 +120,7 @@ class TestGlassFallback:
             nd = float(mat.n(0.58756).item())
             # None of the glass surfaces (1, 2, 4) should resolve to n=1.0 (air)
             if i in (1, 2, 4):
-                assert nd > 1.1, (
-                    f"Surface {i} glass silently became air (n={nd:.4f})"
-                )
+                assert nd > 1.1, f"Surface {i} glass silently became air (n={nd:.4f})"
 
 
 if __name__ == "__main__":

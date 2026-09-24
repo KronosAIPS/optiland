@@ -27,7 +27,7 @@ def _make_simple_optic(name: str = "Test", fields: list[float] | None = None) ->
     optic.wavelengths.add(0.55)
     for y in (fields if fields is not None else [0.0, 14.0, 20.0]):
         optic.fields.add(y=y, x=0.0)
-    optic.surfaces.add(index=0, radius=0, thickness=1e10)
+    optic.surfaces.add(index=0, radius=0, thickness=be.inf)
     optic.surfaces.add(index=1, radius=100.0, thickness=5.0, material="N-BK7", is_stop=True)
     optic.surfaces.add(index=2, radius=-100.0, thickness=50.0)
     optic.surfaces.add(index=3)
@@ -170,7 +170,7 @@ class TestOsloWriter:
         optic.wavelengths.add(0.55)
         optic.fields.add(y=0)
 
-        optic.surfaces.add(index=0, radius=0, thickness=1e10)
+        optic.surfaces.add(index=0, radius=0, thickness=be.inf)
         optic.surfaces.add(index=1, radius=100.0, thickness=5.0, material="N-BK7", is_stop=True)
         optic.surfaces.add(index=2, radius=-100.0, thickness=50.0)
         optic.surfaces.add(index=3)

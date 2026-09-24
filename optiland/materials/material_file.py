@@ -79,6 +79,33 @@ class MaterialFile(BaseMaterial):
         data = self._read_file()
         self._parse_file(data)
 
+    def _cache_state(self) -> tuple | None:
+        """Track the live optical arrays used by file and catalog materials."""
+        if not isinstance(self._n_formula, str):
+            return None
+        method_name = (
+            "_" + self._n_formula.replace(" ", "_")
+            if self._n_formula.startswith("formula ")
+            else "_tabulated_n"
+        )
+        formula = self.formula_map.get(self._n_formula)
+        if getattr(formula, "__func__", None) is not getattr(
+            MaterialFile, method_name, None
+        ):
+            return None  # A custom callable may depend on untracked mutable state.
+        return self._state_key(
+            (
+                self._n_formula,
+                self.coefficients,
+                self.thermdispcoef,
+                self._t0,
+                self._n_wavelength,
+                self._n,
+                self._k_wavelength,
+                self._k,
+            )
+        )
+
     def _calculate_n(self, wavelength, **kwargs):
         """Calculates the refractive index of the material at given wavelengths.
 
@@ -103,7 +130,7 @@ class MaterialFile(BaseMaterial):
         if (
             temperature is not None
             and self._t0 is not None
-            and be.any(be.array(self.thermdispcoef))
+            and be.any(self._as_backend_array(self.thermdispcoef))
         ):
             pressure = 1.0 if pressure is None else pressure
 
@@ -161,7 +188,7 @@ class MaterialFile(BaseMaterial):
         n_absolute_reference = base_relative_n * n_air_reference
 
         # Compute the change in the absolute index due to the temperature difference
-        c = self.thermdispcoef
+        c = self._as_backend_array(self.thermdispcoef)
         delta_t = temp_c - self._t0
 
         # This is the Schott formula for the change in absolute refractive index
@@ -245,7 +272,11 @@ class MaterialFile(BaseMaterial):
                 return be.zeros_like(wavelength)
             return 0.0
 
-        return be.interp(wavelength, self._k_wavelength, self._k)
+        return be.interp(
+            wavelength,
+            self._as_backend_array(self._k_wavelength),
+            self._as_backend_array(self._k),
+        )
 
     def _formula_1(self, w):
         """Calculate the refractive index using dispersion formula 1 from
@@ -258,7 +289,7 @@ class MaterialFile(BaseMaterial):
             float or be.ndarray: The refractive index(s) of the material.
 
         """
-        c = self.coefficients
+        c = self._as_backend_array(self.coefficients)
         try:
             n = 1 + c[0]
             for k in range(1, len(c), 2):
@@ -278,7 +309,7 @@ class MaterialFile(BaseMaterial):
             float or be.ndarray: The refractive index(s) of the material.
 
         """
-        c = self.coefficients
+        c = self._as_backend_array(self.coefficients)
         try:
             n = 1 + c[0]
             for k in range(1, len(c), 2):
@@ -298,7 +329,7 @@ class MaterialFile(BaseMaterial):
             float or be.ndarray: The refractive index(s) of the material.
 
         """
-        c = self.coefficients
+        c = self._as_backend_array(self.coefficients)
         try:
             n = c[0]
             for k in range(1, len(c), 2):
@@ -318,7 +349,7 @@ class MaterialFile(BaseMaterial):
             float or be.ndarray: The refractive index(s) of the material.
 
         """
-        c = self.coefficients
+        c = self._as_backend_array(self.coefficients)
         try:
             n = (
                 c[0]
@@ -342,7 +373,7 @@ class MaterialFile(BaseMaterial):
             float or be.ndarray: The refractive index(s) of the material.
 
         """
-        c = self.coefficients
+        c = self._as_backend_array(self.coefficients)
         try:
             n = c[0]
             for k in range(1, len(c), 2):
@@ -362,7 +393,7 @@ class MaterialFile(BaseMaterial):
             float or be.ndarray: The refractive index(s) of the material.
 
         """
-        c = self.coefficients
+        c = self._as_backend_array(self.coefficients)
         try:
             n = 1 + c[0]
             for k in range(1, len(c), 2):
@@ -382,7 +413,7 @@ class MaterialFile(BaseMaterial):
             float or be.ndarray: The refractive index(s) of the material.
 
         """
-        c = self.coefficients
+        c = self._as_backend_array(self.coefficients)
         try:
             n = c[0] + c[1] / (w**2 - 0.028) + c[2] * (1 / (w**2 - 0.028)) ** 2
             for k in range(3, len(c)):
@@ -402,7 +433,7 @@ class MaterialFile(BaseMaterial):
             float or be.ndarray: The refractive index(s) of the material.
 
         """
-        c = self.coefficients
+        c = self._as_backend_array(self.coefficients)
         if len(c) != 4:
             raise ValueError("Invalid coefficients for dispersion formula 8.")
 
@@ -420,7 +451,7 @@ class MaterialFile(BaseMaterial):
             float or be.ndarray: The refractive index(s) of the material.
 
         """
-        c = self.coefficients
+        c = self._as_backend_array(self.coefficients)
         if len(c) != 6:
             raise ValueError("Invalid coefficients for dispersion formula 9.")
 
@@ -437,7 +468,11 @@ class MaterialFile(BaseMaterial):
             float or be.ndarray: Interpolated refractive index(s).
         """
         try:
-            return be.interp(w, self._n_wavelength, self._n)
+            return be.interp(
+                w,
+                self._as_backend_array(self._n_wavelength),
+                self._as_backend_array(self._n),
+            )
         except ValueError as err:  # Typically if _n_wavelength or _n is None or empty
             raise ValueError(
                 "No tabular refractive index data found or data is invalid."

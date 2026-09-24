@@ -33,7 +33,7 @@ class OsloDataFormatter:
         lines: list[str] = []
         lines.append("// OSLO 5.00 0 0 0")
         lines.append(
-            f'LEN NEW "{self.model.name}" '
+            f'LEN NEW "{self._quote(self.model.name)}" '
             f"{self._fmt(self.model.scaling)} {self.model.num_surfaces}"
         )
 
@@ -42,6 +42,8 @@ class OsloDataFormatter:
         # DES and UNI are always emitted (OSLO EDU convention)
         lines.append('DES "Optiland"')
         lines.append(f"UNI {self._fmt(self.model.units)}")
+        if self.model.settings.get("telecentric"):
+            lines.append("TELE ON")
 
         self._format_field_commands(lines)
         self._format_notes(lines)
@@ -52,6 +54,24 @@ class OsloDataFormatter:
         self._format_wavelength_footer(lines)
 
         lines.append(f"END {self.model.num_surfaces}")
+        points = self.model.fields.get("points", {})
+        if points:
+            lines.append("RST NEW")
+            for index, point in points.items():
+                values = [
+                    point["y"],
+                    point["x"],
+                    0,
+                    0,
+                    0,
+                    point["vy"] - 1,
+                    1 - point["vy"],
+                    point["vx"] - 1,
+                    1 - point["vx"],
+                    point["weight"],
+                ]
+                lines.append(f"F {index} {self._fmt_vals(values)}")
+            lines.append("END")
         lines.append("")
 
         return "\n".join(lines)
@@ -62,7 +82,8 @@ class OsloDataFormatter:
         if "FNO" in self.model.aperture:
             lines.append(f"FNO {self._fmt(self.model.aperture['FNO'])}")
         if "NAO" in self.model.aperture:
-            lines.append(f"NAO {self._fmt(self.model.aperture['NAO'])}")
+            # Rounding upward can turn a valid cone into NA == n_object.
+            lines.append(f"NAO {float(self.model.aperture['NAO'])}")
 
     def _format_field_commands(self, lines: list[str]) -> None:
         if "y" not in self.model.fields:
@@ -71,13 +92,21 @@ class OsloDataFormatter:
             "OBH" if self.model.fields.get("type") == "object_height" else "ANG"
         )
         for y in self.model.fields["y"]:
-            lines.append(f"{field_type_cmd} {self._fmt(y)}")
+            # Preserve the normalization used to encode fractional fields,
+            # including angular references immediately below 90 degrees.
+            lines.append(f"{field_type_cmd} {float(y)}")
 
     def _format_notes(self, lines: list[str]) -> None:
         for cmd, content in self.model.notes.items():
             if cmd == "DES":
                 continue  # already emitted explicitly above
-            lines.append(f'{cmd} "{content}"')
+            lines.append(f'{cmd} "{self._quote(content)}"')
+
+    @staticmethod
+    def _quote(content: str) -> str:
+        if "\n" in content or "\r" in content:
+            raise ValueError("OSLO names and notes must fit on a single line")
+        return content.replace("\\", "\\\\").replace('"', '\\"')
 
     def _format_wavelength_footer(self, lines: list[str]) -> None:
         """Emit WV/WW footer lines (after surfaces, before END) per convention."""
@@ -93,12 +122,14 @@ class OsloDataFormatter:
             lines.append(f"WW {self._fmt_vals(weights[: len(vals)])}")
 
     def _fmt_vals(self, values: list[float]) -> str:
-        """Format up to the first 3 values, matching OSLO's WV/WW convention."""
-        return " ".join(self._fmt(v) for v in values[:3])
+        """Preserve distinct spectral samples and field normalization exactly."""
+        return " ".join(str(float(v)) for v in values)
 
     def _format_surface(
         self, lines: list[str], index: int, data: dict[str, Any]
     ) -> None:
+        if "glass_wavelengths" in data:
+            lines.append(f"WV {self._fmt_vals(data['glass_wavelengths'])}")
         lines.append(data.get("material", "AIR"))
 
         self._format_surface_geometry(lines, data)
@@ -114,11 +145,18 @@ class OsloDataFormatter:
             lines.append(f"  RD {self._fmt(data['RD'])}")
 
         if "TH" in data:
-            th = 1e10 if math.isinf(data["TH"]) else data["TH"]
-            lines.append(f"  TH {self._fmt(th)}")  # 1e10 is OSLO's infinity convention
+            th = (
+                math.copysign(1e10, data["TH"])
+                if math.isinf(data["TH"])
+                else data["TH"]
+            )
+            # Retain the shortest round-trippable value: rounding a finite
+            # object distance up to OSLO's cutoff changes the ray launch.
+            lines.append(f"  TH {th}")
 
         if "AP" in data:
-            lines.append(f"  AP {self._fmt(data['AP'])}")
+            flag = "CHK " if data.get("aperture_checked") else ""
+            lines.append(f"  AP {flag}{self._fmt(data['AP'])}")
 
         if data.get("AST"):
             lines.append("  AST")
@@ -130,6 +168,13 @@ class OsloDataFormatter:
             lines.append(f"CC {self._fmt(data['CC'])}")
 
     def _format_surface_aspherics(self, lines: list[str], data: dict[str, Any]) -> None:
+        if "ASP" in data:
+            coefficients = {
+                k: v for k, v in data.items() if k.startswith("AS") and k[2:].isdigit()
+            }
+            lines.append(f"ASP {data['ASP']} {len(coefficients)}")
+            for key, value in coefficients.items():
+                lines.append(f"{key} {self._fmt(value)}")
         for key in ("AD", "AE", "AF", "AG"):
             if key in data:
                 lines.append(f"{key} {self._fmt(data[key])}")
@@ -152,5 +197,5 @@ class OsloDataFormatter:
     def _fmt(self, val: float) -> str:
         """Format float for OSLO using compact decimal notation (≤7 sig figs)."""
         if math.isinf(val):
-            return "1.0e+10"
+            return "-1.0e+10" if val < 0 else "1.0e+10"
         return f"{val:.7g}"

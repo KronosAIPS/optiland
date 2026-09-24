@@ -26,7 +26,7 @@ coverage:
         base: auto
 
 ignore:
-  - "tests/*"  # Ignore test files
+  - "tests/**/*"  # Ignore test files at every directory depth
   - "optiland/database/generate_csv_database.py"
   - "optiland_gui/*"  # Ignore GUI files
 

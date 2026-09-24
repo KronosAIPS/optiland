@@ -7,16 +7,37 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
+import math
 import warnings
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any
 
 import optiland.backend as be
-from optiland.coordinate_system import CoordinateSystem
+from optiland.fields.field_types import ObjectHeightField
 from optiland.fileio.base import BaseOpticReader
+from optiland.fileio.oslo.constants import (
+    DEFAULT_WAVELENGTHS_UM,
+    OBJECT_INFINITY_THRESHOLD,
+    THICKNESS_INFINITY_THRESHOLD,
+)
+from optiland.fileio.oslo.reader.configurations import select_configuration
+from optiland.fileio.oslo.reader.coordinates import surface_coordinates
+from optiland.fileio.oslo.reader.geometry import surface_geometry
 from optiland.fileio.oslo.reader.parser import OsloDataParser
-from optiland.fileio.oslo.surfaces import get_handler
-from optiland.materials import AbbeMaterial, IdealMaterial, Material
+from optiland.fileio.oslo.reader.pickups import resolve_pickups
+from optiland.fileio.oslo.reader.solves import SOLVES, apply_solve, check_solve
+from optiland.fileio.oslo.syntax import decode_text, tokenize
+from optiland.fileio.oslo.validation import validate_object_na
+from optiland.materials import (
+    AbbeMaterial,
+    BaseMaterial,
+    IdealMaterial,
+    MatchPolicy,
+    Material,
+)
 from optiland.optic import Optic
+from optiland.phase import LinearGratingPhaseProfile
+from optiland.physical_apertures import RadialAperture
 
 # ---------------------------------------------------------------------------
 # Fallback glass catalog for OSLO glass names not in the refractiveindex.info
@@ -85,6 +106,8 @@ _OSLO_GLASS_FALLBACK: dict[str, tuple[float, float]] = {
 _MANUFACTURER_PREFIXES = ("H_", "O_", "P_", "J_", "E_", "K_")
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from optiland.fileio.oslo.model import OsloDataModel
 
 
@@ -95,11 +118,32 @@ class OsloToOpticConverter(BaseOpticReader):
         oslo_data: OsloDataModel containing the OSLO optical system data.
     """
 
-    def __init__(self, oslo_data: OsloDataModel | None = None):
+    def __init__(
+        self,
+        oslo_data: OsloDataModel | None = None,
+        *,
+        strict: bool = False,
+        configuration: int = 1,
+        material_overrides: Mapping[str, BaseMaterial] | None = None,
+    ):
         self.data = oslo_data
+        self.strict = strict
+        self.configuration = configuration
+        self.material_overrides = {}
+        for name, material in (material_overrides or {}).items():
+            if (
+                not isinstance(name, str)
+                or not name.strip()
+                or not isinstance(material, BaseMaterial)
+                or name.casefold() in self.material_overrides
+            ):
+                raise ValueError(
+                    "material_overrides requires unique nonempty names "
+                    "and material objects"
+                )
+            self.material_overrides[name.casefold()] = deepcopy(material)
+        self._warned_missing_catalogs: set[str] = set()
         self.optic: Optic | None = None
-        self.current_cs = CoordinateSystem()
-        self._py_surface_indices: list[int] = []
 
     def read(self, source: str) -> Optic:
         """Read an OSLO file and return a fully-configured Optic.
@@ -110,9 +154,7 @@ class OsloToOpticConverter(BaseOpticReader):
         Returns:
             A configured Optic instance.
         """
-        self.data = OsloDataParser(source).parse()
-        self.current_cs = CoordinateSystem()
-        self._py_surface_indices = []
+        self.data = OsloDataParser(source, strict=self.strict).parse()
         return self.convert()
 
     def convert(self) -> Optic:
@@ -123,25 +165,137 @@ class OsloToOpticConverter(BaseOpticReader):
         """
         if self.data is None:
             raise ValueError("No OSLO data to convert.")
+        if self.strict and self.data.diagnostics:
+            diagnostic = self.data.diagnostics[0]
+            raise ValueError(
+                f"OSLO {diagnostic.command} at line {diagnostic.line}, surface "
+                f"{diagnostic.surface}: {diagnostic.message}; strict conversion "
+                "requires a prescription without unsupported commands"
+            )
 
+        prescription = self.data
+        try:
+            self.data = select_configuration(prescription, self.configuration)
+            self.data.surfaces = resolve_pickups(self.data.surfaces)
+            self._validate_catalog_references()
+            self._build_optic()
+            self._apply_solves()
+            self._apply_image_focus()
+            return self.optic
+        finally:
+            # Overrides and solved values belong to this conversion only. The
+            # next selection must start from the original base, even on failure.
+            self.data = prescription
+
+    def _apply_image_focus(self) -> None:
+        """Move the detector by OSLO's defocus after nominal solves and pickups."""
+        image_index = max(self.data.surfaces)
+        shift = self.data.surfaces[image_index].get("TH", 0.0)
+        image = self.optic.surfaces[image_index]
+        image.thickness = 0.0
+        if not shift:
+            return
+        if image_index < 2:
+            raise ValueError("OSLO image focus shift requires an interior surface")
+        if "GC" in self.data.surfaces[image_index]:
+            raise ValueError(
+                "OSLO image focus shift with a global reference is not mapped"
+            )
+
+        # Image TH adds to the preceding nominal gap; it does not advance a
+        # nonexistent next surface. Apply it after solves so PY=0 may retain
+        # deliberate defocus. Program Reference pp. 46 and 122:
+        # https://lambdares.com/hubfs/Support/support/oslo/oslo_releases/OSLOProgramReference.pdf#page=60
+        if self._coordinates:
+            # Reuse the coordinate convention, including bends and returns,
+            # rather than moving a tilted image leg along global z.
+            surfaces = deepcopy(self.data.surfaces)
+            previous = surfaces[image_index - 1]
+            previous["TH"] = previous.get("TH", 0.0) + shift
+            position = surface_coordinates(surfaces, self.data.units)[image_index]
+            for axis in ("x", "y", "z"):
+                setattr(image.geometry.cs, axis, be.array(position[axis]))
+        else:
+            image.geometry.cs.z = image.geometry.cs.z + shift * self.data.units
+        self.optic.surfaces[image_index - 1].thickness += shift * self.data.units
+        if image.is_stop:
+            # Moving the stop moves its entrance pupil. Preserve OSLO's beam
+            # specification with the new pupil while keeping nominal GIH fields.
+            self._configure_aperture()
+            self._configure_telecentric_launch()
+
+    def _build_optic(self) -> None:
+        """Build from the current resolved prescription without applying solves."""
         self.optic = Optic(self.data.name)
+        self.optic.obj_space_telecentric = self.data.settings.get("telecentric", False)
+        self.optic.fields.set_telecentric(self.optic.obj_space_telecentric)
         self._configure_surfaces()
+        self._configure_wavelengths()
         self._configure_aperture()
         self._configure_fields()
-        self._configure_wavelengths()
-        self._apply_py_solves()
-        return self.optic
+        self._configure_telecentric_launch()
+
+    def _configure_telecentric_launch(self) -> None:
+        """Adapt supported TELE prescriptions to the native real-ray launcher."""
+        if not self.optic.obj_space_telecentric:
+            return
+        if (
+            self.optic.object_surface.is_infinite
+            or not isinstance(self.optic.fields.field_definition, ObjectHeightField)
+            or float(
+                self.optic.object_surface.material_post.n(
+                    self.optic.primary_wavelength
+                ).item()
+            )
+            != 1
+            or not self.optic.surfaces.build_paraxial_path().entry_is_positive_z
+        ):
+            message = (
+                "OSLO TELE real-ray launch currently requires finite object-height "
+                "fields in air and entry along +z"
+            )
+            if self.strict:
+                raise ValueError(message)
+            warnings.warn(message, UserWarning, stacklevel=3)
+            return
+        if self.optic.aperture.ap_type != "objectNA":
+            # Keep the axial cone fixed while allowing every field point's
+            # chief ray to launch parallel to the axis. The native TELE aimer
+            # expects the cone's sine as an object-NA aperture in air.
+            slope = abs(float(self.optic.paraxial.marginal_ray()[1][0].item()))
+            self.optic.set_aperture("objectNA", math.sin(math.atan(slope)))
+        if not 0 < self.optic.aperture.value < 1:
+            raise ValueError(
+                "OSLO TELE launch requires object NA strictly between 0 and 1"
+            )
 
     def _configure_surfaces(self) -> None:
         """Configure all surfaces on the optic."""
-        # Check if any surface has decenters or tilts
+        coordinate_commands = {
+            "DCX",
+            "DCY",
+            "DCZ",
+            "TLA",
+            "TLB",
+            "TLC",
+            "GC",
+            "RCO",
+            "BEN",
+            "TOX",
+            "TOY",
+            "TOZ",
+        }
         has_coord_transform = any(
-            any(k in sd for k in ["DCX", "DCY", "DCZ", "TLA", "TLB", "TLC"])
-            for sd in self.data.surfaces.values()
+            coordinate_commands.intersection(sd) for sd in self.data.surfaces.values()
         )
 
         # Determine if any surface is explicitly marked as the stop
         has_stop = any(sd.get("AST", False) for sd in self.data.surfaces.values())
+        self._coordinates = (
+            surface_coordinates(self.data.surfaces, self.data.units)
+            if has_coord_transform
+            else {}
+        )
 
         for idx in sorted(self.data.surfaces.keys()):
             surf_data = self.data.surfaces[idx]
@@ -155,86 +309,77 @@ class OsloToOpticConverter(BaseOpticReader):
     def _configure_surface(
         self, index: int, data: dict[str, Any], has_coord_transform: bool
     ) -> None:
-        # Determine surface type
-        # Default is standard. If AD, AE, AF, or AG are present, it's even_asphere.
-        oslo_type = "standard"
-        if any(k in data for k in ["AD", "AE", "AF", "AG"]):
-            oslo_type = "even_asphere"
-
-        handler = get_handler(oslo_type)
-        surface_params = handler.parse(data)
+        scale = self.data.units
+        surface_params = surface_geometry(data, scale)
+        # Native scalar traces use the base radius only. Constant, linear and
+        # quadratic sag terms can change the vertex, normal or paraxial power.
+        low_order = {"ASR": (1,), "ARA": (1, 2), "ASX": tuple(range(6))}
+        if any(data.get(f"AS{i}", 0) for i in low_order.get(data.get("ASP"), ())):
+            message = (
+                f"OSLO asphere at surface {index} has low-order sag terms ignored "
+                "by native paraxial analysis; real-ray geometry is retained, but "
+                "paraxial pupils, fields and solves may be inaccurate"
+            )
+            if self.strict:
+                raise ValueError(message)
+            warnings.warn(message, UserWarning, stacklevel=3)
         surface_params["index"] = index
         surface_params["is_stop"] = data.get("AST", False)
 
         th = data.get("TH", 0.0)
-        # OSLO uses 1e10 as "infinity"; allow for floating-point imprecision
-        # (e.g., 9.9999999996e+09 appears in practice).
-        if th >= 9.9e9:
-            th = be.inf
-        surface_params["thickness"] = th
+        # Object conjugates have a documented cutoff below the large sentinel
+        # used for other distances (sometimes saved as 9.9999999996e+09).
+        infinity_threshold = (
+            OBJECT_INFINITY_THRESHOLD if index == 0 else THICKNESS_INFINITY_THRESHOLD
+        )
+        if abs(th) >= infinity_threshold:
+            th = be.inf if th > 0 else -be.inf
+        surface_params["thickness"] = th * scale
 
         # Is paraxial?
         if "PFL" in data:
+            message = "OSLO PFL perfect imagery is approximated by a paraxial thin lens"
+            if self.strict:
+                raise ValueError(message)
+            warnings.warn(message, UserWarning, stacklevel=3)
             surface_params["surface_type"] = "paraxial"
-            surface_params["f"] = data["PFL"]
+            surface_params["f"] = data["PFL"] * scale
+
+        if "GSP" in data or "GOR" in data:
+            spacing, order = data.get("GSP", 0.0), data.get("GOR", 1)
+            if int(order) != order or spacing < 0 or (spacing == 0 and order != 0):
+                raise ValueError(
+                    "OSLO GSP requires positive spacing and GOR an integer order"
+                )
+            if spacing and order:
+                surface_params["phase_profile"] = LinearGratingPhaseProfile(
+                    spacing * scale, angle=math.pi / 2, order=int(order)
+                )
 
         # Handle material
         material_raw = data.get("material", "AIR")
-        surface_params["material"] = self._resolve_material(material_raw)
+        surface_params["material"] = self._resolve_material(
+            material_raw, data.get("glass_wavelengths")
+        )
 
-        # Handle aperture (AP is radius in OSLO).
-        # Skip sentinel values like AP 4e9 which mean "infinite aperture".
-        if "AP" in data and data["AP"] < 1e6:
-            from optiland.physical_apertures import RadialAperture
-
-            surface_params["aperture"] = RadialAperture(r_max=data["AP"])
+        if (
+            data.get("aperture_checked")
+            and self.data.settings.get("aperture_check", True)
+            and data.get("AP", 0.0) > 0
+        ):
+            surface_params["aperture"] = RadialAperture(r_max=data["AP"] * scale)
 
         if has_coord_transform:
-            # Resolve effective global position and orientation
-            # OSLO decenters/tilts are applied to the surface.
-            dx = data.get("DCX", 0.0)
-            dy = data.get("DCY", 0.0)
-            dz = data.get("DCZ", 0.0)
-            rx = be.deg2rad(data.get("TLA", 0.0))
-            ry = be.deg2rad(data.get("TLB", 0.0))
-            rz = be.deg2rad(data.get("TLC", 0.0))
-
-            if dx != 0 or dy != 0 or dz != 0 or rx != 0 or ry != 0 or rz != 0:
-                # Apply transform to current CS
-                self.current_cs = CoordinateSystem(
-                    x=dx, y=dy, z=dz, rx=rx, ry=ry, rz=rz, reference_cs=self.current_cs
-                )
-
-            translation, _ = self.current_cs.get_effective_transform()
-            rx_, ry_, rz_ = self.current_cs.get_effective_rotation_euler()
-
-            surface_params.update(
-                {
-                    "x": float(translation[0]),
-                    "y": float(translation[1]),
-                    "z": float(translation[2]),
-                    "rx": float(rx_),
-                    "ry": float(ry_),
-                    "rz": float(rz_),
-                }
-            )
-
-            # Advance CS by thickness for next surface
-            th = data.get("TH", 0.0)
-            if not be.isinf(th):
-                self.current_cs = CoordinateSystem(z=th, reference_cs=self.current_cs)
-        else:
-            # Standard sequential path, thickness handled by Optiland automatically
-            pass
+            surface_params.pop("thickness")
+            surface_params.update(self._coordinates[index])
 
         self.optic.surfaces.add(**surface_params)
+        if has_coord_transform:
+            self.optic.surfaces[index].thickness = th * scale
 
-        # Track surfaces with a PY (paraxial thickness) solve.
-        # Actual solve is applied in _apply_py_solves() after full configuration.
-        if "PY" in data:
-            self._py_surface_indices.append(index)
-
-    def _resolve_material(self, material_raw: str) -> Any:
+    def _resolve_material(
+        self, material_raw: str, wavelengths: list[float] | None = None
+    ) -> Any:
         if material_raw == "AIR":
             return "air"
         if material_raw == "RFL":
@@ -242,50 +387,107 @@ class OsloToOpticConverter(BaseOpticReader):
 
         if material_raw.startswith("GLA "):
             rest = material_raw[4:].strip()
-            parts = rest.split()
+            parts = tokenize(rest)
             if not parts:
                 return "air"
 
-            # Case 1: Catalog Glass (e.g. GLA BK7)
-            if len(parts) == 1:
-                return self._resolve_catalog_glass(parts[0])
-
-            # Case 2: Direct Indices (e.g. GLA 1.573 1.573 1.573)
-            # Case 3: Modeled Glass (e.g. GLA MOD G1 1.6489 1.662...)
+            name = ""
+            # Modeled glass (e.g. GLA MOD G1 1.6489 1.662...).
+            modeled = parts[0].upper() == "MOD"
+            if modeled:
+                parts = parts[1:]
+            if not parts:
+                raise ValueError("GLA MOD requires refractive-index data")
             try:
-                if parts[0].upper() == "MOD":
-                    # MOD <name> <nd> <n1> <n2>
-                    nd = float(parts[2])
-                    if len(parts) >= 5:
-                        n1 = float(parts[3])
-                        n2 = float(parts[4])
-                        return self._create_abbe_material(nd, n1, n2)
-                    return IdealMaterial(nd)
-                else:
-                    # <nd> <n1> <n2>
-                    nd = float(parts[0])
-                    if len(parts) >= 3:
-                        n1 = float(parts[1])
-                        n2 = float(parts[2])
-                        return self._create_abbe_material(nd, n1, n2)
-                    return IdealMaterial(nd)
-            except (ValueError, IndexError):
-                return "air"
+                float(parts[0])
+            except ValueError:
+                name, parts = decode_text(parts[0]), parts[1:]
+            if not parts:
+                if modeled:
+                    raise ValueError("GLA MOD requires refractive-index data")
+                # Catalog glass (e.g. GLA BK7).
+                return self._resolve_catalog_glass(name)
+            # Direct indices (e.g. GLA 1.573 1.573 1.573), or index data
+            # remaining after a named/model-glass prefix.
+            indices = [float(value) for value in parts]
+            if any(value <= 0 for value in indices):
+                raise ValueError(
+                    f"OSLO glass {name!r} requires positive refractive indices"
+                )
+            if modeled and len(indices) == 2:
+                # Interactive model glass (e.g. GLA MOD 1.6 50) specifies
+                # refractive index and Abbe number.
+                # Saved legacy MOD records instead contain explicit index samples.
+                if self.strict:
+                    raise ValueError("GLA MOD index/Abbe dispersion is approximate")
+                warnings.warn(
+                    "OSLO GLA MOD index/Abbe uses Optiland's Buchdahl model",
+                    UserWarning,
+                    stacklevel=3,
+                )
+                return AbbeMaterial(*indices, model="buchdahl")
+            if len(set(indices)) == 1:
+                return IdealMaterial(indices[0])
+            wavelengths = wavelengths or list(DEFAULT_WAVELENGTHS_UM)
+            if len(indices) != len(wavelengths):
+                raise ValueError(f"OSLO glass {name!r} index/wavelength counts differ")
+            # Retain the existing public reader's d/F/C Abbe approximation.
+            # Exact arbitrary sampled dispersion is a separate material feature.
+            message = "OSLO direct-index dispersion uses an approximate Abbe model"
+            if self.strict:
+                raise ValueError(message)
+            warnings.warn(message, UserWarning, stacklevel=3)
+            if len(indices) >= 3 and indices[1] != indices[2]:
+                abbe = (indices[0] - 1) / (indices[1] - indices[2])
+                if abbe > 0:
+                    return AbbeMaterial(indices[0], abbe, model="buchdahl")
+            return IdealMaterial(indices[0])
 
         return "air"
 
-    def _resolve_catalog_glass(self, name: str) -> Any:
-        """Resolve a single glass name to a Material.
+    def _validate_catalog_references(self) -> None:
+        """Report all missing names together before constructing the optic."""
+        missing = {}
+        for surface in self.data.surfaces.values():
+            raw = surface.get("material", "AIR")
+            parts = tokenize(raw)
+            if len(parts) != 2 or parts[0] != "GLA" or parts[1].upper() == "MOD":
+                continue
+            try:
+                float(parts[1])
+                continue
+            except ValueError:
+                name = decode_text(parts[1])
+            key = name.casefold()
+            if key not in self.material_overrides:
+                missing[key] = name
+        if self.strict and missing:
+            raise ValueError(
+                "OSLO glasses could not be resolved from material bindings: "
+                + ", ".join(sorted(missing.values(), key=str.casefold))
+                + ". Provide material_overrides."
+            )
 
-        Resolution order:
-        1. Direct lookup via Material() (uses the refractiveindex.info DB).
-        2. Strip a known manufacturer prefix (H_, O_, …) and retry.
-        3. Fall back to AbbeMaterial using a built-in OSLO glass table.
-        4. Warn and return air as a last resort.
-        """
+    def _resolve_catalog_glass(self, name: str) -> Any:
+        """Prefer caller bindings and material data before permissive fallback."""
+        if name.casefold() in self.material_overrides:
+            return deepcopy(self.material_overrides[name.casefold()])
+        if name.casefold() not in self._warned_missing_catalogs:
+            warnings.warn(
+                f"OSLO glass {name!r} has no definition in material bindings; "
+                "using database/approximation fallback",
+                UserWarning,
+                stacklevel=3,
+            )
+            self._warned_missing_catalogs.add(name.casefold())
+
+        # OSLO requires unique glass names across its installed catalogs. The
+        # refractiveindex.info catalog has broader family names and author data;
+        # strict import cannot silently accept a fuzzy or ambiguous identity.
+        # https://lambdares.com/support-posts/editing-glass-catalogs
         # Step 1 – direct DB lookup.
         try:
-            return Material(name)
+            return Material(name, match_policy=MatchPolicy.WARN)
         except ValueError:
             pass
 
@@ -294,70 +496,152 @@ class OsloToOpticConverter(BaseOpticReader):
             if name.upper().startswith(prefix):
                 base = name[len(prefix) :]
                 try:
-                    return Material(base)
+                    material = Material(base)
+                    message = (
+                        f"OSLO glass {name!r} requires a manufacturer-prefix "
+                        "substitution; "
+                        "provide material_overrides to specify its catalog identity"
+                    )
+                    warnings.warn(message, UserWarning, stacklevel=3)
+                    return material
                 except ValueError:
                     pass
                 # Also check the fallback table for the base name.
                 if base.upper() in _OSLO_GLASS_FALLBACK:
                     nd, vd = _OSLO_GLASS_FALLBACK[base.upper()]
-                    return AbbeMaterial(nd, vd, model="buchdahl")
+                    return self._fallback_material(name, nd, vd)
                 break
 
         # Step 3 – built-in OSLO fallback table.
         entry = _OSLO_GLASS_FALLBACK.get(name.upper())
         if entry is not None:
             nd, vd = entry
-            return AbbeMaterial(nd, vd, model="buchdahl")
+            return self._fallback_material(name, nd, vd)
 
         # Step 4 – cannot resolve; warn and fall back to air.
         warnings.warn(
             f"OSLO glass '{name}' could not be resolved and will be treated as "
-            "air.  Add it to _OSLO_GLASS_FALLBACK in oslo/reader/converter.py "
-            "if a catalog value is available.",
+            "air. Provide material_overrides with a verified catalog definition.",
             UserWarning,
             stacklevel=4,
         )
         return "air"
 
-    def _create_abbe_material(self, nd: float, n1: float, n2: float) -> Any:
-        # n1 = nF (F line 0.48613 µm), n2 = nC (C line 0.65627 µm)
-        # Abbe V = (nd - 1) / (nF - nC)
-        if n1 != n2:
-            vd = (nd - 1.0) / (n1 - n2)
-            if vd > 0:
-                return AbbeMaterial(nd, vd, model="buchdahl")
-        return IdealMaterial(nd)
+    def _fallback_material(self, name: str, nd: float, vd: float) -> AbbeMaterial:
+        message = f"OSLO glass {name!r} uses approximate historical Abbe dispersion"
+        warnings.warn(message, UserWarning, stacklevel=4)
+        return AbbeMaterial(nd, vd, model="buchdahl")
 
     def _configure_aperture(self) -> None:
-        aperture_data = self.data.aperture
-        if "EPD" in aperture_data:
-            self.optic.set_aperture("EPD", aperture_data["EPD"])
-
-        if "FNO" in aperture_data:
+        aperture_data = self.data.aperture or {"EPD": 2.0}
+        if (
+            "FNO" in aperture_data
+            and self.optic.object_surface.is_infinite
+            and float(
+                self.optic.surfaces[-1]
+                .material_pre.n(self.optic.primary_wavelength)
+                .item()
+            )
+            == 1.0
+            and 0 < float(self.optic.paraxial.f2()) < math.inf
+        ):
             self.optic.set_aperture("imageFNO", aperture_data["FNO"])
+            return
+        if "EPD" in aperture_data:
+            # The shared model's EPD is twice OSLO's EBR, the radius at surface 1
+            # (Program Reference p. 120). For finite objects, this plane need
+            # not coincide with the entrance pupil.
+            diameter = aperture_data["EPD"] * self.data.units
+            self.optic.set_aperture("EPD", 1.0)
+            if not self.optic.object_surface.is_infinite:
+                height = abs(float(self.optic.paraxial.marginal_ray()[0][1].item()))
+                if not math.isfinite(height) or height == 0:
+                    raise ValueError("EBR requires a finite nonzero beam at surface 1")
+                diameter /= 2 * height
+            self.optic.set_aperture("EPD", diameter)
 
         if "NAO" in aperture_data:
-            self.optic.set_aperture("objectNA", aperture_data["NAO"])
+            value = aperture_data["NAO"]
+            validate_object_na(self.optic, value)
+            self.optic.set_aperture("objectNA", value)
+        if any(key in aperture_data for key in ("NAP", "FNO", "PUK")):
+            # OSLO's image NA is an aplanatic paraxial specification. Scale a
+            # unit pupil using its image-space reduced slope (n * u).
+            self.optic.set_aperture("EPD", 1.0)
+            _, slopes = self.optic.paraxial.marginal_ray()
+            n_image = self.optic.surfaces[-1].material_pre.n(
+                self.optic.primary_wavelength
+            )
+            reduced_slope = abs(float((n_image * slopes[-2]).item()))
+            target = aperture_data.get("NAP")
+            if "FNO" in aperture_data:
+                target = 1 / (2 * aperture_data["FNO"])
+            elif "PUK" in aperture_data:
+                target = aperture_data["PUK"] * float(n_image.item())
+            if reduced_slope == 0:
+                raise ValueError("NAP cannot define an aperture for an afocal system")
+            self.optic.set_aperture("EPD", target / reduced_slope)
 
     def _configure_fields(self) -> None:
         field_data = self.data.fields
-        if not field_data:
-            return
-
         field_type = field_data.get("type", "angle")
         y_coords = field_data.get("y", [0.0])
+
+        if field_type == "gaussian_image_height":
+            height = y_coords[0] * self.data.units
+            if self.optic.object_surface.is_infinite:
+                field_type = "angle"
+                y_coords = [
+                    math.degrees(math.atan(height / float(self.optic.paraxial.f2())))
+                ]
+            else:
+                field_type = "object_height"
+                y_coords = [
+                    height
+                    / float(self.optic.paraxial.magnification())
+                    / self.data.units
+                ]
 
         # If object is at infinity, ObjectHeightField is invalid in Optiland.
         # OSLO often uses OBH even for infinite objects, encoding the angle.
         # OSLO OBH sign convention: negative means below axis - take abs().
-        if field_type == "object_height" and be.isinf(self.optic.surfaces[0].thickness):
+        if field_type == "object_height" and self.optic.object_surface.is_infinite:
             field_type = "angle"
-            y_coords = [abs(float(be.degrees(be.arctan(y / 1e10)))) for y in y_coords]
+            distance = self.data.surfaces[0].get("TH", 1e10)
+            y_coords = [
+                abs(float(be.degrees(be.arctan(y / distance)))) for y in y_coords
+            ]
         elif field_type == "angle":
             # ANG is always positive in OSLO for the max half-angle.
             y_coords = [abs(y) for y in y_coords]
+        else:
+            y_coords = [y * self.data.units for y in y_coords]
+
+        # The reference field must stay below 90 degrees even in OSLO's
+        # separate WARM mode (Program Reference p. 215). Our ordinary field
+        # mapping uses tan/atan, which would fold 100 degrees onto -80 degrees.
+        # https://lambdares.com/hubfs/Support/support/oslo/oslo_releases/OSLOProgramReference.pdf#page=229
+        if field_type == "angle" and any(abs(y) >= 90 for y in y_coords):
+            raise ValueError("OSLO angular reference must be less than 90 degrees")
 
         self.optic.fields.set_type(field_type)
+
+        if "points" in field_data:
+            maximum = y_coords[0]
+            for point in field_data["points"].values():
+                coords = dict(point)
+                for axis in ("x", "y"):
+                    fraction = point[axis]
+                    coords[axis] = (
+                        math.degrees(
+                            math.atan(fraction * math.tan(math.radians(maximum)))
+                        )
+                        if field_type == "angle"
+                        else fraction * maximum
+                    )
+                self.optic.fields.add(**coords)
+            if self.optic.fields.num_fields:
+                return
 
         # OSLO stores only the maximum field value.  Expand to three standard
         # field points (on-axis, 0.7×max, full field) for usable analysis.
@@ -367,20 +651,51 @@ class OsloToOpticConverter(BaseOpticReader):
         for y in fields_to_add:
             self.optic.fields.add(y=y, x=0.0)
 
-    def _apply_py_solves(self) -> None:
-        """Apply paraxial thickness (PY) solves.
-
-        PY 0.0 in an OSLO file means "set this surface's thickness so that
-        the paraxial marginal ray focuses at the image plane."  We implement
-        this via image_solve(), which drives F2() to zero by correctly setting
-        the image distance.
-        """
-        if not self._py_surface_indices:
-            return
-        import contextlib
-
-        with contextlib.suppress(Exception):
-            self.optic.updater.image_solve()
+    def _apply_solves(self) -> None:
+        """Apply surface-specific solves, retaining saved values on warned failures."""
+        applied = []
+        for index in sorted(self.data.surfaces):
+            for command in SOLVES:
+                data = self.data.surfaces[index]
+                if command not in data:
+                    continue
+                saved = self.optic.to_dict()
+                saved_surfaces = deepcopy(self.data.surfaces)
+                target = data[command]
+                try:
+                    apply_solve(self.optic, index, command, target, self.data.units)
+                    key = "TH" if command in {"PY", "PYC", "EC"} else "RD"
+                    surface = self.optic.surfaces[index]
+                    value = (
+                        surface.thickness if key == "TH" else surface.geometry.radius
+                    )
+                    data[key] = float(be.asarray(value).item()) / self.data.units
+                    self.data.surfaces = resolve_pickups(self.data.surfaces)
+                    self._build_optic()
+                    # Recomputing dependent geometry, NAP/FNO/PUK or GIH may
+                    # change the rays used by this solve or an earlier one.
+                    # Accept only a prescription that still meets every target.
+                    pending = (index, command, target)
+                    for solve_index, solve_command, solve_target in [*applied, pending]:
+                        check_solve(
+                            self.optic,
+                            solve_index,
+                            solve_command,
+                            solve_target,
+                            self.data.units,
+                        )
+                    applied.append(pending)
+                except (ValueError, RuntimeError, ArithmeticError) as exc:
+                    self.data.surfaces = saved_surfaces
+                    self.optic = Optic.from_dict(saved)
+                    message = f"OSLO {command} at surface {index}: {exc}"
+                    if self.strict:
+                        raise ValueError(message) from exc
+                    warnings.warn(
+                        message + "; retained saved prescription",
+                        UserWarning,
+                        stacklevel=3,
+                    )
 
     def _configure_wavelengths(self) -> None:
         wl_data = self.data.wavelengths

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import vtk
+from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
 
 import optiland.backend as be
 from optiland.physical_apertures import RadialAperture
@@ -20,16 +21,41 @@ from optiland.visualization.system.utils import revolve_contour, transform, tran
 _FACE_ON_THRESHOLD = 0.5  # |cos(60°)|
 
 
+def _finite_aperture_extent(surface) -> float | None:
+    """Return a finite physical drawing bound in the surface's local frame."""
+    if surface.aperture is not None:
+        bounds = be.to_numpy(be.array(surface.aperture.extent))
+        if np.all(np.isfinite(bounds)):
+            return float(np.max(np.abs(bounds)))
+    # semi_aperture can be a paraxial ray-height estimate; it does not establish
+    # a physical aperture or detector dimension.
+    return None
+
+
+def _schematic_image_extent(surface) -> float:
+    """Choose a drawing scale, never a physical image or detector dimension."""
+    previous = surface.previous_surface
+    while previous is not None:
+        radius = _finite_aperture_extent(previous)
+        if radius is not None and radius > 0:
+            return radius
+        previous = previous.previous_surface
+    return 1.0  # mm: deterministic schematic radius without any finite aperture
+
+
 class Surface2D:
     """A class used to represent a 2D surface for visualization.
 
     Args:
-        surf (Surface): The surface object containing the geometry.
-        extent (tuple): The extent of the surface in the x and y directions.
+        surface (Surface): The surface object containing the geometry.
+        ray_extent (float): Local radial extent of valid incident ray samples.
+        is_image_plane (bool): Use a schematic marker if this image endpoint
+            has no finite physical aperture. Defaults to False.
 
     Attributes:
         surf (Surface): The surface object containing the geometry.
-        ray_extent (tuple): The extent of rays on the surface.
+        extent (float): Resolved local radial drawing extent.
+        extent_source (str): Physical aperture, ray samples or schematic sizing.
 
     Methods:
         plot(ax):
@@ -37,21 +63,19 @@ class Surface2D:
 
     """
 
-    def __init__(self, surface, ray_extent):
+    def __init__(self, surface, ray_extent, *, is_image_plane: bool = False):
         self.surf = surface
-
-        if self.surf.aperture:
-            x_min, x_max, y_min, y_max = self.surf.aperture.extent
-            # Use the largest absolute bound so that apertures offset from
-            # the surface vertex (e.g. OffsetRadialAperture) are fully
-            # covered by the symmetric [-extent, extent] sampling window
-            # used in _compute_sag; a plain max() would collapse to the
-            # aperture radius and miss the offset region entirely.
-            extent = be.max(be.abs(be.array([x_min, x_max, y_min, y_max])))
-            # Fall back to ray extent if aperture extent is infinite
-            self.extent = extent if be.isfinite(be.array(extent)) else ray_extent
+        self.is_image_plane = is_image_plane
+        extent = _finite_aperture_extent(surface)
+        if extent is not None:
+            self.extent = extent
+            self.extent_source = "physical_aperture"
+        elif is_image_plane:
+            self.extent = _schematic_image_extent(surface)
+            self.extent_source = "schematic"
         else:
-            self.extent = ray_extent
+            self.extent = ray_extent if be.isfinite(be.array(ray_extent)) else 0.0
+            self.extent_source = "ray_samples"
 
     # Maps projection name to the index of the viewing axis in global normal.
     # e.g. for "YZ" the view is along X (index 0); "XZ" along Y (index 1); etc.
@@ -97,12 +121,15 @@ class Surface2D:
         if theme:
             color = theme.parameters.get("axes.edgecolor", color)
 
+        label = f"Surface {self.surf.comment}"
+        if self.extent_source == "schematic":
+            label += " (schematic image plane)"
         if projection == "XY":
-            (line,) = ax.plot(x, y, color=color, label=f"Surface {self.surf.comment}")
+            (line,) = ax.plot(x, y, color=color, label=label)
         elif projection == "XZ":
-            (line,) = ax.plot(z, x, color=color, label=f"Surface {self.surf.comment}")
+            (line,) = ax.plot(z, x, color=color, label=label)
         else:  # YZ
-            (line,) = ax.plot(z, y, color=color, label=f"Surface {self.surf.comment}")
+            (line,) = ax.plot(z, y, color=color, label=label)
         return {line: self}
 
     def _compute_sag(self, projection="YZ"):
@@ -165,8 +192,8 @@ class Surface3D(Surface2D):
 
     """
 
-    def __init__(self, surface, extent):
-        super().__init__(surface, extent)
+    def __init__(self, surface, extent, *, is_image_plane: bool = False):
+        super().__init__(surface, extent, is_image_plane=is_image_plane)
 
     def plot(self, renderer, theme=None, *args, **kwargs):
         """Plots the surface on the given renderer.
@@ -222,13 +249,7 @@ class Surface3D(Surface2D):
         return actor
 
     def _get_asymmetric_surface(self):
-        """Generates an asymmetric surface using Delaunay triangulation and
-        returns a VTK actor for rendering.
-
-        This method computes the 3D sag values, creates a VTK poly data object
-        to store the points, applies Delaunay triangulation to generate a
-        surface mesh, maps the surface to a VTK actor, configures the actor's
-        material properties, and converts the actor to global coordinates.
+        """Build a clipped quad grid with bulk VTK point/connectivity arrays.
 
         Returns:
             vtk.vtkActor: A VTK actor representing the asymmetric surface.
@@ -246,34 +267,29 @@ class Surface3D(Surface2D):
             r = np.hypot(x, y)
             mask = r <= be.to_numpy(self.extent)
 
-        # Create VTK points.
+        # Preserve the original row-major vertex order and vtkPoints float32
+        # precision, but avoid one Python/VTK call per coordinate and quad.
         points = vtk.vtkPoints()
         num_rows, num_cols = x.shape
-
-        # Map grid indices to point IDs
-        point_ids = -np.ones((num_rows, num_cols), dtype=int)
-        for i in range(num_rows):
-            for j in range(num_cols):
-                point_ids[i, j] = points.InsertNextPoint(x[i, j], y[i, j], z[i, j])
-
-        # Create cells (quads) for the surface
-        # Only include a quad if all four of its vertices lie inside aperture
+        coordinates = np.column_stack((x.ravel(), y.ravel(), z.ravel()))
+        points.SetData(numpy_to_vtk(coordinates.astype(np.float32), deep=True))
+        point_ids = np.arange(num_rows * num_cols, dtype=np.int64).reshape(x.shape)
+        mask = np.asarray(be.to_numpy(mask), dtype=bool)
+        inside = mask[:-1, :-1] & mask[1:, :-1] & mask[1:, 1:] & mask[:-1, 1:]
+        quads = np.column_stack(
+            (
+                point_ids[:-1, :-1][inside],
+                point_ids[1:, :-1][inside],
+                point_ids[1:, 1:][inside],
+                point_ids[:-1, 1:][inside],
+            )
+        ).ravel()
+        offsets = np.arange(0, len(quads) + 1, 4, dtype=np.int64)
         cells = vtk.vtkCellArray()
-        for i in range(num_rows - 1):
-            for j in range(num_cols - 1):
-                # Check the four corners of the cell.
-                if (
-                    mask[i, j]
-                    and mask[i + 1, j]
-                    and mask[i + 1, j + 1]
-                    and mask[i, j + 1]
-                ):
-                    quad = vtk.vtkQuad()
-                    quad.GetPointIds().SetId(0, point_ids[i, j])
-                    quad.GetPointIds().SetId(1, point_ids[i + 1, j])
-                    quad.GetPointIds().SetId(2, point_ids[i + 1, j + 1])
-                    quad.GetPointIds().SetId(3, point_ids[i, j + 1])
-                    cells.InsertNextCell(quad)
+        cells.SetData(
+            numpy_to_vtkIdTypeArray(offsets, deep=True),
+            numpy_to_vtkIdTypeArray(quads, deep=True),
+        )
 
         polydata = vtk.vtkPolyData()
         polydata.SetPoints(points)
