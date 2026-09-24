@@ -284,14 +284,18 @@ def _component_kind(component: BaseComponent) -> str:
         component: A scene surface.
 
     Returns:
-        One of ``"refractive"``, ``"reflective"``, ``"absorbing"``.
+        One of ``"refractive"``, ``"reflective"``, ``"absorbing"``,
+        ``"paraxial"``.
 
     Raises:
-        TypeError: If the component type is not one of the three known
+        TypeError: If the component type is not one of the known
             interaction kinds.
     """
     from optiland.nonsequential.components.absorbing import (
         AbsorbingComponent,  # noqa: PLC0415
+    )
+    from optiland.nonsequential.components.paraxial import (
+        ParaxialLensComponent,  # noqa: PLC0415
     )
     from optiland.nonsequential.components.reflective import (
         ReflectiveComponent,  # noqa: PLC0415
@@ -306,6 +310,8 @@ def _component_kind(component: BaseComponent) -> str:
         return "reflective"
     if isinstance(component, AbsorbingComponent):
         return "absorbing"
+    if isinstance(component, ParaxialLensComponent):
+        return "paraxial"
     raise TypeError(
         f"No scene-IR lowering registered for component type "
         f"{type(component).__name__}."
@@ -520,6 +526,9 @@ def lower(scene: NSQScene, *, strict: bool = True) -> SceneIR:
     primitives = []
     for i, component in enumerate(scene.surfaces):
         kind, params = _lower_geometry(component.geometry)
+        if _component_kind(component) == "paraxial":
+            # The ideal lens's one parameter of its own, beside the plane's.
+            params = {**params, "focal_length": component.focal_length}
         primitives.append(
             PrimitiveIR(
                 id=i,

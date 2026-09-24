@@ -273,6 +273,10 @@ def _serialize_component(name: str, compound: Any) -> dict:
     from optiland.nonsequential.components.doublet import Doublet  # noqa: PLC0415
     from optiland.nonsequential.components.lens import Lens  # noqa: PLC0415
     from optiland.nonsequential.components.mirror import Mirror  # noqa: PLC0415
+    from optiland.nonsequential.components.paraxial import (  # noqa: PLC0415
+        ParaxialLens,
+    )
+    from optiland.nonsequential.components.prism import Prism  # noqa: PLC0415
 
     cs = compound._cs
     config = compound._config
@@ -341,10 +345,42 @@ def _serialize_component(name: str, compound: Any) -> dict:
             },
         }
 
+    if isinstance(compound, Prism):
+        # As for a lens, per-surface overrides (SurfaceConfig) are not part
+        # of the round trip.
+        return {
+            "type": "prism",
+            "name": name,
+            "cs": _serialize_cs(cs),
+            "config": {
+                "apex_angle_deg": _to_float(config.apex_angle_deg),
+                "face_length": _to_float(config.face_length),
+                "length": _to_float(config.length),
+                "material": _serialize_material(config.material),
+                "open_base": bool(config.open_base),
+            },
+        }
+
+    if isinstance(compound, ParaxialLens):
+        return {
+            "type": "paraxial_lens",
+            "name": name,
+            "cs": _serialize_cs(cs),
+            "config": {
+                "focal_length": _to_float(config.focal_length),
+                "aperture_radius": _to_float(config.aperture_radius),
+                "stop_radius": (
+                    _to_float(config.stop_radius)
+                    if config.stop_radius is not None
+                    else None
+                ),
+            },
+        }
+
     raise TypeError(
         f"Cannot serialize component '{name}' of type "
-        f"'{type(compound).__name__}'. Only Lens, Mirror, and Doublet are "
-        "supported for round-trip serialization."
+        f"'{type(compound).__name__}'. Only Lens, Mirror, Doublet, Prism and "
+        "ParaxialLens are supported for round-trip serialization."
     )
 
 
@@ -362,6 +398,8 @@ def _deserialize_component(d: dict, scene: NSQScene) -> None:
         DoubletConfig,
         LensConfig,
         MirrorConfig,
+        ParaxialLensConfig,
+        PrismConfig,
     )
 
     ctype = d["type"]
@@ -407,10 +445,28 @@ def _deserialize_component(d: dict, scene: NSQScene) -> None:
         )
         scene.add_doublet(name, cs, config)
 
+    elif ctype == "prism":
+        config = PrismConfig(
+            apex_angle_deg=cfg_d["apex_angle_deg"],
+            face_length=cfg_d["face_length"],
+            length=cfg_d["length"],
+            material=_deserialize_material(cfg_d["material"]),
+            open_base=cfg_d.get("open_base", False),
+        )
+        scene.add_prism(name, cs, config)
+
+    elif ctype == "paraxial_lens":
+        config = ParaxialLensConfig(
+            focal_length=cfg_d["focal_length"],
+            aperture_radius=cfg_d["aperture_radius"],
+            stop_radius=cfg_d.get("stop_radius"),
+        )
+        scene.add_paraxial_lens(name, cs, config)
+
     else:
         raise ValueError(
             f"Unknown component type '{ctype}' in NSQ JSON. "
-            "Expected 'lens', 'mirror', or 'doublet'."
+            "Expected 'lens', 'mirror', 'doublet', 'prism' or 'paraxial_lens'."
         )
 
 

@@ -25,7 +25,10 @@ PrimitiveKind = Literal[
 # any BsdfIR scatter overlay. A future BSDF-lobe rework could fold
 # refractive/reflective/absorbing into BsdfIR itself, at which point this
 # field would become redundant -- it has not been folded in yet.
-ComponentKind = Literal["refractive", "reflective", "absorbing"]
+# "paraxial" is the ideal thin lens: a plane that deflects every ray by the
+# thin-lens law in its slopes, with no Fresnel branch; its focal length is
+# carried in PrimitiveIR.params["focal_length"] beside the plane's own.
+ComponentKind = Literal["refractive", "reflective", "absorbing", "paraxial"]
 
 EmitterKind = Literal["point", "collimated", "extended"]
 

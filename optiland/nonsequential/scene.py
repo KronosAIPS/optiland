@@ -27,6 +27,8 @@ if TYPE_CHECKING:
         DoubletConfig,
         LensConfig,
         MirrorConfig,
+        ParaxialLensConfig,
+        PrismConfig,
     )
     from optiland.nonsequential.tracer import SimulationResult
 
@@ -156,6 +158,44 @@ class NSQScene:
         from optiland.nonsequential.components.doublet import Doublet  # noqa: PLC0415
 
         self.component_registry.add(name, Doublet(name, cs, config))
+
+    def add_prism(
+        self,
+        name: str,
+        cs: CoordinateSystem,
+        config: PrismConfig,
+    ) -> None:
+        """Add a prism or wedge to the scene.
+
+        Args:
+            name: Unique name for the prism in the registry.
+            cs: The prism's coordinate system: the apex edge along its local
+                y axis, the apex angle opening toward local -x (see
+                :class:`~optiland.nonsequential.components.configs.PrismConfig`).
+            config: PrismConfig describing the prism.
+        """
+        from optiland.nonsequential.components.prism import Prism  # noqa: PLC0415
+
+        self.component_registry.add(name, Prism(name, cs, config))
+
+    def add_paraxial_lens(
+        self,
+        name: str,
+        cs: CoordinateSystem,
+        config: ParaxialLensConfig,
+    ) -> None:
+        """Add an ideal thin (paraxial) lens to the scene.
+
+        Args:
+            name: Unique name for the lens in the registry.
+            cs: Coordinate system of the lens plane (its local z = 0).
+            config: ParaxialLensConfig: focal length, aperture, optional stop.
+        """
+        from optiland.nonsequential.components.paraxial import (  # noqa: PLC0415
+            ParaxialLens,
+        )
+
+        self.component_registry.add(name, ParaxialLens(name, cs, config))
 
     def add_component(self, name: str, component: BaseComponent) -> None:
         """Add a raw BaseComponent (advanced use).

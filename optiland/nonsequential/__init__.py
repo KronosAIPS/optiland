@@ -245,6 +245,11 @@ from optiland.nonsequential.components import (
     Mirror,
     MirrorConfig,
     NonWatertightVolumeError,
+    ParaxialLens,
+    ParaxialLensComponent,
+    ParaxialLensConfig,
+    Prism,
+    PrismConfig,
     ReflectiveComponent,
     RefractiveComponent,
     SurfaceConfig,
@@ -347,6 +352,7 @@ __all__ = [
     "Spectrum",
     # Components -- raw
     "AbsorbingComponent",
+    "ParaxialLensComponent",
     "RefractiveComponent",
     "ReflectiveComponent",
     # Components -- compound
@@ -360,6 +366,10 @@ __all__ = [
     "Mirror",
     "MirrorConfig",
     "NonWatertightVolumeError",
+    "ParaxialLens",
+    "ParaxialLensConfig",
+    "Prism",
+    "PrismConfig",
     "SurfaceConfig",
     "Volume",
     # Geometry
