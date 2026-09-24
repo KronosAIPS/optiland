@@ -8,7 +8,7 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Union
 
 import numpy as np
@@ -25,6 +25,15 @@ if TYPE_CHECKING:
 WavelengthInput = Union[float, np.ndarray, "torch.Tensor"]
 
 
+def _grad_attached(value) -> bool:
+    """True when ``value`` carries a live autograd graph.
+
+    A plain attribute read (``requires_grad`` on a torch Tensor, absent on
+    everything else) -- never a device-to-host transfer.
+    """
+    return bool(getattr(value, "requires_grad", False))
+
+
 @dataclass
 class NSQMaterial:
     """Thin differentiable adapter over optiland.materials.BaseMaterial.
@@ -33,6 +42,32 @@ class NSQMaterial:
     (no ``float()``, no ``np.asarray()``) so the result stays in the
     autograd graph when using the Torch backend.
 
+    ``n()``/``k()`` additionally memoize their result against the identity
+    of the ``wavelength_um`` object most recently seen (one slot per
+    property, not a general cache). ``optiland.materials.BaseMaterial``
+    itself must re-inspect its live parameters and the wavelength array's
+    content on every call -- issue #630 upstream, still fixed there --
+    which on the Torch backend costs one host synchronization per call (the
+    uniformity probe and the mutable-state fingerprint both read a tensor's
+    value back to the host). That correctness fix is upstream's and stays
+    untouched; the cost it added is paid here only once per *distinct*
+    wavelength array object rather than once per bounce.
+
+    This is sound because, within nsq's own usage, it is: a ray bundle's
+    ``wavelength`` field is only ever replaced by slicing into a *new*
+    array (``NSQRayBundle`` never writes into it in place -- masking,
+    compaction and backend promotion all construct a fresh array), so the
+    same wavelength array object recurs, unchanged, across every bounce
+    that runs on an unchanged ray-state buffer (a "steady" bounce -- see
+    ``tests/nonsequential/test_nsq_host_reads.py``), and a fresh trace
+    always samples a brand-new wavelength array (``Spectrum.sample``
+    allocates), so no cached result can outlive the material parameters
+    that produced it -- nothing in the bounce loop mutates a material's own
+    state mid-trace. A result that carries a live gradient
+    (``requires_grad``) is never cached, matching ``BaseMaterial``'s own
+    rule, so differentiable material-parameter optimization sees a fresh
+    graph on every call exactly as it does without this cache.
+
     Attributes:
         optiland_material: Underlying material model. None means vacuum (n=1).
         bsdf: Optional surface scatter model.
@@ -40,6 +75,11 @@ class NSQMaterial:
 
     optiland_material: BaseMaterial | None = None
     bsdf: BaseBSDF | None = None
+    # Per-property, one-slot memo: (the wavelength object last seen, the
+    # result computed for it). Excluded from dataclass equality/repr so
+    # NSQMaterial's observable identity is unaffected by this optimization.
+    _n_memo: tuple = field(default=(None, None), repr=False, compare=False)
+    _k_memo: tuple = field(default=(None, None), repr=False, compare=False)
 
     @classmethod
     def from_glass(cls, name: str) -> NSQMaterial:
@@ -86,8 +126,14 @@ class NSQMaterial:
                 return be.ones_like(wavelength_um)
             except (TypeError, AttributeError):
                 return 1.0
+        memo_wavelength, memo_result = self._n_memo
+        if wavelength_um is memo_wavelength:
+            return memo_result
         # Pass wavelength directly -- preserves the grad graph
-        return self.optiland_material.n(wavelength_um)
+        result = self.optiland_material.n(wavelength_um)
+        if not _grad_attached(result):
+            self._n_memo = (wavelength_um, result)
+        return result
 
     def k(self, wavelength_um: WavelengthInput) -> WavelengthInput:
         """Extinction coefficient at the given wavelength(s).
@@ -111,7 +157,13 @@ class NSQMaterial:
                 return be.zeros_like(wavelength_um)
             except (TypeError, AttributeError):
                 return 0.0
-        return self.optiland_material.k(wavelength_um)
+        memo_wavelength, memo_result = self._k_memo
+        if wavelength_um is memo_wavelength:
+            return memo_result
+        result = self.optiland_material.k(wavelength_um)
+        if not _grad_attached(result):
+            self._k_memo = (wavelength_um, result)
+        return result
 
 
 # Module-level vacuum constant
