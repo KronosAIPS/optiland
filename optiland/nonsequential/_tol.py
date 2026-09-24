@@ -44,6 +44,11 @@ Three primitives:
   bare ``1e-30``/``1e-14`` comparison threshold used to decide whether a
   denominator is degenerate.
 
+And two helpers for a value about to be square-rooted: :func:`radicand_min`
+(``k u_T``, below which a radicand is a domain error; the refraction radicand
+uses it) and :func:`radicand_floor` (a float64-calibrated clamp scaled to the
+dtype; the conic and sphere geometries use it).
+
 Two exceptions, both intentional and both flagged where used: a physical
 fraction (a Russian-roulette flux floor, a scatter-branch probability clamp)
 is dtype-independent by definition and stays an absolute constant; and a
@@ -104,6 +109,21 @@ DEFAULT_OFFSET_K_DELTA = 32
 
 # ulp(1) at float64 -- the reference radicand_floor() scales against.
 _ULP1_F64 = 2.220446049250313e-16
+
+# k of docs/theory/08_precision.md section 8.7's radicand row ("reject w < k u_T
+# as a domain error", k = 4), in units of the unit roundoff u_T. Used for the
+# refraction radicand w = 1 - sin^2(theta_t), an O(1) dimensionless quantity
+# whose own resolution is u_T. Near the critical angle w is formed as
+# 1 - r^2 (1 - c^2) (r = n1/n2, c = cos(theta_i)); both subtractions are exact
+# there (Sterbenz), and the three products carry at most (1 + r^2) u_T of
+# absolute error once r is given (3.3 u_T for N-BK7 against vacuum), or
+# (3 + r^2) u_T if the index ratio itself is rounded (5.3 u_T). [derived] k = 4
+# is the theory's integer and sits in that range: below it the sign of w, and
+# so whether a transmitted wave exists at all, is not resolved by the working
+# dtype. It does not cover the error cos(theta_i) brings in from the direction
+# and the normal (2 r^2 c per unit of error in c, 3.5 u_T per ulp of c for
+# N-BK7), which is the incidence angle's own uncertainty, not the formula's.
+DEFAULT_RADICAND_K = 4
 
 
 def ulp(x: ScalarOrArrayT) -> ScalarOrArrayT:
@@ -216,6 +236,55 @@ def origin_offset(
     return (k_delta / 2.0) * ulp(mag)
 
 
+def unit_roundoff(like: ScalarOrArrayT) -> ScalarOrArrayT:
+    """Unit roundoff ``u_T = ulp(1) / 2`` of ``like``'s dtype, in its backend.
+
+    A 0-d array (NumPy) or 0-d tensor (Torch, on ``like``'s device), so it
+    compares against arrays of the same dtype without a host round trip.
+    ``2^-24`` at float32 and ``2^-53`` at float64 (docs/theory/08_precision.md
+    table 8.1).
+
+    Args:
+        like: Any array, tensor or Python float in the working dtype; only
+            its dtype (and device) are read.
+
+    Returns:
+        ``u_T`` as a 0-d array or tensor in ``like``'s dtype.
+    """
+    if is_tensor(like):
+        import torch  # noqa: PLC0415
+
+        one = torch.ones((), dtype=like.dtype, device=like.device)
+    else:
+        one = np.ones((), dtype=np.asarray(like).dtype)
+    return 0.5 * ulp(one)
+
+
+def radicand_min(like: ScalarOrArrayT, k: int = DEFAULT_RADICAND_K) -> ScalarOrArrayT:
+    """Smallest radicand the working dtype resolves as positive, ``k * u_T``.
+
+    docs/theory/08_precision.md section 8.7, the radicand row: a value about
+    to be square-rooted that is below ``k u_T`` is a domain error, not a
+    number to clamp and carry on with. For the refraction radicand
+    ``w = 1 - sin^2(theta_t)`` the domain error is total internal
+    reflection: no transmitted wave is asserted where the dtype cannot tell
+    ``w`` from zero (see ``components.refractive.refraction_cosine``).
+
+    Unlike :func:`radicand_floor`, this does not change the value of any
+    radicand the dtype resolves: it only decides which ones are not there.
+
+    Args:
+        like: The radicand (or anything in its dtype and on its device).
+        k: Multiple of the unit roundoff. Default
+            :data:`DEFAULT_RADICAND_K`.
+
+    Returns:
+        ``k * u_T`` as a 0-d array or tensor in ``like``'s dtype:
+        ``2.38e-7`` at float32, ``4.44e-16`` at float64.
+    """
+    return k * unit_roundoff(like)
+
+
 def tiny_for(dtype_or_array: Any) -> float:
     """Division-guard epsilon safe for the backward pass, for ``dtype``.
 
@@ -278,6 +347,17 @@ def radicand_floor(ones_like_x: ScalarOrArrayT, floor_at_f64: float = 1e-12) -> 
     below the dtype's own resolution at magnitude 1 (float32 epsilon is
     1.19e-7) and so acts as if it were zero -- the sqrt(0) singularity it
     exists to avoid still reaches the backward pass.
+
+    Not for a radicand whose *value* is the physics. At float32 the scaled
+    floor is 5.37e-4, which is 9000 u_T: the refraction radicand
+    ``w = 1 - sin^2(theta_t)`` used to be clamped with it, so ``cos(theta_t)``
+    never fell below 0.0232 and every refraction within 1.33 degrees of
+    grazing was bent and weighted as if it were 1.33 degrees from grazing --
+    measured one millidegree inside the critical angle of N-BK7 against
+    vacuum, a transmittance of 0.124 where float64 reads 0.0373 on the same
+    rays. That radicand now uses :func:`radicand_min` (a domain test that
+    leaves every resolved value alone); the geometry clamps below still use
+    this floor.
 
     Args:
         ones_like_x: An array of ones in the working backend/dtype (e.g.
