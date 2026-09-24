@@ -268,6 +268,175 @@ class TestCylindricalFrustumGeometry:
         # Normal should face the incoming ray (+x side), so nx > 0
         assert normals[0, 0] > 0.9
 
+    def test_axis_parallel_ray_inside_constant_radius_tube_never_hits(self):
+        """Issue #14: a = b = 0 exactly for an axis-parallel ray through a
+        constant-radius tube. The degenerate-quadratic fallback used to
+        return the same spurious t1 = t2 = 0 pair regardless of c, with
+        disc = 0 trivially -- so nothing distinguished a ray that misses the
+        tube from one running along its wall, and a negative (shifted) eps
+        let the spurious t = 0 root through. Even with eps forced negative
+        here (what BaseComponent.intersect's origin advance can produce),
+        a ray strictly inside the tube's radius must never register a hit,
+        at t = 0 or anywhere else.
+        """
+        geom = CylindricalFrustumGeometry(
+            r_front=18.5, r_back=18.5, z_front=0.0, z_back=40.0
+        )
+        origins = np.array([[5.0, 0.0, 0.0]])  # r=5 << r_front=18.5, on the
+        # front plane already (the origin-advance limit)
+        directions = np.array([[0.0, 0.0, 1.0]])
+        t, _, hit, _ = geom.ray_intersect(origins, directions, eps=-1.0)
+        assert not hit[0], "axis-parallel ray inside a constant-radius tube was hit"
+
+    def test_axis_parallel_ray_on_the_wall_is_rejected(self):
+        """Issue #14: the measure-zero case of running exactly along the
+        tube's wall (r == r_front == r_back, so c = 0 too) is rejected --
+        it is never accepted as a hit at t = 0.
+        """
+        geom = CylindricalFrustumGeometry(
+            r_front=18.5, r_back=18.5, z_front=0.0, z_back=40.0
+        )
+        origins = np.array([[18.5, 0.0, 0.0]])
+        directions = np.array([[0.0, 0.0, 1.0]])
+        t, _, hit, _ = geom.ray_intersect(origins, directions, eps=-1.0)
+        assert not hit[0], "ray running along the tube wall was accepted as a hit"
+
+    def test_tapered_frustum_still_uses_the_linear_fallback(self):
+        """Sanity: a genuinely tapered frustum with a small (but nonzero)
+        axial radius change still resolves a near-axial ray through the
+        linear fallback (b not small), unaffected by the a_small gating
+        that fixes the constant-radius case above.
+        """
+        # Slight taper: r_front=5.0 -> r_back=5.1 over 10mm. A ray parallel
+        # to the axis at r=5.05 (inside r_front, outside... ) crosses the
+        # cone wall once.
+        geom = CylindricalFrustumGeometry(
+            r_front=5.0, r_back=6.0, z_front=0.0, z_back=10.0
+        )
+        origins = np.array([[5.5, 0.0, -5.0]])
+        directions = np.array([[0.0, 0.0, 1.0]])
+        t, _, hit, _ = geom.ray_intersect(origins, directions)
+        assert hit[0]
+        # r(z) = 5.0 + 0.1*z = 5.5 at z = 5.0, so t = 5.0 - (-5.0) = 10.0
+        np.testing.assert_allclose(t[0], 10.0, atol=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Issue #14: an absorbing constant-radius tube around an axial beam
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(
+    params=[
+        ("numpy", "float64"),
+        ("numpy", "float32"),
+        ("torch", "float64"),
+        ("torch", "float32"),
+    ],
+    ids=lambda p: f"backend={p[0]},dtype={p[1]}",
+)
+def backend_and_precision(request):
+    """Run a test on both backends and both dtypes, restoring prior state.
+
+    Mirrors the ``each_backend`` fixture of test_nsq_sphere_cavity.py, with
+    precision added as its own axis (issue #14 asks for both backends and
+    both dtypes explicitly).
+    """
+    import optiland.backend as be  # noqa: PLC0415
+
+    backend, precision = request.param
+    previous_backend = be.get_backend()
+    be.set_backend(backend)
+    if backend == "torch":
+        be.set_device("cpu")
+    be.set_precision(precision)
+    yield backend, precision
+    if backend == "torch":
+        be.grad_mode.disable()
+    be.set_backend(previous_backend)
+    be.set_precision("float64")
+
+
+class TestConstantRadiusTubeAxialRay:
+    """Issue #14, end to end through AbsorbingComponent.intersect (the
+    real origin-advance path: BaseComponent.intersect shifts eps by t_adv,
+    which is exactly what let the degenerate root through before the fix).
+    """
+
+    def test_axial_beam_inside_barrel_is_not_absorbed(self, backend_and_precision):
+        import optiland.backend as be  # noqa: PLC0415
+        from optiland.nonsequential import VACUUM, AbsorbingComponent  # noqa: PLC0415
+        from optiland.nonsequential.ray_bundle import NSQRayBundle  # noqa: PLC0415
+
+        comp = AbsorbingComponent(
+            cs=CoordinateSystem(z=0.0),
+            geometry=CylindricalFrustumGeometry(
+                r_front=18.5, r_back=18.5, z_front=0.0, z_back=40.0
+            ),
+            material_front=VACUUM,
+            name="barrel",
+        )
+        n = 25
+        # A small bundle of axis-parallel rays, well inside the tube radius,
+        # starting well in front of the tube -- as in bench/demo_lens_ghosts.py.
+        rng = np.random.default_rng(14)
+        r = 10.0 * np.sqrt(rng.random(n))
+        phi = 2 * np.pi * rng.random(n)
+        rays = NSQRayBundle(
+            x=be.array(r * np.cos(phi)),
+            y=be.array(r * np.sin(phi)),
+            z=be.array(np.full(n, -100.0)),
+            L=be.array(np.zeros(n)),
+            M=be.array(np.zeros(n)),
+            N=be.array(np.ones(n)),
+            flux=be.array(np.ones(n)),
+            wavelength=be.array(np.full(n, 0.55)),
+            n_current=be.array(np.ones(n)),
+            bounce=np.zeros(n, dtype=np.int32),
+            alive=be.array(np.ones(n, dtype=bool)),
+            ray_id=np.arange(n, dtype=np.int64),
+        )
+        t, _normals, hit_mask, _n_geom = comp.intersect(rays)
+        hit_np = np.asarray(hit_mask)
+        assert not np.any(hit_np), (
+            "an axial ray inside a constant-radius absorbing tube was "
+            f"absorbed at its front plane (backend/dtype = {backend_and_precision})"
+        )
+
+    def test_radial_ray_still_hits_the_same_barrel(self, backend_and_precision):
+        """The fix must not turn a genuine radial hit into a miss."""
+        import optiland.backend as be  # noqa: PLC0415
+        from optiland.nonsequential import VACUUM, AbsorbingComponent  # noqa: PLC0415
+        from optiland.nonsequential.ray_bundle import NSQRayBundle  # noqa: PLC0415
+
+        comp = AbsorbingComponent(
+            cs=CoordinateSystem(z=0.0),
+            geometry=CylindricalFrustumGeometry(
+                r_front=18.5, r_back=18.5, z_front=0.0, z_back=40.0
+            ),
+            material_front=VACUUM,
+            name="barrel",
+        )
+        rays = NSQRayBundle(
+            x=be.array(np.array([50.0])),
+            y=be.array(np.array([0.0])),
+            z=be.array(np.array([20.0])),
+            L=be.array(np.array([-1.0])),
+            M=be.array(np.array([0.0])),
+            N=be.array(np.array([0.0])),
+            flux=be.array(np.array([1.0])),
+            wavelength=be.array(np.array([0.55])),
+            n_current=be.array(np.array([1.0])),
+            bounce=np.zeros(1, dtype=np.int32),
+            alive=be.array(np.ones(1, dtype=bool)),
+            ray_id=np.arange(1, dtype=np.int64),
+        )
+        t, _normals, hit_mask, _n_geom = comp.intersect(rays)
+        assert bool(np.asarray(hit_mask)[0])
+        precision = backend_and_precision[1]
+        atol = 1e-3 if precision == "float32" else 1e-6
+        np.testing.assert_allclose(np.asarray(t)[0], 31.5, atol=atol)
+
 
 # ---------------------------------------------------------------------------
 # AnnularPlaneGeometry intersection
