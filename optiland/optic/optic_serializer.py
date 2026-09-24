@@ -97,7 +97,6 @@ class OpticSerializer:
             optic.fields.set_type(data["fields"]["field_type"])
         else:
             optic.fields.field_definition = None
-        optic.obj_space_telecentric = data["fields"]["telecentric"]
 
         optic.paraxial = Paraxial(optic)
         optic.aberrations = Aberrations(optic)

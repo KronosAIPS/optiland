@@ -5,13 +5,19 @@ This section covers Optiland functionality related to reading and writing variou
 
 The ``optiland.fileio`` package handles saving and loading of optical systems. 
 It supports the native Optiland JSON format, as well as Zemax (.zmx), CODE V (.seq), 
-and OSLO (.len) files.
+and OSLO (.len) files
 
 Zemax and CODE V export reject an ``IdealMaterial`` with nonzero extinction
 before opening the destination file, because their current glass encodings do
 not preserve that absorption. Save the native JSON format to retain it.
 The shared writer air classifier requires exactly unit index and zero extinction;
 a small refractive-index difference is still an optical property.
+
+
+.. toctree::
+   :maxdepth: 1
+
+   /oslo_import
 
 .. autosummary::
    :toctree: generated

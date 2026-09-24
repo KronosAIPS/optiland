@@ -10,6 +10,7 @@ Kramer Harrison, 2024
 from __future__ import annotations
 
 import math
+import operator
 from typing import TYPE_CHECKING, Any
 
 from optiland.physical_apertures import OffsetRadialAperture
@@ -69,6 +70,10 @@ class ZemaxFileEncoder:
 
         Returns:
             A list of strings, one per line of the output file.
+
+        Raises:
+            ValueError: If nonempty wavelength data has an explicitly invalid
+                primary index, including None, a non-integer, or an out-of-range value.
         """
         lines: list[str] = []
         self._encode_header(lines)
@@ -147,13 +152,22 @@ class ZemaxFileEncoder:
             _FIELD_TYPE_TO_FTYP.get(fields.get("type", "angle"), 0),
         )
         # FTYP <type> <telecentric> <num_fields> <num_wavelengths> 0 0 0
-        num_wl = self._model.wavelengths.get("num_wavelengths", 1)
+        num_wl = self._model.wavelengths.get(
+            "num_wavelengths", len(self._model.wavelengths.get("data", []))
+        )
         lines.append(f"FTYP {ftyp_int} 0 {n} {num_wl} 0 0 0")
 
     def _encode_wavelengths(self, lines: list[str]) -> None:
         wl_data = self._model.wavelengths
         data = wl_data.get("data", [])
-        primary_index = wl_data.get("primary_index", 0)
+        if len(data) == 0:
+            return
+        try:
+            primary_index = operator.index(wl_data.get("primary_index", 0))
+        except TypeError as exc:
+            raise ValueError("Primary wavelength index must be an integer.") from exc
+        if not 0 <= primary_index < len(data):
+            raise ValueError("Primary wavelength is not present in the active data.")
         for i, w in enumerate(data):
             lines.append(f"WAVM {i + 1} {_fmt(w)} 1")
         lines.append(f"PWAV {primary_index + 1}")

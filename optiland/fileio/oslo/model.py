@@ -1,20 +1,42 @@
 """OSLO Data Model
 
-Defines OsloDataModel, the shared intermediate representation used by both
-the OSLO reader (parser -> model) and writer (optic -> model) paths.
+Defines OsloDataModel, the shared parsed prescription. The reader fills it
+from .len commands before converting it to an Optic; the writer builds it
+from an Optic before formatting .len text.
 
 Kramer Harrison, 2026
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any
+
+
+@dataclass(frozen=True)
+class OsloDiagnostic:
+    """A source-located record of an OSLO command that was not imported."""
+
+    command: str
+    line: int
+    surface: int
+    message: str
+
+
+@dataclass
+class OsloConfiguration:
+    """Declarative differences from configuration 1, with OSLO's one-based slots."""
+
+    thicknesses: dict[int, float] = field(default_factory=dict)
+    wavelengths: dict[int, float] = field(default_factory=dict)
+    wavelength_weights: dict[int, float] = field(default_factory=dict)
+    weight: float = 1.0
+    active: bool = True
 
 
 @dataclass
 class OsloDataModel:
-    """Intermediate representation of an OSLO .len optical system.
+    """Parsed OSLO prescription shared by the reader and writer.
 
     Attributes:
         name: System name from the LEN NEW command.
@@ -39,6 +61,11 @@ class OsloDataModel:
     surfaces: dict[int, dict[str, Any]] = field(default_factory=dict)
     units: float = 1.0
     notes: dict[str, str] = field(default_factory=dict)
+    diagnostics: list[OsloDiagnostic] = field(default_factory=list)
+    settings: dict[str, Any] = field(default_factory=dict)
+    configurations: dict[int, OsloConfiguration] = field(
+        default_factory=lambda: {1: OsloConfiguration()}
+    )
 
     def to_dict(self) -> dict[str, Any]:
         """Return the data model as a plain dictionary.
@@ -47,14 +74,4 @@ class OsloDataModel:
             A plain dict representation suitable for use with
             ``OsloToOpticConverter``.
         """
-        return {
-            "name": self.name,
-            "scaling": self.scaling,
-            "num_surfaces": self.num_surfaces,
-            "aperture": self.aperture,
-            "fields": self.fields,
-            "wavelengths": self.wavelengths,
-            "surfaces": self.surfaces,
-            "units": self.units,
-            "notes": self.notes,
-        }
+        return asdict(self)

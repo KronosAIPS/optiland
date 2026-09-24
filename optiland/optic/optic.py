@@ -104,7 +104,7 @@ class Optic:
         solves (SolveManager): Manages solves, which automatically adjust
             surface properties to meet certain constraints.
         obj_space_telecentric (bool): If True, the system is object-space
-            telecentric. Defaults to False.
+            telecentric. Alias for ``fields.telecentric``. Defaults to False.
 
 
     """
@@ -137,9 +137,22 @@ class Optic:
         self.apodization: BaseApodization | None = None
         self.pickups: PickupManager = PickupManager(self)
         self.solves: SolveManager = SolveManager(self)
-        self.obj_space_telecentric: bool = False
         self.updater: OpticUpdater = OpticUpdater(self)
         self.sequences: dict[str, SequencedOptic] = {}
+
+    @property
+    def obj_space_telecentric(self) -> bool:
+        """Whether object space is telecentric, as stored in the current field group."""
+        return self.fields.telecentric
+
+    @obj_space_telecentric.setter
+    def obj_space_telecentric(self, is_telecentric: bool) -> None:
+        """Set object-space telecentricity on the current field group.
+
+        Args:
+            is_telecentric: Whether the system is telecentric in object space.
+        """
+        self.fields.set_telecentric(is_telecentric)
 
     @property
     def surface_group(self) -> SurfaceGroup:
@@ -772,6 +785,8 @@ class Optic:
         num_rays: int | None = 100,
         distribution: DistributionType | BaseDistribution | None = "hexapolar",
         record: bool = True,
+        *,
+        retain_launch: bool = False,
     ) -> RealRays:
         """Trace a distribution of rays through the optical system.
 
@@ -779,8 +794,9 @@ class Optic:
             Hx: The normalized x field coordinate(s).
             Hy: The normalized y field coordinate(s).
             wavelength (float): The wavelength of the rays in microns.
-            num_rays: The number of rays to trace.
-                Defaults to 100.
+            num_rays (int, optional): The sampling parameter that determines the
+                number of rays in the pupil. Its meaning depends on the value of
+                `distribution`. Defaults to 100.
             distribution:
                 The distribution of rays. Can be a string identifier (e.g.,
                 'hexapolar', 'uniform') or a `BaseDistribution` object.
@@ -790,13 +806,27 @@ class Optic:
                 False roughly halves peak memory and is recommended for very
                 large GPU traces where only the returned rays are needed.
                 Defaults to True.
+            retain_launch: Whether to retain the generated ray state for an
+                analysis. Defaults to False.
 
         Returns:
             RealRays: A `RealRays` object containing the traced rays.
 
+        Notes:
+            The interpretation of the `num_rays` argument depends on the value of
+            `distribution`. For example, if `distribution` is `hexapolar`, `num_rays`
+            specifies the number of rings, whereas when `distribution` is `uniform`, it
+            specifies the total number of rays per axis.
+
         """
         return self.ray_tracer.trace(
-            Hx, Hy, wavelength, num_rays, distribution, record=record
+            Hx,
+            Hy,
+            wavelength,
+            num_rays,
+            distribution,
+            record=record,
+            retain_launch=retain_launch,
         )
 
     def trace_generic(
@@ -806,6 +836,8 @@ class Optic:
         Px: ScalarOrArray,
         Py: ScalarOrArray,
         wavelength: float,
+        *,
+        retain_launch: bool = False,
     ):
         """Trace generic rays through the optical system.
 
@@ -815,12 +847,16 @@ class Optic:
             Px: The normalized x pupil coordinate(s).
             Py: The normalized y pupil coordinate(s).
             wavelength (float): The wavelength of the rays in microns.
+            retain_launch: Whether to retain the generated ray state for an
+                analysis. Defaults to False.
 
         Returns:
             RealRays: A `RealRays` object containing the traced rays.
 
         """
-        return self.ray_tracer.trace_generic(Hx, Hy, Px, Py, wavelength)
+        return self.ray_tracer.trace_generic(
+            Hx, Hy, Px, Py, wavelength, retain_launch=retain_launch
+        )
 
     def plot_surface_sag(
         self,

@@ -7,6 +7,12 @@ importing/exporting Zemax (.zmx) and CODE V Sequential (.seq) files.
 from __future__ import annotations
 
 import warnings
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from optiland.materials import BaseMaterial
 
 from optiland.fileio.codev.reader.converter import CodeVToOpticConverter as _CodeVTC
 from optiland.fileio.codev.writer.exporter import save_codev_file
@@ -46,16 +52,32 @@ def load_codev_file(source: str):
     return _CodeVTC({}).read(source)
 
 
-def load_oslo_file(source: str):
+def load_oslo_file(
+    source: str,
+    *,
+    strict: bool = False,
+    configuration: int = 1,
+    material_overrides: Mapping[str, BaseMaterial] | None = None,
+):
     """Load an OSLO .len file and return an Optic object.
 
     Args:
         source: The path to a local .len file.
-
+        strict: Reject unsupported optical commands and require explicit
+            bindings for every named glass.
+        configuration: One-based OSLO configuration to import as an independent
+            snapshot. Defaults to the base configuration (1).
+        material_overrides: Explicit case-insensitive bindings from OSLO catalog
+            names to verified native materials. These apply only to named catalog
+            references, not direct-index records, and do not change global catalogs.
     Returns:
         An Optic object created from the OSLO file data.
     """
-    return _OsloTC().read(source)
+    return _OsloTC(
+        strict=strict,
+        configuration=configuration,
+        material_overrides=material_overrides,
+    ).read(source)
 
 
 # ---------------------------------------------------------------------------

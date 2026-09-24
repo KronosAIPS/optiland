@@ -11,6 +11,7 @@ from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from optiland._types import ScalarOrArray
     from optiland.paraxial import Paraxial
 
 
@@ -53,7 +54,7 @@ class BaseSystemAperture(ABC):
 
     @property
     @abstractmethod
-    def value(self) -> float:
+    def value(self) -> ScalarOrArray:
         """Raw aperture value as supplied by the user."""
 
     # ── Capability flags ───────────────────────────────────────────────────

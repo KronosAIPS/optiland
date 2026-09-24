@@ -97,6 +97,10 @@ class Material(MaterialFile):
         file, self.material_data = self._retrieve_file()
         super().__init__(file, propagation_model=propagation_model)
 
+    def _cache_state(self) -> tuple | None:
+        """Track the resolved file's optical state; labels do not affect n/k."""
+        return super()._cache_state()
+
     @classmethod
     def _load_dataframe(cls):
         """Load the catalog DataFrame (delegates to MaterialRegistry)."""

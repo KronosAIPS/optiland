@@ -31,6 +31,7 @@ from optiland.paraxial_path import (
     UnsupportedParaxialGeometryError,
 )
 from optiland.rays import RealRays
+from optiland.wavefront import OPD
 
 from .test_folded_paraxial import _finish, folded, retro, straight
 from .test_folded_paraxial_hardening import (
@@ -372,9 +373,9 @@ class TestOddParityAuthorings:
 
 
 class TestMatrixDomainValidation:
-    def test_oblique_powered_mirror_matrix_raises(self, set_test_backend):
+    def test_oblique_powered_mirror_matrix_warns(self, set_test_backend):
         optic = oblique_powered_mirror()
-        with pytest.raises(UnsupportedParaxialGeometryError):
+        with pytest.warns(ParaxialDomainWarning, match="OBLIQUE_POWERED_MIRROR"):
             optic.paraxial.ray_transfer_matrix(1, optic.surfaces.num_surfaces - 1)
 
     def test_tilted_powered_refractive_matrix_raises(self, set_test_backend):
@@ -382,9 +383,9 @@ class TestMatrixDomainValidation:
         with pytest.raises(UnsupportedParaxialGeometryError):
             optic.paraxial.ray_transfer_matrix(1, optic.surfaces.num_surfaces - 1)
 
-    def test_f2_range_rejects_out_of_domain_geometry(self, set_test_backend):
+    def test_f2_range_warns_for_approximate_geometry(self, set_test_backend):
         optic = oblique_powered_mirror()
-        with pytest.raises(UnsupportedParaxialGeometryError):
+        with pytest.warns(ParaxialDomainWarning, match="OBLIQUE_POWERED_MIRROR"):
             optic.paraxial.f2_range(1, optic.surfaces.num_surfaces - 1)
 
     def test_straight_tilted_lens_matrix_warns_advisory(self, set_test_backend):
@@ -829,17 +830,33 @@ class TestTangentSingularityRejection:
         ):
             optic.paraxial.chief_ray()
 
-    def test_wavefront_tilt_correction_is_guarded(self, set_test_backend):
-        from optiland.wavefront.strategy import require_nonsingular_tangent_angles
+    @pytest.mark.parametrize("strategy", ["chief_ray", "centroid", "best_fit"])
+    @pytest.mark.parametrize("axis", ["x", "y"])
+    @pytest.mark.parametrize("angle", [90.0, -90.0, 270.0, -270.0])
+    def test_wavefront_analysis_rejects_singular_angles(
+        self, set_test_backend: None, strategy: str, axis: str, angle: float
+    ) -> None:
+        """Public wavefront analysis rejects singular angular fields."""
+        optic = straight()
+        optic.fields.add(
+            x=angle if axis == "x" else 0.0,
+            y=angle if axis == "y" else 0.0,
+        )
+        field = optic.fields.get_field_coords()[-1]
 
         with pytest.raises(
             UnsupportedParaxialGeometryError, match="SINGULAR_ANGLE_TANGENT"
         ):
-            require_nonsingular_tangent_angles(
-                90.0, operation="wavefront tilt correction"
+            OPD(
+                optic,
+                field,
+                0.55,
+                num_rays=3,
+                distribution="line_y",
+                strategy=strategy,
             )
 
-    @pytest.mark.parametrize("backend", ["numpy", "torch"])
+    @pytest.mark.parametrize("backend", be.list_available_backends())
     def test_boundary_scales_with_backend_precision(self, backend):
         """The rejection width is derived from the active precision: a
         near-pole angle inside the float32 width but far outside the

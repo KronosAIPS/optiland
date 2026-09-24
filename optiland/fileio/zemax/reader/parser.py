@@ -32,13 +32,18 @@ class ZemaxDataParser:
         data_model: The ZemaxDataModel being populated during parsing.
     """
 
-    def __init__(self, filename: str):
+    def __init__(self, filename: str) -> None:
         self.filename = filename
         self.data_model = ZemaxDataModel()
         self._current_surf = -1
         self._current_surf_data: dict[str, Any] = {}
         self._current_aperture_offset = (0.0, 0.0)
-        self._ftyp = None
+        self._declared_field_count: int | None = None
+        self._declared_wavelength_count: int | None = None
+        self._raw_fields: dict[str, list[float]] = {}
+        self._wavelength_slots: dict[int, tuple[float, float]] = {}
+        self._primary_wavelength_slot: int | None = None
+        self._read_config_data(["FTYP"])
 
         # Operand dispatch table — maps operand string to handler method
         self._operand_table = {
@@ -153,11 +158,15 @@ class ZemaxDataParser:
             except ValueError:
                 return default
 
-        # Safety for losely compatible files (e.g: optalix exports)
-        if data == [0]:
-            return
+        # Defaults describe legacy files; only declared non-negative counts
+        # constrain incoming records. In particular, zero is authoritative.
+        field_count = _safe_int(3, -1)
+        wavelength_count = _safe_int(4, -1)
+        self._declared_field_count = field_count if field_count >= 0 else None
+        self._declared_wavelength_count = (
+            wavelength_count if wavelength_count >= 0 else None
+        )
         fields = self.data_model.fields
-        fields["num_fields"] = _safe_int(3, 0)
         fields["type"] = {
             0: "angle",
             1: "object_height",
@@ -165,36 +174,84 @@ class ZemaxDataParser:
             3: "real_image_height",
             4: "theodolite_angle",
         }.get(_safe_int(1, 0), "unsupported")
-        self.data_model.wavelengths["num_wavelengths"] = _safe_int(4, 0)
         fields["object_space_telecentric"] = _safe_int(2, 0) == 1
         fields["afocal_image_space"] = _safe_int(7, 0) == 1
-        # Legacy files may omit XFLN/YFLN entirely (implying a single
-        # on-axis field). Seed defaults so downstream code does not hit
-        # KeyError 'x' / 'y'. Any real XFLN/YFLN lines that follow will
-        # overwrite these.
-        fields.setdefault("x", [0.0])
-        fields.setdefault("y", [0.0])
-        if fields["num_fields"] <= 0:
-            fields["num_fields"] = 1
+        self._sync_fields()
+        self._sync_wavelengths()
+
+    def _read_field_column(self, key: str, data: list[str]) -> None:
+        """Retain the latest full column so later declarations can expand it."""
+        self._raw_fields[key] = [float(v) for v in data[1:]]
+        self._sync_fields()
+
+    def _sync_fields(self) -> None:
+        """Publish bounded columns and align defaults only for omitted axes."""
+        fields = self.data_model.fields
+        for key, values in self._raw_fields.items():
+            fields[key] = values[: self._declared_field_count]
+        num_fields = max(
+            (len(fields[axis]) for axis in ("x", "y") if axis in self._raw_fields),
+            default=1,
+        )
+        if self._declared_field_count is not None:
+            num_fields = min(num_fields, self._declared_field_count)
+        for axis in ("x", "y"):
+            if axis not in self._raw_fields:
+                fields[axis] = [0.0] * num_fields
+        fields["num_fields"] = (
+            num_fields
+            if self._declared_field_count is None
+            else self._declared_field_count
+        )
 
     def _read_x_fields(self, data: list[str]) -> None:
-        n = self.data_model.fields["num_fields"] if self._ftyp else len(data)
-        self.data_model.fields["x"] = [float(v) for v in data[1 : n + 1]]
+        self._read_field_column("x", data)
 
     def _read_y_fields(self, data: list[str]) -> None:
-        n = self.data_model.fields["num_fields"] if self._ftyp else len(data)
-        self.data_model.fields["y"] = [float(v) for v in data[1 : n + 1]]
+        self._read_field_column("y", data)
 
     def _read_wavelength(self, data: list[str]) -> None:
+        """Read wavelength/weight pairs in microns, with indexed WAVM slots."""
+        if data[0] == "WAVL":
+            # Preserve historical token consumption, not the actual WAVL vector
+            # layout. Parsing that layout and WWGT remains deferred.
+            slot = max(self._wavelength_slots, default=0) + 1
+        else:
+            slot = int(data[1])
+        if slot < 1:
+            return
         val = float(data[2])
         weight = float(data[3]) if len(data) > 3 else 1.0
-        n = self.data_model.wavelengths["num_wavelengths"] if self._ftyp else len(data)
-        if len(self.data_model.wavelengths["data"]) < n:
-            self.data_model.wavelengths["data"].append(val)
-            self.data_model.wavelengths["weights"].append(weight)
+        self._wavelength_slots[slot] = (val, weight)
+        self._sync_wavelengths()
 
     def _read_primary_wave(self, data: list[str]) -> None:
-        self.data_model.wavelengths["primary_index"] = int(data[1]) - 1
+        self._primary_wavelength_slot = int(data[1])
+        self._sync_wavelengths()
+
+    def _sync_wavelengths(self) -> None:
+        """Publish active slots in order without losing PWAV slot identity."""
+        slots = [
+            slot
+            for slot in sorted(self._wavelength_slots)
+            if self._declared_wavelength_count is None
+            or slot <= self._declared_wavelength_count
+        ]
+        wavelengths = self.data_model.wavelengths
+        wavelengths["data"] = [self._wavelength_slots[slot][0] for slot in slots]
+        wavelengths["weights"] = [self._wavelength_slots[slot][1] for slot in slots]
+        wavelengths["num_wavelengths"] = (
+            len(slots)
+            if self._declared_wavelength_count is None
+            else self._declared_wavelength_count
+        )
+        if self._primary_wavelength_slot is not None:
+            # A missing slot must not alias another record when holes compact.
+            wavelengths["primary_index"] = (
+                slots.index(self._primary_wavelength_slot)
+                if self._primary_wavelength_slot in slots
+                else None
+            )
 
     def _read_surface(self, data: list[str]) -> None:
         if self._current_surf >= 0:
@@ -343,38 +400,22 @@ class ZemaxDataParser:
         self._current_surf_data[key] = float(data[2])
 
     def _read_field_weights(self, data: list[str]) -> None:
-        n = self.data_model.fields["num_fields"]
-        self.data_model.fields["weights"] = [float(v) for v in data[1 : n + 1]]
+        self._read_field_column("weights", data)
 
     def _read_vignette_decenter_x(self, data: list[str]) -> None:
-        n = self.data_model.fields["num_fields"]
-        self.data_model.fields["vignette_decenter_x"] = [
-            float(v) for v in data[1 : n + 1]
-        ]
+        self._read_field_column("vignette_decenter_x", data)
 
     def _read_vignette_decenter_y(self, data: list[str]) -> None:
-        n = self.data_model.fields["num_fields"]
-        self.data_model.fields["vignette_decenter_y"] = [
-            float(v) for v in data[1 : n + 1]
-        ]
+        self._read_field_column("vignette_decenter_y", data)
 
     def _read_vignette_compress_x(self, data: list[str]) -> None:
-        n = self.data_model.fields["num_fields"]
-        self.data_model.fields["vignette_compress_x"] = [
-            float(v) for v in data[1 : n + 1]
-        ]
+        self._read_field_column("vignette_compress_x", data)
 
     def _read_vignette_compress_y(self, data: list[str]) -> None:
-        n = self.data_model.fields["num_fields"]
-        self.data_model.fields["vignette_compress_y"] = [
-            float(v) for v in data[1 : n + 1]
-        ]
+        self._read_field_column("vignette_compress_y", data)
 
     def _read_vignette_tangent_angle(self, data: list[str]) -> None:
-        n = self.data_model.fields["num_fields"]
-        self.data_model.fields["vignette_tangent_angle"] = [
-            float(v) for v in data[1 : n + 1]
-        ]
+        self._read_field_column("vignette_tangent_angle", data)
 
     def _read_circular_aperture(self, data: list[str]) -> None:
         r_min = float(data[1])
@@ -437,12 +478,12 @@ class ZemaxDataParser:
 
         sorted_items = sorted(unique, key=lambda it: it[1])
 
-        if not sorted_items:
-            return
-
-        unzipped = list(zip(*sorted_items, strict=False))
-        for i, k in enumerate(keys):
-            fields[k] = list(unzipped[i])
+        if sorted_items:
+            unzipped = list(zip(*sorted_items, strict=False))
+            for i, k in enumerate(keys):
+                fields[k] = list(unzipped[i])
+        if self._declared_field_count is None:
+            fields["num_fields"] = len(fields["x"])
 
     def _finalize_surface(self) -> None:
         """Flush the last in-progress surface into the model."""

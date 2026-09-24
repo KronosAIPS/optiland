@@ -13,6 +13,10 @@ import vtk
 import optiland.backend as be
 from optiland.utils import resolve_fields, resolve_wavelengths
 from optiland.visualization.system.ray_bundle import RayBundle
+from optiland.visualization.system.ray_path import (
+    neutral_reference_mask,
+    physical_ray_path,
+)
 from optiland.visualization.system.utils import transform
 
 
@@ -83,6 +87,7 @@ class Rays2D:
         fields_coords = [fp.coord for fp in field_points]
         wavelengths_vals = [wp.value for wp in wl_points]
 
+        self.r_extent = be.zeros(self.optic.surfaces.num_surfaces)
         artists = {}
 
         for i, field in enumerate(fields_coords):
@@ -173,15 +178,38 @@ class Rays2D:
     def _update_surface_extents(self):
         """Updates the extents of the surfaces in the optic's surface group."""
         r_extent_new = be.copy(be.zeros_like(self.r_extent))
+        alive_before = be.ones_like(self.i[0]) > 0
         for i, surf in enumerate(self.optic.surfaces):
             x_surf = self.x[i]
             y_surf = self.y[i]
             z_surf = self.z[i]
 
-            # Convert to local coordinate system
-            x, y, _ = transform(x_surf, y_surf, z_surf, surf, is_global=True)
+            finite_points = (
+                be.isfinite(x_surf) & be.isfinite(y_surf) & be.isfinite(z_surf)
+            )
+            # Replace invalid inputs before rotating them, avoiding inf * 0
+            # warnings. The validity mask still excludes these placeholder hits.
+            x, y, _ = transform(
+                be.where(finite_points, x_surf, 0.0),
+                be.where(finite_points, y_surf, 0.0),
+                be.where(finite_points, z_surf, 0.0),
+                surf,
+                is_global=True,
+            )
 
-            r_extent_new[i] = be.nanmax(be.hypot(x, y))
+            radius = be.hypot(x, y)
+            # Retain the incident hit at the first blocking surface, but never
+            # use an already-extinguished ray's later mathematical coordinates.
+            valid = (
+                alive_before
+                & finite_points
+                & be.isfinite(self.i[i])
+                & (self.i[i] >= 0)
+                & be.isfinite(radius)
+            )
+            if be.size(radius):
+                r_extent_new[i] = be.max(be.where(valid, radius, 0.0))
+            alive_before = alive_before & be.isfinite(self.i[i]) & (self.i[i] > 0)
         self.r_extent = be.fmax(self.r_extent, r_extent_new)
 
     def _plot_lines(
@@ -218,21 +246,8 @@ class Rays2D:
         """
         artists = {}
         bundle_id = f"bundle_{color_idx}"
-        # loop through rays
-        for k in range(self.z.shape[1]):
-            xk = be.to_numpy(self.x[:, k])
-            yk = be.to_numpy(self.y[:, k])
-            zk = be.to_numpy(self.z[:, k])
-            ik = be.to_numpy(self.i[:, k])
-
-            if np.any(ik == 0):
-                if hide_vignetted:
-                    continue
-                first_zero_idx = np.where(ik == 0)[0][0]
-                xk[first_zero_idx + 1 :] = np.nan
-                yk[first_zero_idx + 1 :] = np.nan
-                zk[first_zero_idx + 1 :] = np.nan
-
+        for path in self._iter_physical_paths(hide_vignetted):
+            xk, yk, zk = path.T
             artist, ray_bundle = self._plot_single_line(
                 ax,
                 xk,
@@ -247,6 +262,22 @@ class Rays2D:
             ray_bundle.bundle_id = bundle_id
             artists[artist] = ray_bundle
         return artists
+
+    def _iter_physical_paths(self, hide_vignetted=False):
+        """Yield shared 3D polylines for both display backends."""
+        neutral = neutral_reference_mask(list(self.optic.surfaces))
+        x, y, z, intensity = (
+            be.to_numpy(values) for values in (self.x, self.y, self.z, self.i)
+        )
+        for index in range(z.shape[1]):
+            path = physical_ray_path(
+                np.column_stack((x[:, index], y[:, index], z[:, index])),
+                intensity[:, index],
+                neutral,
+                hide_vignetted=hide_vignetted,
+            )
+            if len(path):
+                yield path
 
     def _plot_single_line(
         self, ax, x, y, z, color_idx, field, linewidth=1, theme=None, projection="YZ"
@@ -331,6 +362,7 @@ class Rays3D(Rays2D):
         fields_coords = [fp.coord for fp in field_points]
         wavelengths_vals = [wp.value for wp in wl_points]
 
+        self.r_extent = be.zeros(self.optic.surfaces.num_surfaces)
         for i, field in enumerate(fields_coords):
             for j, wavelength in enumerate(wavelengths_vals):
                 # if only one field, use different colors for each wavelength
@@ -382,21 +414,8 @@ class Rays3D(Rays2D):
     def _plot_lines(
         self, ax, color_idx, field, linewidth=1, theme=None, hide_vignetted=False
     ):
-        # loop through rays
-        for k in range(self.z.shape[1]):
-            xk = be.to_numpy(self.x[:, k])
-            yk = be.to_numpy(self.y[:, k])
-            zk = be.to_numpy(self.z[:, k])
-            ik = be.to_numpy(self.i[:, k])
-
-            if np.any(ik == 0):
-                if hide_vignetted:
-                    continue
-                first_zero_idx = np.where(ik == 0)[0][0]
-                xk[first_zero_idx + 1 :] = np.nan
-                yk[first_zero_idx + 1 :] = np.nan
-                zk[first_zero_idx + 1 :] = np.nan
-
+        for path in self._iter_physical_paths(hide_vignetted):
+            xk, yk, zk = path.T
             self._plot_single_line(
                 ax, xk, yk, zk, color_idx, field, linewidth, theme=theme
             )

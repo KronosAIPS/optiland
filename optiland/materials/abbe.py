@@ -17,6 +17,8 @@ import warnings
 from abc import ABC, abstractmethod
 from importlib import resources
 
+import numpy as np
+
 import optiland.backend as be
 from optiland.materials.base import BaseMaterial
 
@@ -45,13 +47,26 @@ class AbbePolynomialModel(AbbeModel):
     def __init__(self, index: float, abbe: float):
         self.index = be.array([index])
         self.abbe = be.array([abbe])
+        coefficients_file = resources.files("optiland.database").joinpath(
+            "glass_model_coefficients.npy"
+        )
+        self._fit_coefficients = np.load(str(coefficients_file))
         self._p = self._get_coefficients()
+
+    def _cache_state(self) -> tuple | None:
+        """Track the parameters and fixed polynomial fit used by the wrapper."""
+        return BaseMaterial._state_key(
+            ("polynomial", self.index, self.abbe, self._fit_coefficients)
+        )
 
     def predict_n(self, wavelength: float | be.ndarray) -> float | be.ndarray:
         wavelength = be.array(wavelength)
         if be.any(wavelength < 0.380) or be.any(wavelength > 0.750):
             # This legacy check is preserved
             raise ValueError("Wavelength out of range for this model.")
+        # Recompute the small coefficient vector from live parameters. A stored
+        # derived graph cannot be reused after backward or a parameter update.
+        self._p = self._get_coefficients()
         return be.atleast_1d(be.polyval(self._p, wavelength))
 
     def predict_k(self, wavelength: float | be.ndarray) -> float | be.ndarray:
@@ -59,25 +74,22 @@ class AbbePolynomialModel(AbbeModel):
 
     def _get_coefficients(self):
         # Polynomial fit to the refractive index data
+        index = BaseMaterial._as_backend_array(self.index)
+        abbe = BaseMaterial._as_backend_array(self.abbe)
         X_poly = be.ravel(
             be.array(
                 [
-                    self.index,
-                    self.abbe,
-                    self.index**2,
-                    self.abbe**2,
-                    self.index**3,
-                    self.abbe**3,
+                    index,
+                    abbe,
+                    index**2,
+                    abbe**2,
+                    index**3,
+                    abbe**3,
                 ]
             )
         )
 
-        coefficients_file = str(
-            resources.files("optiland.database").joinpath(
-                "glass_model_coefficients.npy",
-            ),
-        )
-        coefficients = be.load(coefficients_file)
+        coefficients = BaseMaterial._as_backend_array(self._fit_coefficients)
         return be.matmul(X_poly, coefficients)
 
 
@@ -90,6 +102,21 @@ class BuchdahlModel(AbbeModel):
         self.index = be.array([index])
         self.abbe = be.array([abbe])
         self.v1, self.v2, self.v3 = self._calculate_buchdahl_coefficients()
+
+    def _cache_state(self) -> tuple | None:
+        """Track reference convention, live inputs and configurable fitted constants."""
+        return BaseMaterial._state_key(
+            (
+                "buchdahl",
+                self.index,
+                self.abbe,
+                self.WAVE_REF,
+                self.ALPHA,
+                getattr(self, "V1_COEFFS", None),
+                getattr(self, "V2_COEFFS", None),
+                getattr(self, "V3_COEFFS", None),
+            )
+        )
 
     @property
     @abstractmethod
@@ -104,6 +131,7 @@ class BuchdahlModel(AbbeModel):
 
     def predict_n(self, wavelength: float | be.ndarray) -> float | be.ndarray:
         wavelength = be.array(wavelength)
+        self.v1, self.v2, self.v3 = self._calculate_buchdahl_coefficients()
 
         # Calculate Buchdahl coordinate omega
         # omega = (lambda - lambda_d) / (1 + alpha * (lambda - lambda_d))
@@ -112,7 +140,10 @@ class BuchdahlModel(AbbeModel):
 
         # Buchdahl polynomial: n = nd + v1*w + v2*w^2 + v3*w^3
         n_pred = (
-            self.index + self.v1 * omega + self.v2 * (omega**2) + self.v3 * (omega**3)
+            BaseMaterial._as_backend_array(self.index)
+            + self.v1 * omega
+            + self.v2 * (omega**2)
+            + self.v3 * (omega**3)
         )
 
         return be.atleast_1d(n_pred)
@@ -155,8 +186,8 @@ class BuchdahlDModel(BuchdahlModel):
     ]
 
     def _calculate_buchdahl_coefficients(self):
-        nd = self.index
-        vd = self.abbe
+        nd = BaseMaterial._as_backend_array(self.index)
+        vd = BaseMaterial._as_backend_array(self.abbe)
         inv_v = 1.0 / vd
         inv_v2 = 1.0 / (vd**2)
         nd_sq = nd**2
@@ -193,8 +224,8 @@ class BuchdahlEModel(BuchdahlModel):
     WAVE_REF = 0.546074
 
     def _calculate_buchdahl_coefficients(self):
-        ne = self.index
-        ve = self.abbe
+        ne = BaseMaterial._as_backend_array(self.index)
+        ve = BaseMaterial._as_backend_array(self.abbe)
 
         inv_v = 1.0 / ve
         inv_v2 = 1.0 / (ve**2)
@@ -229,7 +260,48 @@ class BuchdahlEModel(BuchdahlModel):
         return v1, v2, v3
 
 
-class AbbeMaterial(BaseMaterial):
+class _AbbeMaterialParameters:
+    """Expose model-owned parameters identically through both public wrappers."""
+
+    model: AbbeModel
+
+    @property
+    def index(self):
+        """The model's live reference-line refractive index."""
+        return self.model.index
+
+    @index.setter
+    def index(self, value):
+        self.model.index = value
+
+    @property
+    def abbe(self):
+        """The model's live Abbe number in its reference-line convention."""
+        return self.model.abbe
+
+    @abbe.setter
+    def abbe(self, value):
+        self.model.abbe = value
+
+    def _model_cache_state(self) -> tuple | None:
+        if type(self.model) not in (
+            AbbePolynomialModel,
+            BuchdahlDModel,
+            BuchdahlEModel,
+        ):
+            return None
+        return self.model._cache_state()
+
+    def _calculate_n(self, wavelength, **kwargs):
+        """Evaluate the selected model from its authoritative parameters."""
+        return self.model.predict_n(wavelength)
+
+    def _calculate_k(self, wavelength, **kwargs):
+        """Evaluate extinction through the existing Abbe model contract."""
+        return self.model.predict_k(wavelength)
+
+
+class AbbeMaterial(_AbbeMaterialParameters, BaseMaterial):
     """Represents a material based on the refractive index and Abbe number.
 
     This class serves as a wrapper around specific model implementations.
@@ -253,8 +325,6 @@ class AbbeMaterial(BaseMaterial):
 
     def __init__(self, n, abbe, model=None):
         super().__init__()
-        self.index = be.array([n])
-        self.abbe = be.array([abbe])
 
         if model is None:
             warnings.warn(
@@ -279,13 +349,9 @@ class AbbeMaterial(BaseMaterial):
                 f"Unknown model: {model}. Valid options: 'polynomial', 'buchdahl'"
             )
 
-    def _calculate_n(self, wavelength, **kwargs):
-        """Returns the refractive index of the material."""
-        return self.model.predict_n(wavelength)
-
-    def _calculate_k(self, wavelength, **kwargs):
-        """Returns the extinction coefficient of the material."""
-        return self.model.predict_k(wavelength)
+    def _cache_state(self) -> tuple | None:
+        """Track the selected d-line model's authoritative parameters."""
+        return self._model_cache_state()
 
     def to_dict(self):
         """Returns a dictionary representation of the material."""
@@ -311,7 +377,7 @@ class AbbeMaterial(BaseMaterial):
         return cls(data["index"], data["abbe"], model=model)
 
 
-class AbbeMaterialE(BaseMaterial):
+class AbbeMaterialE(_AbbeMaterialParameters, BaseMaterial):
     """Represents a material based on the refractive index and Abbe number at e-line.
 
     This class uses a Buchdahl 3-term model fitted to e-line (546.07 nm) data.
@@ -329,17 +395,11 @@ class AbbeMaterialE(BaseMaterial):
 
     def __init__(self, n, abbe):
         super().__init__()
-        self.index = be.array([n])
-        self.abbe = be.array([abbe])
         self.model = BuchdahlEModel(n, abbe)
 
-    def _calculate_n(self, wavelength, **kwargs):
-        """Returns the refractive index of the material."""
-        return self.model.predict_n(wavelength)
-
-    def _calculate_k(self, wavelength, **kwargs):
-        """Returns the extinction coefficient of the material."""
-        return self.model.predict_k(wavelength)
+    def _cache_state(self) -> tuple | None:
+        """Track the e-line model's authoritative parameters."""
+        return self._model_cache_state()
 
     def to_dict(self):
         """Returns a dictionary representation of the material."""

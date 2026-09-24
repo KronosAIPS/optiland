@@ -37,7 +37,7 @@ class FieldGroup:
     def __init__(self):
         self.fields = []
         self.field_definition: BaseFieldDefinition | None = None
-        self.telecentric = False
+        self.telecentric: bool = False
 
     def require_definition(self) -> BaseFieldDefinition:
         """Return the field definition, or raise if none has been set.
@@ -231,12 +231,11 @@ class FieldGroup:
         """
         self.fields.pop(field_number)
 
-    def set_telecentric(self, is_telecentric):
-        """Specify whether the system is telecentric in object space.
+    def set_telecentric(self, is_telecentric: bool) -> None:
+        """Set the object-space telecentric state stored by this group.
 
         Args:
-            is_telecentric (bool): Whether the system is telecentric in object
-                space.
+            is_telecentric: Whether the system is telecentric in object space.
 
         """
         self.telecentric = is_telecentric

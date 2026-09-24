@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import optiland.backend as be
+from optiland.aperture import ObjectNAAperture
 from optiland.fields.field_types import AngleField
 from optiland.paraxial_path import (
     UnsupportedParaxialGeometryError,
@@ -94,8 +95,8 @@ class ParaxialRayAimer(BaseRayAimer):
 
         if self.optic.obj_space_telecentric:
             self._check_telecentric_compatibility()
-            # The telecentric launch construction below displaces along
-            # global z and lays pupil offsets in global x/y; it is only
+            # The telecentric launches below use global +z as their axis
+            # and global x/y for pupil offsets; this construction is only
             # valid while the beam enters along +z. Reject other entries
             # rather than silently constructing invalid targets.
             path = self.optic.surfaces.build_paraxial_path()
@@ -107,6 +108,18 @@ class ParaxialRayAimer(BaseRayAimer):
                     "telecentric construction is not yet implemented. Real "
                     "ray tracing remains available."
                 )
+            if isinstance(self.optic.aperture, ObjectNAAperture):
+                # Share the aperture's NA = n*sin(theta) conversion, reference
+                # wavelength and validation with its EPD calculation.
+                sine = self.optic.aperture.object_space_sine(self.optic)
+                # Work directly with directions to avoid a target at 1/sine.
+                # Normalization retains the existing slope-based pupil sampling.
+                L = Px * vx * sine
+                M = Py * vy * sine
+                N = be.ones_like(Px) * be.sqrt(1 - sine**2)
+                norm = be.sqrt(L**2 + M**2 + N**2)
+                return x0, y0, z0, L / norm, M / norm, N / norm
+
             sin = self.optic.aperture.value
             z = be.sqrt(1 - sin**2) / sin + z0
             z1 = be.full_like(Px, z)

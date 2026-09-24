@@ -343,6 +343,27 @@ class SurfaceGroup:
         return transverse_basis(direction)
 
     @property
+    def obliquity(self):
+        """np.array: cosine between each surface's normal and the axis reaching it.
+
+        Converts paraxial heights (perpendicular to the axis) to apertures in the
+        surface's own plane; the axis reflects at each mirror, so folds measure local.
+        """
+        axis = be.array([0.0, 0.0, 1.0])
+        cosines = []
+        for surf in self.surfaces:
+            _, rot = surf.geometry.cs.get_effective_transform()
+            normal = be.matmul(rot, be.array([0.0, 0.0, 1.0]))
+            normal = normal / be.sqrt(be.sum(normal * normal))
+            projection = be.sum(axis * normal)
+            cosines.append(be.abs(projection))
+            if surf.interaction_model.is_reflective:
+                axis = axis - 2 * projection * normal
+        # Saturate past cos(80 deg): an edge-on surface intercepts no paraxial beam,
+        # and the unbounded 1 / cos would inflate any aperture taken from it.
+        return be.clip(be.array(cosines), 0.17364817766693033, 1.0)
+
+    @property
     def radii(self):
         """np.array: radii of curvature of all surfaces"""
         return be.array([surf.geometry.radius for surf in self.surfaces])
@@ -416,7 +437,9 @@ class SurfaceGroup:
                 "required. Add surfaces with lens.add_surface(...)."
             )
         z = self.positions[1:]
-        return be.max(z) - be.min(z)
+        # max(z) - min(z). be.max/be.min detach to Python scalars under torch,
+        # which would cut the total_track operand out of the autograd graph.
+        return be.nanmax(z) + be.nanmax(-z)
 
     @property
     def global_z_span(self):
