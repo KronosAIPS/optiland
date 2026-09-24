@@ -74,6 +74,8 @@ class NSQScene:
         )
 
         self.sampling_policy = SamplingPolicy()
+        # Deposition tallies (optiland.nonsequential.deposition): name -> tally.
+        self.deposition_tallies: dict = {}
 
     @property
     def surfaces(self) -> list[BaseComponent]:
@@ -262,6 +264,46 @@ class NSQScene:
         detector = _build_detector(cs, config)
         self.detector_registry.add(name, detector)
 
+    def add_deposition_tally(
+        self,
+        name: str,
+        component: str,
+        kind: str = "rz",
+        bounds: tuple = (),
+        shape: tuple = (),
+        origin: tuple = (0.0, 0.0, 0.0),
+        axis: tuple = (0.0, 0.0, 1.0),
+    ) -> None:
+        """Tally the bulk power a component absorbs on a grid.
+
+        The map lands in ``SimulationResult.deposition[name]`` as power per
+        bin (W) and per unit volume (W/mm^3). See
+        :mod:`optiland.nonsequential.deposition` for how a loss is placed.
+
+        Args:
+            name: Unique name of the tally.
+            component: Registry name of the component whose bulk loss is
+                tallied.
+            kind: ``"xyz"`` or ``"rz"``.
+            bounds: ``(x0, x1, y0, y1, z0, z1)`` or ``(r0, r1, z0, z1)``, mm.
+            shape: ``(nx, ny, nz)`` or ``(nr, nz)``.
+            origin: A point on the axis of an ``rz`` grid, mm.
+            axis: The axis direction of an ``rz`` grid.
+        """
+        from optiland.nonsequential.deposition import DepositionTally  # noqa: PLC0415
+
+        if name in self.deposition_tallies:
+            raise ValueError(f"a deposition tally named {name!r} already exists")
+        if component not in self.component_names:
+            raise ValueError(
+                f"deposition tally {name!r}: no component named {component!r}; "
+                f"components: {self.component_names}"
+            )
+        self.deposition_tallies[name] = DepositionTally(
+            name=name, component=component, kind=kind, bounds=tuple(bounds),
+            shape=tuple(shape), origin=tuple(origin), axis=tuple(axis),
+        )
+
     def remove_component(self, name: str) -> None:
         """Remove a compound component by name.
 
@@ -435,6 +477,12 @@ class NSQScene:
             raise ValueError("Scene has no sources. Add at least one source.")
         if not self.detector_registry.detectors:
             raise ValueError("Scene has no detectors. Add at least one detector.")
+        for tally in getattr(self, "deposition_tallies", {}).values():
+            if tally.component not in self.component_names:
+                raise ValueError(
+                    f"deposition tally {tally.name!r} names component "
+                    f"{tally.component!r}, which the scene no longer holds"
+                )
 
 
 def _resolve_total_flux(config) -> float:

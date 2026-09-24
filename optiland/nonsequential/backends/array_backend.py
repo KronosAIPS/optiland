@@ -40,6 +40,11 @@ from optiland.nonsequential._utils import (
 )
 from optiland.nonsequential.backends.base import TracerBackend
 from optiland.nonsequential._tally import Tally
+from optiland.nonsequential.deposition import (
+    ComponentBook,
+    absorbed_by_component,
+    surface_owners,
+)
 from optiland.nonsequential.detectors.dispatch import intersect_detectors
 from optiland.nonsequential.diagnostics import build_diagnostics
 from optiland.nonsequential.ir.interpreter import apply_primitive_interactions
@@ -454,6 +459,17 @@ class ArrayBackend(TracerBackend):
         # per-surface hit counter of ch. 10 R-10-6).
         hit_counts = Tally.vector(len(scene.surfaces))
         split_budget_saturated = False
+        # Bulk loss per surface that ended the segment (grouped into
+        # components after the trace), and the deposition tallies with the
+        # flat surface indices each tally's component owns.
+        component_book = ComponentBook(len(scene.surfaces))
+        owners = surface_owners(scene)
+        tallies = []
+        for tally in getattr(scene, "deposition_tallies", {}).values():
+            tally.reset()
+            owned = np.zeros(len(scene.surfaces) + 1, dtype=bool)   # last slot: no surface
+            owned[[i for i, o in enumerate(owners) if o == tally.component]] = True
+            tallies.append((tally, owned))
 
         # Hoisted out of the bounce loop: the scene's bounding box does not
         # change during a trace, and rebuilding it every bounce was O(S) of
@@ -576,6 +592,18 @@ class ArrayBackend(TracerBackend):
                         total_flux_bulk_absorbed.add(
                             be.sum(flux_before - rays.flux)
                         )
+                        component_book.add(
+                            flux_before - rays.flux,
+                            comp_idx,
+                            comp_first,
+                            det_first,
+                            rays.medium_depth,
+                        )
+                        if tallies:
+                            self._deposit(
+                                tallies, rays, flux_before, hit_t, alpha,
+                                comp_idx, comp_first,
+                            )
 
                     # --- detector recording -----------------------------
                     for di, det in enumerate(scene.detectors):
@@ -910,9 +938,41 @@ class ArrayBackend(TracerBackend):
             flux_conservation_error=flux_err,
             trace_time_sec=t_end - t_start,
             ray_paths=ray_paths,
+            absorbed_by_component=absorbed_by_component(
+                scene, component_book.values()
+            ),
+            deposition={t.name: t.result() for t, _ in tallies},
             diagnostics=diagnostics,
             reflection_histograms=reflection_histograms,
         )
+
+    @staticmethod
+    def _deposit(tallies, rays, flux_before, hit_t, alpha, comp_idx, comp_first) -> None:
+        """Hand this bounce's absorbing segments to the deposition tallies.
+
+        A segment is tallied when it ends on a surface of the tally's
+        component and was travelled inside a medium (stack depth above zero),
+        the same rule that books it to that component. Read on the host: one
+        device-to-host copy per bounce while a tally is registered.
+        """
+        idx = np.asarray(to_numpy(comp_idx), dtype=np.int64)
+        ends = np.asarray(to_numpy(comp_first), dtype=bool) & (
+            np.asarray(to_numpy(rays.medium_depth)) > 0
+        )
+        f0 = np.asarray(to_numpy(flux_before), dtype=np.float64)
+        # alpha is in 1/um and hit_t in mm: 1/um * 1e3 = 1/mm
+        att = np.asarray(to_numpy(alpha), dtype=np.float64) * 1e3
+        length = np.asarray(to_numpy(hit_t), dtype=np.float64)
+        lossy = ends & (att > 0.0) & (f0 > 0.0)
+        if not lossy.any():
+            return
+        start = np.column_stack([np.asarray(to_numpy(c), dtype=np.float64) for c in (rays.x, rays.y, rays.z)])
+        dirs = np.column_stack([np.asarray(to_numpy(c), dtype=np.float64) for c in (rays.L, rays.M, rays.N)])
+        safe_idx = np.where(idx >= 0, idx, -1)
+        for tally, owned in tallies:
+            m = lossy & owned[safe_idx]
+            if m.any():
+                tally.deposit(start[m], dirs[m], length[m], f0[m], att[m])
 
     def _continue_bounce(
         self, rays: NSQRayBundle, depth: int, max_depth: int
