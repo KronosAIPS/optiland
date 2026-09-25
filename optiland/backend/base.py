@@ -177,6 +177,36 @@ class AbstractBackend(ABC):
         """Return True if this backend can use GPU acceleration."""
         return False
 
+    @property
+    def exact_complex_sqrt(self) -> bool:
+        """Whether the native complex square root is exact to the working precision.
+
+        True when the library's own complex ``sqrt`` returns the principal root
+        to a few units of roundoff in *both* parts, including a part that is
+        small beside the other (the imaginary part of the root of
+        ``5 + 0.0005j``, the real part of the root of ``-4 + 0.001j``). A
+        backend on which it is not answers False, and :meth:`csqrt` then forms
+        the root from real operations instead.
+        """
+        return True
+
+    def csqrt(self, z: Any) -> Any:
+        """Principal complex square root, exact on every device of the backend.
+
+        Where :attr:`exact_complex_sqrt` holds this is the library's own
+        ``sqrt``, unchanged. Code that takes the square root of a complex
+        argument whose one part may be small beside the other (the layer
+        cosines of a thin-film stack with an absorbing layer) calls this
+        instead of :meth:`sqrt`.
+
+        Args:
+            z: Complex input.
+
+        Returns:
+            The principal square root of ``z``.
+        """
+        return self.sqrt(z)
+
     # ------------------------------------------------------------------
     # Precision
     # ------------------------------------------------------------------

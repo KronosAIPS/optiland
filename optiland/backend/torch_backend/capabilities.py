@@ -21,6 +21,53 @@ if TYPE_CHECKING:
     from optiland.backend.torch_backend.config import GradMode
 
 
+#: Device types whose native complex square root is not exact. On Apple's
+#: ``mps`` device (torch 2.14.0, and MLX 0.32.2 on the same GPU) the root of an
+#: argument whose imaginary part is small beside its real part comes back with
+#: that imaginary part wrong or zero: sqrt(5 + 0.0005j) returns 2.2360680 + 0j
+#: where the root is 2.2360680 + 1.1180e-4j, and sqrt(5 + 0.005j) returns an
+#: imaginary part 2.3 percent low. The real part of sqrt(-4 + 0.001j) is lost
+#: the same way. Every other complex operation checked there (cos, sin, exp,
+#: products, quotients, abs) is within a few float32 roundoffs of float64.
+#: Measured on an Apple silicon GPU, 2026-09-24/25.
+_INEXACT_COMPLEX_SQRT_DEVICES = frozenset({"mps"})
+
+
+def csqrt_from_reals(z: Tensor) -> Tensor:
+    """Principal complex square root formed from real operations.
+
+    The half-angle form that never subtracts two nearly equal numbers: with
+    ``r = |z| = hypot(a, b)`` and ``t = sqrt((r + |a|) / 2)``, the root is
+    ``t + i b / (2t)`` for ``a >= 0`` and ``|b| / (2t) + i copysign(t, b)``
+    for ``a < 0``. The part that is small beside the other is a quotient, not
+    a difference, so it keeps its relative precision. For ``z = 0`` the root is
+    ``0 + i b`` with ``b``'s own sign of zero, which is what the principal
+    branch gives. A real non-negative argument returns exactly ``sqrt(a)``,
+    and a real negative one exactly ``i sqrt(-a)`` with the sign of its zero
+    imaginary part, as the native root does.
+
+    Every step is an ordinary differentiable operation; the quotient's
+    denominator is replaced by 1 where ``t`` is zero, so no branch that is
+    not taken carries ``0/0`` into a reverse pass.
+
+    Args:
+        z: Complex tensor (complex64 or complex128), any device.
+
+    Returns:
+        The principal square root of ``z``, same dtype and device.
+    """
+    a = z.real
+    b = z.imag
+    r = torch.hypot(a, b)
+    t = torch.sqrt((r + torch.abs(a)) * 0.5)
+    positive = t > 0
+    q = b / (2.0 * torch.where(positive, t, torch.ones_like(t)))
+    right = a >= 0
+    re = torch.where(right, t, torch.abs(q))
+    im = torch.where(right, q, torch.copysign(t, b))
+    return torch.complex(re, im)
+
+
 class CapabilitiesMixin:
     """Identity, capability flags, overrides, and precision."""
 
@@ -46,6 +93,40 @@ class CapabilitiesMixin:
     def supports_gpu(self) -> bool:
         """Return True if CUDA is available."""
         return torch.cuda.is_available()
+
+    @property
+    def exact_complex_sqrt(self) -> bool:
+        """False on a device whose native complex square root is not exact.
+
+        The configured device's type against
+        :data:`_INEXACT_COMPLEX_SQRT_DEVICES` (Apple's ``mps``); True on
+        ``cpu`` and ``cuda``.
+        """
+        return str(self._config.get_device()) not in _INEXACT_COMPLEX_SQRT_DEVICES
+
+    def csqrt(self, z: Any) -> Tensor:
+        """Principal complex square root, exact on every device.
+
+        The native ``torch.sqrt`` on a tensor whose device type computes it
+        exactly, so ``cpu`` and ``cuda`` results are unchanged to the bit;
+        :func:`csqrt_from_reals` on one that does not (``mps``). The rule is
+        the tensor's own device type, the same set
+        :attr:`exact_complex_sqrt` reads for the configured device, so a
+        tensor that is on ``mps`` is protected whatever the configuration.
+
+        Args:
+            z: Complex input.
+
+        Returns:
+            Tensor: The principal square root of ``z``.
+        """
+        if (
+            isinstance(z, torch.Tensor)
+            and z.is_complex()
+            and z.device.type in _INEXACT_COMPLEX_SQRT_DEVICES
+        ):
+            return csqrt_from_reals(z)
+        return self.sqrt(z)
 
     # ------------------------------------------------------------------
     # Capability-gated overrides (torch has real implementations)

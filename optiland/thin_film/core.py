@@ -39,6 +39,12 @@ def _snell_cos(n0, theta0, n):
     Calculation follows 'Thin-Film Optical Filters, Fifth Edition, Macleod,
     Hugh Angus CRC Press, Ch2.6.
 
+    The root is taken with ``be.csqrt``: in an absorbing layer the argument's
+    imaginary part (``-2 n k``) is small beside its real part, and on a backend
+    whose native complex root loses such a part (Apple's ``mps``; see
+    ``exact_complex_sqrt``) the layer's attenuation would vanish. Where the
+    native root is exact, ``be.csqrt`` is that root, unchanged.
+
     Args:
         n0 (complex): Incident medium complex refractive index.
         theta0 (float): Angle of incidence in radians.
@@ -49,7 +55,7 @@ def _snell_cos(n0, theta0, n):
     """
     nr = n.real
     k = n.imag
-    return be.sqrt(nr**2 - k**2 - (n0 * be.sin(theta0)) ** 2 - 2j * nr * k) / n
+    return be.csqrt(nr**2 - k**2 - (n0 * be.sin(theta0)) ** 2 - 2j * nr * k) / n
 
 
 def _admittance(n: complex, cos_t: complex, pol: PolSP):
