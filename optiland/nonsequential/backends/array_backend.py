@@ -51,7 +51,7 @@ from optiland.nonsequential.path_recording import (  # noqa: F401
     PathRecorder,
 )
 from optiland.nonsequential.ray_bundle import NSQRayBundle
-from optiland.nonsequential.rng import EventSlot, NSQRng
+from optiland.nonsequential.rng import EventSlot, NSQRng, uniform_bits
 from optiland.nonsequential.sampling import russian_roulette
 
 if TYPE_CHECKING:
@@ -632,18 +632,27 @@ class ArrayBackend(TracerBackend):
 
         Returns:
             The array library, the device, the working precision and the
-            generator kernel that drew the trace's random numbers.
+            generator kernel that drew the trace's random numbers; at
+            float32 also ``uniform_bits``, the number of the generator's 32
+            output bits its uniforms are made of (24 since issue 62 of the
+            research repository: the top 24 bits times 2**-24, so no draw is
+            1.0). At float64 the key is absent: the uniform is the whole
+            32-bit output times 2**-32, as in every record made before the
+            key existed.
         """
         try:
             device = str(be.get_device())
         except (AttributeError, BackendCapabilityError):
             device = "cpu"
-        return {
+        env: dict[str, object] = {
             "array_backend": be.get_backend(),
             "device": device,
             "precision": f"float{be.get_precision()}",
             "rng_kernel": getattr(self.rng, "kernel", be.get_backend()),
         }
+        if be.get_precision() == 32:
+            env["uniform_bits"] = uniform_bits(32)
+        return env
 
     # ------------------------------------------------------------------
     # Shared per-bounce pieces
