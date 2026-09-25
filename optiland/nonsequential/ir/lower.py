@@ -145,7 +145,7 @@ def _lower_geometry(geometry: object) -> tuple[str, dict[str, Any]]:
     from optiland.nonsequential import kinds  # noqa: PLC0415
 
     try:
-        spec = kinds.GEOMETRIES.for_object(geometry)
+        spec = kinds.GEOMETRIES.for_object(geometry, any_ancestor=True)
     except TypeError:
         raise TypeError(
             "No scene-IR lowering registered for geometry type "
@@ -172,7 +172,7 @@ def _lower_bsdf(bsdf: object | None) -> BsdfIR:
     if bsdf is None:
         return BsdfIR(kind="none")
     try:
-        spec = kinds.BSDFS.for_object(bsdf)
+        spec = kinds.BSDFS.for_object(bsdf, any_ancestor=True)
     except TypeError:
         raise TypeError(
             f"No scene-IR lowering registered for BSDF type {type(bsdf).__name__}."
@@ -260,7 +260,7 @@ def _lower_source(
     from optiland.nonsequential import kinds  # noqa: PLC0415
 
     try:
-        spec = kinds.SOURCES.for_object(source)
+        spec = kinds.SOURCES.for_object(source, any_ancestor=True)
     except TypeError:
         raise TypeError(
             "No scene-IR lowering registered for source type "
@@ -300,7 +300,7 @@ def _lower_detector(idx: int, detector: object) -> SensorIR:
     from optiland.nonsequential import kinds  # noqa: PLC0415
 
     try:
-        spec = kinds.DETECTORS.for_object(detector)
+        spec = kinds.DETECTORS.for_object(detector, any_ancestor=True)
     except TypeError:
         raise TypeError(
             "No scene-IR lowering registered for detector type "

@@ -261,18 +261,28 @@ class KindRegistry:
             )
         return spec
 
-    def for_object(self, obj: Any) -> KindSpec:
+    def for_object(self, obj: Any, *, any_ancestor: bool = False) -> KindSpec:
         """The spec of a live object: its exact class, else the nearest
         registered ancestor whose spec accepts subclasses.
+
+        Args:
+            obj: The live object.
+            any_ancestor: Accept the nearest registered ancestor whatever its
+                spec says. The lowering the backends make before every trace
+                uses it: that description only drives dispatch, and a subclass
+                of a built-in kind (a test's source that replays given rays, a
+                user's detector with an extra plot) has always traced as its
+                parent. Serialization never does: a subclass written as its
+                parent would come back without its own state.
 
         Raises:
             TypeError: If no spec handles ``type(obj)``.
         """
         _ensure_builtins()
-        spec = self._lookup_cls(type(obj))
+        spec = self._lookup_cls(type(obj), any_ancestor)
         if spec is None:
             load_plugins()
-            spec = self._lookup_cls(type(obj))
+            spec = self._lookup_cls(type(obj), any_ancestor)
         if spec is None:
             raise TypeError(
                 f"No {self.family} kind is registered for type "
@@ -281,14 +291,14 @@ class KindRegistry:
             )
         return spec
 
-    def _lookup_cls(self, cls: type) -> KindSpec | None:
+    def _lookup_cls(self, cls: type, any_ancestor: bool = False) -> KindSpec | None:
         spec = self._by_cls.get(cls)
         if spec is not None:
             return spec
         for ancestor in cls.__mro__[1:]:
             spec = self._by_cls.get(ancestor)
             if spec is not None:
-                return spec if spec.accept_subclasses else None
+                return spec if (spec.accept_subclasses or any_ancestor) else None
         return None
 
     # -- the gradient rule ---------------------------------------------------

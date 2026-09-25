@@ -347,3 +347,23 @@ def test_plugin_loaded_from_entry_point_on_first_miss(monkeypatch):
     finally:
         kinds.SOURCES.unregister("test_ring")
         monkeypatch.setattr(kinds, "_plugins_loaded", True)
+
+
+def test_unregistered_subclass_still_traces_as_its_parent():
+    """The lowering before a trace keeps the old dispatch (a test's source that
+    replays given rays subclasses a built-in source); only the serializer refuses."""
+    from optiland.nonsequential import CollimatedSource  # noqa: PLC0415
+
+    class Replay(CollimatedSource):
+        pass
+
+    scene = NSQScene()
+    scene.source_registry.add(
+        "S", Replay(CoordinateSystem(), Spectrum.monochromatic(0.55), 1.0, aperture_radius=1.0)
+    )
+    scene.add_detector("D", CoordinateSystem(z=5.0), IrradianceDetectorConfig(width=4.0, height=4.0))
+    assert lower(scene, strict=False).emitters[0].kind == "collimated"
+    result = scene.trace(num_rays=200, seed=1)
+    assert float(to_numpy(result.detectors["D"].total_flux)) == pytest.approx(1.0, rel=1e-12)
+    with pytest.raises(TypeError, match="Replay"):
+        scene_to_dict(scene)
