@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, Literal
 import torch
 import torch.nn.functional as F
 
+from optiland.backend.torch_backend.capabilities import to_device_dtype
+
 if TYPE_CHECKING:
     from torch import Tensor
 
@@ -34,9 +36,9 @@ class InterpolationMixin:
         Returns:
             Tensor: Interpolated values.
         """
-        x = torch.as_tensor(x, dtype=self._dtype(), device=self._device())
-        xp = torch.as_tensor(xp, dtype=self._dtype(), device=self._device())
-        fp = torch.as_tensor(fp, dtype=self._dtype(), device=self._device())
+        x = to_device_dtype(x, self._device(), self._dtype())
+        xp = to_device_dtype(xp, self._device(), self._dtype())
+        fp = to_device_dtype(fp, self._device(), self._dtype())
         sorted_indices = torch.argsort(xp)
         xp = xp[sorted_indices]
         fp = fp[sorted_indices]
@@ -71,7 +73,7 @@ class InterpolationMixin:
         Hx, Hy = self.array(Hx), self.array(Hy)
         Hx, Hy = torch.broadcast_tensors(Hx, Hy)
         q_flat = torch.stack([Hx, Hy], dim=-1).reshape(-1, 2)
-        d = torch.cdist(q_flat, points.to(dtype=q_flat.dtype, device=q_flat.device))
+        d = torch.cdist(q_flat, to_device_dtype(points, q_flat.device, q_flat.dtype))
         idx = d.argmin(dim=1)
         vals = values.view(points.shape[0], -1)
         out = vals[idx].view(*Hx.shape, -1)

@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from optiland.backend.torch_backend.capabilities import to_device_dtype
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -284,7 +286,7 @@ class CreationMixin:
         x_t = self.array(x)
         if isinstance(fill_value, torch.Tensor):
             ones = torch.ones_like(x_t, device=self._device(), dtype=self._dtype())
-            return ones * fill_value.to(device=self._device(), dtype=self._dtype())
+            return ones * to_device_dtype(fill_value, self._device(), self._dtype())
         return torch.full_like(
             x_t,
             fill_value,
@@ -362,7 +364,7 @@ class CreationMixin:
             dtype = _NP_TO_TORCH[dtype]
         elif hasattr(dtype, "type") and dtype.type in _NP_TO_TORCH:
             dtype = _NP_TO_TORCH[dtype.type]
-        return torch.as_tensor(x, device=self._device(), dtype=dtype)
+        return to_device_dtype(x, self._device(), dtype)
 
     def load(self, filename: str) -> Tensor:
         """Load a NumPy file and convert to a tensor.

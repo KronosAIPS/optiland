@@ -233,3 +233,77 @@ class TestLossyLayerOnTheAppleGpu:
         R32, T32 = _lossy_layer_rt(k, "torch", "float32", "cpu")
         assert np.max(np.abs(R32 - R64)) <= self.WINDOW
         assert np.max(np.abs(T32 - T64)) <= self.WINDOW
+
+
+# Float32 values (ordinary, negative, tiny normal, near the float32 maximum);
+# widening float32 to float64 is exact, so "intact" is bit equality with the
+# float32 values widened on the CPU.
+_KNOWN = [1.5, 2.5, -3.25, 2.0**-100, 3.0e38]
+
+
+class TestHostCopy:
+    """A device tensor lands intact in a float64 host tensor, on every conversion path.
+
+    ``to_device_dtype`` moves a tensor that leaves its device to the host in its
+    own dtype and casts it there. The paths through it: the backend's
+    ``to_tensor``, ``cast``, ``asarray``, ``atleast_1d``/``atleast_2d``,
+    ``full_like`` with a tensor fill value, ``interp``, ``copy_to``, and the
+    detectors' accumulation into a host buffer.
+    """
+
+    def test_on_one_device_the_helper_is_the_plain_conversion(self):
+        from optiland.backend.torch_backend.capabilities import to_device_dtype
+
+        x = torch.tensor(_KNOWN, dtype=torch.float32, requires_grad=True)
+        y = to_device_dtype(x, "cpu", torch.float64)
+        assert torch.equal(y, x.to(torch.float64))
+        y.sum().backward()  # still on x's graph
+        assert torch.equal(x.grad, torch.ones_like(x))
+        assert to_device_dtype(x, None, None) is x
+        arr = np.asarray(_KNOWN)
+        assert torch.equal(to_device_dtype(arr, "cpu", torch.float32),
+                           torch.as_tensor(arr, dtype=torch.float32, device="cpu"))
+
+    @needs_mps
+    def test_a_known_mps_tensor_lands_intact_in_a_float64_cpu_tensor(self):
+        from optiland.backend.torch_backend.capabilities import to_device_dtype
+
+        expected = torch.tensor(_KNOWN, dtype=torch.float32).to(torch.float64)
+        for dtype in (torch.float32, torch.int32, torch.bool):
+            x = torch.tensor(_KNOWN, dtype=torch.float32).to(dtype).to("mps")
+            want = expected.to(dtype).to(torch.float64)
+            assert torch.equal(to_device_dtype(x, "cpu", torch.float64), want), dtype
+        z = torch.tensor(_KNOWN, dtype=torch.complex64, device="mps")
+        assert torch.equal(to_device_dtype(z, "cpu", torch.complex128), expected.to(torch.complex128))
+
+    @needs_mps
+    def test_control_the_one_call_copy_writes_zeros(self):
+        """The defect itself, on this torch. If this starts failing, torch has
+        fixed it and the fence (and this control) can be dated and retired."""
+        x = torch.tensor(_KNOWN, dtype=torch.float32, device="mps")
+        assert float(x.to("cpu", torch.float64).abs().sum()) == 0.0
+
+    @needs_mps
+    def test_every_backend_conversion_path_keeps_the_values(self, torch_backend_state):
+        from optiland.nonsequential.detectors.base import _accumulate_into
+
+        expected = torch.tensor(_KNOWN, dtype=torch.float32).to(torch.float64)
+        x = torch.tensor(_KNOWN, dtype=torch.float32, device="mps")
+        be.set_backend("torch")
+        be.set_device("cpu")
+        be.set_precision("float64")
+        assert torch.equal(be.to_tensor(x), expected)
+        assert torch.equal(be.cast(x), expected)
+        assert torch.equal(be.asarray(x), expected)
+        assert torch.equal(be.atleast_1d(x), expected)
+        assert torch.equal(be.atleast_2d(x)[0], expected)
+        filled = be.full_like(torch.zeros(3, dtype=torch.float64), x[0])
+        assert torch.equal(filled, torch.full((3,), 1.5, dtype=torch.float64))
+        grid = torch.tensor([0.0, 1.0, 2.0, 3.0, 4.0], device="mps")
+        assert torch.equal(be.interp(grid, grid, x), expected)
+        dest = torch.zeros(len(_KNOWN), dtype=torch.float64)
+        be.copy_to(x, dest)
+        assert torch.equal(dest, expected)
+        buf = torch.zeros(len(_KNOWN), dtype=torch.float64)
+        _accumulate_into(buf, np.arange(len(_KNOWN)), x)
+        assert torch.equal(buf, expected)

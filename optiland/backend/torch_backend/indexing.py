@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import torch
 
+from optiland.backend.torch_backend.capabilities import to_device_dtype
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -36,7 +38,7 @@ class IndexingMixin:
         """
         if not isinstance(x, torch.Tensor):
             return torch.tensor(x, device=self._device(), dtype=self._dtype())
-        return x.to(device=self._device(), dtype=self._dtype())
+        return to_device_dtype(x, self._device(), self._dtype())
 
     def is_array_like(self, x: Any) -> bool:
         """Return True if x is a tensor, ndarray, list, or tuple.
@@ -175,7 +177,7 @@ class IndexingMixin:
         Returns:
             Tensor: At least 1-D tensor.
         """
-        t = torch.as_tensor(x, dtype=self._dtype(), device=self._device())
+        t = to_device_dtype(x, self._device(), self._dtype())
         return t.unsqueeze(0) if t.ndim == 0 else t
 
     def atleast_2d(self, x: Any) -> Tensor:
@@ -187,7 +189,7 @@ class IndexingMixin:
         Returns:
             Tensor: At least 2-D tensor.
         """
-        t = torch.as_tensor(x, dtype=self._dtype(), device=self._device())
+        t = to_device_dtype(x, self._device(), self._dtype())
         if t.ndim == 0:
             return t.unsqueeze(0).unsqueeze(0)
         if t.ndim == 1:

@@ -145,11 +145,16 @@ def _accumulate_into(buffer, flat_np, contribution) -> None:
     if is_torch_tensor(buffer):
         import torch  # noqa: PLC0415
 
+        from optiland.backend.torch_backend.capabilities import (  # noqa: PLC0415
+            to_device_dtype,
+        )
+
         idx = _flat_index_like(buffer, flat_np)
-        if is_torch_tensor(contribution):
-            src = contribution.to(dtype=buffer.dtype)
-        else:
-            src = torch.as_tensor(contribution, dtype=buffer.dtype, device=buffer.device)
+        # Onto the buffer's device, then into its dtype: a device tensor
+        # bound for a float64 host buffer is moved before it is cast (the
+        # one-call copy from Apple's mps writes zeros there). On one device
+        # this is the plain cast it always was.
+        src = to_device_dtype(contribution, buffer.device, buffer.dtype)
         if buffer.dtype == torch.float32:
             _grouped_index_add_(buffer, idx, src)
         else:

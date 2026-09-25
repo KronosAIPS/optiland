@@ -33,6 +33,42 @@ if TYPE_CHECKING:
 _INEXACT_COMPLEX_SQRT_DEVICES = frozenset({"mps"})
 
 
+def to_device_dtype(x: Any, device: Any, dtype: torch.dtype | None) -> Tensor:
+    """``torch.as_tensor(x, dtype=dtype, device=device)``, moving before casting.
+
+    torch 2.14.0 on Apple's ``mps`` device writes **zeros**, without an error,
+    when one call both moves a tensor to the CPU and casts it to a type the
+    device does not have: ``x_mps.to("cpu", torch.float64)``,
+    ``torch.as_tensor(x_mps, dtype=torch.float64, device="cpu")`` and
+    ``cpu_f64.copy_(x_mps)`` all return ``[0, 0, ...]``, for float64 and
+    complex128 destinations and every source dtype (float32, integer, bool);
+    ``x_mps.cpu().to(torch.float64)`` is right. (Upstream pytorch issue 197715,
+    a 2.14 regression; measured on an Apple silicon GPU on 2026-09-24/25.)
+
+    So a tensor that leaves a device for the host is copied to the host first,
+    in its own dtype, and cast there. Every other case -- a tensor staying on its
+    device, a host tensor going to a device, a non-tensor -- is the one-call
+    conversion it always was, so no result changes on the CPU or CUDA: a cast
+    after the copy rounds exactly as a cast before it.
+
+    Args:
+        x: A tensor or anything ``torch.as_tensor`` accepts.
+        device: Target device (a string or ``torch.device``); ``None`` keeps
+            a tensor's own device.
+        dtype: Target dtype; ``None`` keeps a tensor's own dtype.
+
+    Returns:
+        Tensor: ``x`` on ``device`` in ``dtype``, attached to ``x``'s autograd
+        graph when ``x`` is on one.
+    """
+    if not isinstance(x, torch.Tensor):
+        return torch.as_tensor(x, dtype=dtype, device=device)
+    target = x.device if device is None else torch.device(device)
+    if target.type == "cpu" and x.device.type != "cpu":
+        x = x.to(device=target)
+    return x.to(device=target, dtype=dtype)
+
+
 def csqrt_from_reals(z: Tensor) -> Tensor:
     """Principal complex square root formed from real operations.
 
@@ -210,12 +246,21 @@ class CapabilitiesMixin:
     def copy_to(self, source: Tensor, destination: Tensor) -> None:
         """In-place copy from source to destination tensor.
 
-        Safely handles tensors that require gradients.
+        Safely handles tensors that require gradients. A device tensor copied
+        into a host tensor is moved to the host first and cast there
+        (:func:`to_device_dtype`: the one-call copy writes zeros from
+        ``mps`` into a float64 host tensor).
 
         Args:
             source: Source tensor.
             destination: Destination tensor (modified in place).
         """
+        if (
+            isinstance(source, torch.Tensor)
+            and destination.device.type == "cpu"
+            and source.device.type != "cpu"
+        ):
+            source = source.to(device=destination.device)
         if destination.requires_grad:
             destination.data.copy_(source)
         else:
@@ -239,7 +284,7 @@ class CapabilitiesMixin:
         current_precision = self._config.get_precision()
         if not isinstance(data, torch.Tensor):
             return torch.tensor(data, device=current_device, dtype=current_precision)
-        return data.to(device=current_device, dtype=current_precision)
+        return to_device_dtype(data, current_device, current_precision)
 
     def get_bilinear_weights(
         self, coords: Tensor, bin_edges: Sequence[Tensor]
