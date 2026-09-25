@@ -102,14 +102,19 @@ class SpectralDetector(BaseDetector):
         self.num_pixels_y = int(num_pixels_y)
         self.splat = splat
         self.splat_sigma = float(splat_sigma)
-        self.wavelength_bins = np.asarray(wavelength_bins, dtype=np.float64)
+        # The edges are held on the host, as float64, and uploaded once per
+        # trace by ``table``. They may arrive as a backend array on a device
+        # (the scene builder makes them with ``be.linspace``), which NumPy
+        # cannot read directly: move them to the host first, then widen, so
+        # a CPU array keeps exactly the values it had.
+        self.wavelength_bins = np.asarray(to_numpy(wavelength_bins), dtype=np.float64)
         if self.wavelength_bins.min() > _MAX_PLAUSIBLE_WAVELENGTH_UM:
             raise ValueError(
                 f"wavelength_bins must be in µm, but the smallest bin edge is "
                 f"{self.wavelength_bins.min():g}. Values this large look like "
                 f"nanometres - divide by 1000 (e.g. 550 nm -> 0.55)."
             )
-        n_lambda = len(wavelength_bins) - 1
+        n_lambda = len(self.wavelength_bins) - 1
         self._n_lambda = n_lambda
 
         # Flat accumulation buffer: shape (ny * nx * n_lambda,). The widest
