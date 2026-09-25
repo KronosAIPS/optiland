@@ -141,6 +141,20 @@ class TestTheOption:
         assert TorchBackend(compile_step="cpu", compile_options=_TRACED)._bounce_step(None) is not bounce_body
 
 
+class TestSplittingRunsTheEagerBounce:
+    def test_a_splitting_trace_runs_the_eager_body_and_says_so(self, torch_state):
+        """Bounded splitting reads its rows on the host and grows the bundle
+        inside the bounce; a trace that splits runs the eager body."""
+        be.set_precision("float64")
+        backend = TorchBackend(compile_step=True, compile_options=_TRACED, allow_splitting=True)
+        splitting_ctx = types.SimpleNamespace(allocator=lambda n: np.arange(n))
+        assert backend._bounce_step(splitting_ctx) is bounce_body
+        assert backend.compiled_step_active is False
+        plain_ctx = types.SimpleNamespace(allocator=None)
+        assert backend._bounce_step(plain_ctx) is not bounce_body
+        assert backend.compiled_step_active is True
+
+
 class TestForwardOnly:
     def test_refused_in_gradient_mode(self, torch_state):
         be.set_precision("float64")

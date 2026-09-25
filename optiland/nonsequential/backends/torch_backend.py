@@ -298,7 +298,11 @@ class TorchBackend(ArrayBackend):
             the compilation. The loop around the step -- the alive check,
             compaction, the splitting merge -- is unchanged. The numbers
             are the eager loop's to within float32 rounding, not to the bit:
-            the generated kernels fuse and reorder the arithmetic.
+            the generated kernels fuse and reorder the arithmetic. A trace
+            that splits rays (``allow_splitting=True`` and a
+            ``split_depth``) runs the eager bounce, whose splitting reads
+            its rows on the host; ``compiled_step_active`` says, after each
+            trace, which bounce ran.
         compile_options: Options for the compiler (see
             :func:`compiled_bounce_body`); on ``mps``,
             ``max_fusion_unique_io_buffers`` defaults to
@@ -357,6 +361,8 @@ class TorchBackend(ArrayBackend):
             else _normalise_compile_step(compile_step)
         )
         self.compile_options = dict(compile_options or {})
+        # Whether the last trace ran the compiled step (see _bounce_step).
+        self.compiled_step_active = False
 
     def _compiles_here(self) -> bool:
         """Whether this trace runs the compiled step, on the active device."""
@@ -372,7 +378,8 @@ class TorchBackend(ArrayBackend):
         step is :func:`compiled_bounce_body`, called with torch's
         recompilation limit raised to :data:`COMPILE_RECOMPILE_LIMIT` and
         autograd off; a trace in gradient mode is refused, here and again
-        for any bundle that arrives carrying a gradient.
+        for any bundle that arrives carrying a gradient. A trace that splits
+        rays runs the eager body. ``compiled_step_active`` records which.
 
         Args:
             ctx: The trace's bounce context.
@@ -384,7 +391,14 @@ class TorchBackend(ArrayBackend):
             CompiledStepError: With ``compile_step`` on, when gradients are
                 requested (``be.grad_mode``) or a bundle carries one.
         """
+        self.compiled_step_active = False
         if not self._compiles_here():
+            return bounce_body
+        if ctx is not None and ctx.allocator is not None:
+            # Bounded splitting (allow_splitting=True with split_depth > 0)
+            # chooses the rows to split on the host and grows the bundle
+            # inside the bounce, which a compiled program cannot hold: the
+            # trace runs the eager bounce, and says so here.
             return bounce_body
         if self._grad_requested():
             raise CompiledStepError(
@@ -399,6 +413,7 @@ class TorchBackend(ArrayBackend):
             options.setdefault("max_fusion_unique_io_buffers", MPS_MAX_KERNEL_BUFFERS)
             _complete_metal_codegen()
         compiled = compiled_bounce_body(options)
+        self.compiled_step_active = True
 
         def step(backend, ctx, rays):
             if backend._gradient_mode(rays):
