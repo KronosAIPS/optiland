@@ -94,3 +94,42 @@ class ExtendedSourceConfig:
     aperture_radius: float | None = None
     half_angle_deg: float = 90.0
     medium: NSQMaterial | None = field(default=None)
+
+
+@dataclass
+class TabulatedSourceConfig:
+    """Configuration for a TabulatedSource (an angular intensity table).
+
+    Attributes:
+        spectrum: Wavelength distribution (a line ``Spectrum`` or a continuous
+            ``PiecewiseLinearSpectrum``).
+        polar_angles_deg: Polar nodes [deg] from the local +z axis, strictly
+            increasing within [0, 180]; the intensity is zero outside them.
+        intensity: One intensity per polar node (a rotationally symmetric
+            table), or one row per azimuth node and one column per polar node.
+        azimuth_angles_deg: Azimuth nodes [deg] from local +x toward local +y,
+            0 to 360 with the first and last rows equal; ``None`` for a
+            symmetric table.
+        intensity_units: ``"relative"`` (the flux is ``total_flux`` or
+            ``total_flux_lumens``, 1 W if neither is given), ``"W/sr"`` (the
+            flux is the table's integral) or ``"cd"`` (the table's integral is
+            lumens, converted to watts with ``spectrum``).
+        total_flux: Radiant flux [W] of a relative table.
+        total_flux_lumens: Luminous flux [lm] of a relative table.
+        width, height: A rectangular emitting area [mm] in the local x-y plane.
+        aperture_radius: A circular emitting area [mm]; none of the three: a
+            point.
+        medium: Medium the source is embedded in (default: vacuum).
+    """
+
+    spectrum: Spectrum
+    polar_angles_deg: object
+    intensity: object
+    azimuth_angles_deg: object | None = None
+    intensity_units: str = "relative"
+    total_flux: float | None = None
+    total_flux_lumens: float | None = None
+    width: float | None = None
+    height: float | None = None
+    aperture_radius: float | None = None
+    medium: NSQMaterial | None = field(default=None)

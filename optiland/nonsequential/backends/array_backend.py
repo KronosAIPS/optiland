@@ -31,12 +31,14 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 import optiland.backend as be
+from optiland.backend.base import BackendCapabilityError
 from optiland.backend.utils import to_numpy
 from optiland.nonsequential._utils import (
     DEFAULT_BATCH_SIZE,
     distribute_ray_budget,
     estimate_bounding_scale,
     get_detector_names,
+    resident_scalar,
 )
 from optiland.nonsequential.backends.base import TracerBackend
 from optiland.nonsequential._tally import Tally
@@ -49,7 +51,7 @@ from optiland.nonsequential.path_recording import (  # noqa: F401
     PathRecorder,
 )
 from optiland.nonsequential.ray_bundle import NSQRayBundle
-from optiland.nonsequential.rng import EventSlot
+from optiland.nonsequential.rng import EventSlot, NSQRng
 from optiland.nonsequential.sampling import russian_roulette
 
 if TYPE_CHECKING:
@@ -565,6 +567,84 @@ class ArrayBackend(TracerBackend):
         """
         return bounce_body
 
+    def _check_graph_replay(self, scene, ir, record_paths) -> None:
+        """Refuse a replayed bounce where it cannot apply; no-op by default.
+
+        Args:
+            scene: The scene about to be traced.
+            ir: The scene's lowered IR.
+            record_paths: The trace's ``record_paths`` argument.
+        """
+        return
+
+    def _graph_handover_depth(self, rays: NSQRayBundle) -> int | None:
+        """The bounce at which this batch is handed to a replayed graph, if any.
+
+        The default backend replays nothing, and every bounce runs through
+        the loop below.
+
+        Args:
+            rays: The freshly prepared batch.
+
+        Returns:
+            ``None``.
+        """
+        return None
+
+    def _replay_bounces(
+        self, rays, bounce, depth, max_depth, scene, tallies
+    ) -> NSQRayBundle:
+        """Run bounces ``depth .. max_depth - 1`` as a replayed graph.
+
+        Only called for a batch :meth:`_graph_handover_depth` handed over.
+
+        Args:
+            rays: The batch after the eager bounces.
+            bounce: The loop's bounce body, ``bounce(rays, depth) -> rays``.
+            depth: Bounces already run.
+            max_depth: The depth cap.
+            scene: The scene being traced.
+            tallies: The trace's own tallies.
+
+        Returns:
+            The bundle after the last bounce.
+        """
+        raise NotImplementedError
+    def _trace_rng(self, seed: int | None) -> NSQRng:
+        """The keyed generator this trace draws from.
+
+        Called once at the start of every trace. The default keeps the
+        backend's generator unless the trace names a seed, in which case it
+        is rebuilt with that seed. A backend with a choice of generator
+        kernel (the Torch backend's ``rng_kernel``) makes the choice here,
+        where the device is known.
+
+        Args:
+            seed: The trace's seed argument, or None.
+
+        Returns:
+            The generator for this trace.
+        """
+        return self.rng if seed is None else NSQRng(seed)
+
+    def _environment(self) -> dict[str, object]:
+        """What this trace ran on, for ``SimulationResult.environment``.
+
+        Returns:
+            The array library, the device, the working precision and the
+            generator kernel that drew the trace's random numbers.
+        """
+        try:
+            device = str(be.get_device())
+        except (AttributeError, BackendCapabilityError):
+            device = "cpu"
+        return {
+            "array_backend": be.get_backend(),
+            "device": device,
+            "precision": f"float{be.get_precision()}",
+            "rng_kernel": getattr(self.rng, "kernel", be.get_backend()),
+        }
+
     # ------------------------------------------------------------------
     # Shared per-bounce pieces
     # ------------------------------------------------------------------
@@ -676,13 +756,11 @@ class ArrayBackend(TracerBackend):
         from optiland.nonsequential.components.absorbing import (
             AbsorbingComponent,  # noqa: PLC0415
         )
-        from optiland.nonsequential.rng import NSQRng  # noqa: PLC0415
         from optiland.nonsequential.tracer import (
             SimulationResult,  # noqa: PLC0415, I001
         )
 
-        if seed is not None:
-            self.rng = NSQRng(seed)
+        self.rng = self._trace_rng(seed)
 
         # Reset detectors and absorber stats
         for det in scene.detectors:
@@ -714,6 +792,7 @@ class ArrayBackend(TracerBackend):
         for component in scene.surfaces:
             component.refresh_backend_transform()
         self._check_sampling_support(ir)
+        self._check_graph_replay(scene, ir, record_paths)
 
         t_start = time.perf_counter()
 
@@ -750,6 +829,18 @@ class ArrayBackend(TracerBackend):
         # per-surface hit counter of ch. 10 R-10-6).
         hit_counts = Tally.vector(len(scene.surfaces))
         split_budget_saturated = False
+        tallies = (
+            num_rays_escaped,
+            num_rays_flux_killed,
+            num_rays_depth_killed,
+            total_flux_escaped,
+            total_flux_bulk_absorbed,
+            total_flux_depth_killed,
+            total_flux_rr_killed,
+            total_flux_sampling_residual,
+            total_medium_stack_underflows,
+            hit_counts,
+        )
 
         # Hoisted out of the bounce loop: the scene's bounding box does not
         # change during a trace, and rebuilding it every bounce was O(S) of
@@ -834,15 +925,13 @@ class ArrayBackend(TracerBackend):
 
                 depth = 0
                 self._live_count_cache = None
-                while True:
-                    if not self._continue_bounce(rays, depth, max_depth):
-                        break
-                    # Whatever live count was read for this bounce's
-                    # early-exit check described the state *before* the
-                    # bounce body, which is about to change it. Compaction
-                    # at the end of the bounce reads it again, once, and
-                    # that read is the one the next bounce's check reuses.
-                    self._live_count_cache = None
+
+                # One bounce, as a function of the bundle and the bounce
+                # index. The loop below calls it once per bounce; a backend
+                # that replays a recorded bounce (TorchBackend(graph_replay=
+                # ...)) hands it to _replay_bounces, which records it once.
+                def _bounce(rays, depth):
+                    nonlocal split_budget_saturated
 
                     spawned = step(self, ctx, rays)
 
@@ -896,17 +985,40 @@ class ArrayBackend(TracerBackend):
                     # Flush this bounce's medium-stack inconsistency counts
                     # (see RefractiveComponent.interact) into the running
                     # total, then reset so they are counted exactly once
-                    # regardless of subsequent compaction/concat.
+                    # regardless of subsequent compaction/concat. The reset
+                    # writes an integer zero of the field's own dtype: the
+                    # working-float zero it used to write turned the counter
+                    # into floats after the first bounce, and the tally with
+                    # it (issue 60 of the research repository).
                     total_medium_stack_underflows.add(
                         be.sum(rays.medium_stack_underflows)
                     )
+                    underflows = rays.medium_stack_underflows
                     rays.medium_stack_underflows = be.where(
-                        rays.medium_stack_underflows > 0,
-                        be.zeros_like(rays.medium_stack_underflows),
-                        rays.medium_stack_underflows,
+                        underflows > 0,
+                        resident_scalar(self, "underflow_reset", 0, underflows),
+                        underflows,
                     )
 
                     rays = self._maybe_compact(rays, depth)
+                    return rays
+
+                handover = self._graph_handover_depth(rays)
+                while True:
+                    if not self._continue_bounce(rays, depth, max_depth):
+                        break
+                    # Whatever live count was read for this bounce's
+                    # early-exit check described the state *before* the
+                    # bounce body, which is about to change it. Compaction
+                    # at the end of the bounce reads it again, once, and
+                    # that read is the one the next bounce's check reuses.
+                    self._live_count_cache = None
+                    if handover is not None and depth == handover:
+                        rays = self._replay_bounces(
+                            rays, _bounce, depth, max_depth, scene, tallies
+                        )
+                        break
+                    rays = _bounce(rays, depth)
                     depth += 1
                     # A shape, not a value: free on every backend. With
                     # compaction on, a bundle whose last ray has died comes
@@ -1037,6 +1149,7 @@ class ArrayBackend(TracerBackend):
             ray_paths=ray_paths,
             diagnostics=diagnostics,
             reflection_histograms=reflection_histograms,
+            environment=self._environment(),
         )
 
     def _continue_bounce(

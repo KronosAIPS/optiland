@@ -18,7 +18,14 @@ from optiland.nonsequential.ir.medium_ir import MediumIR
 # "mesh" is included for completeness but requires the optional trimesh
 # dependency to round-trip back into a live MeshGeometry.
 PrimitiveKind = Literal[
-    "conic", "plane", "annulus", "frustum", "sphere", "spherical_cavity", "mesh"
+    "conic",
+    "plane",
+    "annulus",
+    "frustum",
+    "sphere",
+    "spherical_cavity",
+    "mesh",
+    "lenslet_array",
 ]
 
 # Which physical interaction a primitive's hit dispatches to, independent of

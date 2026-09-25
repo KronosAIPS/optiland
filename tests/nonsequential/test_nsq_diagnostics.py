@@ -40,14 +40,11 @@ from optiland.nonsequential.components.mirror import Mirror
 from optiland.nonsequential.detectors.irradiance import IrradianceDetector
 from optiland.nonsequential.detectors.spectral import SpectralDetector
 from optiland.nonsequential.diagnostics import DetectorDiagnostic, Diagnostics
-from optiland.nonsequential.scene import (
-    _build_detector,
-    _build_source,
-    _resolve_total_flux,
-)
+from optiland.nonsequential.scene import _resolve_total_flux
 from optiland.nonsequential.sources.configs import (
     ExtendedSourceConfig,
     PointSourceConfig,
+    TabulatedSourceConfig,
 )
 
 # ---------------------------------------------------------------------------
@@ -55,19 +52,44 @@ from optiland.nonsequential.sources.configs import (
 # consumed somewhere in the live lowering path, or the audit fails.
 # ---------------------------------------------------------------------------
 
+def _kind_builder(config_cls):
+    """The registered builder of the source or detector kind of ``config_cls``."""
+    from optiland.nonsequential import kinds  # noqa: PLC0415
+
+    for registry in (kinds.SOURCES, kinds.DETECTORS):
+        try:
+            return registry.for_config_class(config_cls).build
+        except TypeError:
+            continue
+    raise TypeError(config_cls.__name__)
+
+
 # (config class, [consumer callables whose source is searched])
 _CONFIG_CONSUMERS: list[tuple[type, list[object]]] = [
     (SurfaceConfig, [_make_surface, _resolve_interaction]),
     (LensConfig, [Lens._build]),
     (DoubletConfig, [Doublet._build]),
     (MirrorConfig, [Mirror._build]),
-    (PointSourceConfig, [_build_source, _resolve_total_flux]),
-    (CollimatedSourceConfig, [_build_source, _resolve_total_flux]),
-    (ExtendedSourceConfig, [_build_source, _resolve_total_flux]),
-    (IrradianceDetectorConfig, [_build_detector, IrradianceDetector.record]),
-    (SpectralDetectorConfig, [_build_detector, SpectralDetector.record]),
-    (FarFieldDetectorConfig, [_build_detector]),
-    (RayDatabaseConfig, [_build_detector]),
+    # Sources and detectors are built by their kind's registered builder
+    # (optiland.nonsequential.kinds); _build_source/_build_detector only
+    # dispatch to it, so the builder is where every field must be read.
+    (PointSourceConfig, [_kind_builder(PointSourceConfig), _resolve_total_flux]),
+    (
+        CollimatedSourceConfig,
+        [_kind_builder(CollimatedSourceConfig), _resolve_total_flux],
+    ),
+    (ExtendedSourceConfig, [_kind_builder(ExtendedSourceConfig), _resolve_total_flux]),
+    (TabulatedSourceConfig, [_kind_builder(TabulatedSourceConfig)]),
+    (
+        IrradianceDetectorConfig,
+        [_kind_builder(IrradianceDetectorConfig), IrradianceDetector.record],
+    ),
+    (
+        SpectralDetectorConfig,
+        [_kind_builder(SpectralDetectorConfig), SpectralDetector.record],
+    ),
+    (FarFieldDetectorConfig, [_kind_builder(FarFieldDetectorConfig)]),
+    (RayDatabaseConfig, [_kind_builder(RayDatabaseConfig)]),
 ]
 
 

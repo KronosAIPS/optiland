@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import optiland.backend as be
+from optiland.nonsequential._utils import resident_scalar
 from optiland.nonsequential.rng import EventSlot
 
 if TYPE_CHECKING:
@@ -45,7 +46,9 @@ def detached(value):
     return value
 
 
-def scatter_branch(scatter_fraction, hit_mask, rng: NSQRng, ray_id, bounce):
+def scatter_branch(
+    scatter_fraction, hit_mask, rng: NSQRng, ray_id, bounce, owner=None
+):
     """Draw the BSDF scatter branch, and its compensating weight gate.
 
     Routes a ``scatter_fraction`` of the hit rays into the BSDF lobe and
@@ -61,6 +64,10 @@ def scatter_branch(scatter_fraction, hit_mask, rng: NSQRng, ray_id, bounce):
         rng: Keyed PCG32 RNG.
         ray_id: Per-ray identifiers, shape (N,).
         bounce: Per-ray bounce index as of this event, shape (N,).
+        owner: The surface drawing the branch. When given, two weights that
+            are Python numbers are held on the device on it
+            (:func:`~optiland.nonsequential._utils.resident_scalar`) instead
+            of being uploaded at every call; the values are the same.
 
     Returns:
         ``(scatters, sf_gate)``: the per-ray branch mask, and the per-ray
@@ -77,5 +84,12 @@ def scatter_branch(scatter_fraction, hit_mask, rng: NSQRng, ray_id, bounce):
 
     weight_scatter_branch = sf / sf_det
     weight_nonscatter_branch = (1.0 - sf) / (1.0 - sf_det)
+    if owner is not None and not be.is_torch_tensor(weight_scatter_branch):
+        weight_scatter_branch = resident_scalar(
+            owner, "scatter_weight", weight_scatter_branch, u_scatter
+        )
+        weight_nonscatter_branch = resident_scalar(
+            owner, "scatter_weight", weight_nonscatter_branch, u_scatter
+        )
     sf_gate = be.where(scatters, weight_scatter_branch, weight_nonscatter_branch)
     return scatters, sf_gate

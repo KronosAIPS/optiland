@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 import optiland.backend as be
-from optiland.nonsequential._tally import masked_count
+from optiland.nonsequential._tally import accumulate, masked_count
 from optiland.nonsequential._utils import (
     as_detached_param,
     clamp_int,
@@ -102,14 +102,19 @@ class SpectralDetector(BaseDetector):
         self.num_pixels_y = int(num_pixels_y)
         self.splat = splat
         self.splat_sigma = float(splat_sigma)
-        self.wavelength_bins = np.asarray(wavelength_bins, dtype=np.float64)
+        # The edges are held on the host, as float64, and uploaded once per
+        # trace by ``table``. They may arrive as a backend array on a device
+        # (the scene builder makes them with ``be.linspace``), which NumPy
+        # cannot read directly: move them to the host first, then widen, so
+        # a CPU array keeps exactly the values it had.
+        self.wavelength_bins = np.asarray(to_numpy(wavelength_bins), dtype=np.float64)
         if self.wavelength_bins.min() > _MAX_PLAUSIBLE_WAVELENGTH_UM:
             raise ValueError(
                 f"wavelength_bins must be in µm, but the smallest bin edge is "
                 f"{self.wavelength_bins.min():g}. Values this large look like "
                 f"nanometres - divide by 1000 (e.g. 550 nm -> 0.55)."
             )
-        n_lambda = len(wavelength_bins) - 1
+        n_lambda = len(self.wavelength_bins) - 1
         self._n_lambda = n_lambda
 
         # Flat accumulation buffer: shape (ny * nx * n_lambda,). The widest
@@ -177,7 +182,7 @@ class SpectralDetector(BaseDetector):
             self._record_gaussian(hx_l, hy_l, flux_masked, iwl, nx, ny, dx, dy)
         else:
             self._record_bilinear(hx_l, hy_l, flux_masked, iwl, nx, ny, dx, dy)
-        self._num_rays_hit = self._num_rays_hit + masked_count(hit_mask)
+        self._num_rays_hit = accumulate(self._num_rays_hit, masked_count(hit_mask))
 
     def _flat_index(self, iy, ix, iwl):
         """Flatten (iy, ix, iwl) into the flux-map buffer's flat index."""

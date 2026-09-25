@@ -290,3 +290,51 @@ def clamp_int(idx, lo: int, hi: int):
 
         return torch.clamp(idx, lo, hi)
     return np.clip(idx, lo, hi)
+
+
+def resident_scalar(owner: Any, name: str, value: float | int, like: Any) -> Any:
+    """A scalar constant of the per-ray arithmetic, held beside ``like`` once.
+
+    ``be.where(mask, -1.0, 1.0)`` or ``be.maximum(x, 0.0)`` looks free, but
+    the torch backend turns each bare Python number into a tensor with
+    ``torch.tensor`` on every call. On a device that is a host-to-device copy
+    per call, so per bounce -- a launch and a synchronising copy each, and an
+    operation a CUDA graph cannot capture (issue 61 of the research
+    repository). This keeps the number where the arithmetic runs instead: a
+    0-dim tensor in ``like``'s dtype on ``like``'s device, built on first use
+    and cached on ``owner`` (as
+    :func:`~optiland.nonsequential.components.base.resident_table` caches a
+    table), keyed on the name, the value, the dtype and the device, so a
+    parameter that changes between traces gets a constant of its own.
+
+    The values are the bits ``be.where``/``be.maximum`` built from the bare
+    number: the torch backend converts it to the other operand's dtype (the
+    working dtype when both operands are numbers), and callers pass that
+    operand, or one of the same dtype, as ``like``. On a host backend the
+    number is returned unchanged: it costs nothing there, and NumPy's own
+    promotion of a bare Python number stays exactly as it was.
+
+    Args:
+        owner: The object the constant belongs to; the cache lives on it.
+        name: What the constant is, for the cache key.
+        value: The Python number.
+        like: The array whose dtype and device the constant takes. A host
+            array selects the host path.
+
+    Returns:
+        ``value`` itself on a host backend, else a 0-dim tensor.
+    """
+    if not is_torch_tensor(like):
+        return value
+    key = (name, value, str(like.dtype), str(like.device))
+    cache = getattr(owner, "_be_scalars", None)
+    if cache is None:
+        cache = {}
+        owner._be_scalars = cache
+    cached = cache.get(key)
+    if cached is None:
+        import torch  # noqa: PLC0415
+
+        cached = torch.tensor(value, dtype=like.dtype, device=like.device)
+        cache[key] = cached
+    return cached

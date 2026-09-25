@@ -67,6 +67,33 @@ def masked_count(mask):
     return int(np.asarray(mask, dtype=bool).sum())
 
 
+def accumulate(total, term):
+    """``total + term``, added into ``total``'s own storage where it can be.
+
+    For a running counter kept as an attribute (a detector's hit count, an
+    absorber's totals). The first term starts from the attribute's Python
+    zero, so ``0 + term`` builds the device total, a new tensor of its own;
+    every later term of the same dtype and shape is added into it in place.
+    The value is the addition it always was; the total is never rebound
+    after its first term, which is what lets a recorded bounce be replayed.
+
+    Args:
+        total: The running total: a Python number, or a device tensor.
+        term: The term to add.
+
+    Returns:
+        The total to store back -- the same object when added in place.
+    """
+    if (
+        be.is_torch_tensor(total)
+        and be.is_torch_tensor(term)
+        and total.dtype == term.dtype
+        and total.shape == term.shape
+    ):
+        return total.add_(term)
+    return total + term
+
+
 class Tally:
     """One running total for one trace.
 
@@ -93,11 +120,24 @@ class Tally:
         the Python running total. A tally that sees both keeps both and adds
         them in :meth:`value`.
 
+        A device total adds in place after its first term: the tensor the
+        total lives in is created once, from a copy of the first term, and
+        every later term is added into that same storage. The arithmetic is
+        the addition it always was; what changes is that the total is never
+        rebound, which is what lets a recorded bounce be replayed (a CUDA
+        graph writes to the memory it recorded). A term of another dtype or
+        shape falls back to the out-of-place addition.
+
         Args:
             term: A Python number, a 0-dim array, or a 0-dim tensor.
         """
         if be.is_torch_tensor(term):
-            self._dev = term if self._dev is None else self._dev + term
+            if self._dev is None:
+                self._dev = term.clone()
+            elif term.dtype == self._dev.dtype and term.shape == self._dev.shape:
+                self._dev.add_(term)
+            else:
+                self._dev = self._dev + term
         elif self.is_int:
             self._host += int(term)
         else:

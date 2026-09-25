@@ -125,6 +125,22 @@ _ULP1_F64 = 2.220446049250313e-16
 # N-BK7), which is the incidence angle's own uncertainty, not the formula's.
 DEFAULT_RADICAND_K = 4
 
+# The Fresnel split's branch-probability clamp (docs/theory/08_precision.md
+# section 8.7, the branch-probability row, and 09_differentiation.md R-09-1:
+# p in [k u, 1 - k u], k = 4). The engine's clamp was the float64 literal pair
+# [1e-12, 1 - 1e-12], and at float64 it stays exactly that: 1e-12 is looser
+# than 4 u = 4.4e-16 there, so keeping it moves no float64 number. At float32
+# the upper literal is exactly 1.0 (1 - 1e-12 rounds up), so a probability at
+# the clamp could not leave the reflect branch except on the one draw in
+# ~3e7 that itself rounds to 1.0 -- and then took the transmit branch with a
+# weight of T / tiny_for, about 9e18 T (issue 59 of the research repository).
+# The upper bound is therefore the smaller of the literal and 1 - k u, which
+# is exact in the working dtype (1 - 2**-22 at float32). The lower literal is
+# kept in every dtype: 1e-12 is a normal float32 number, well away from 0,
+# and the reflect weight R / p it bounds is finite with it.
+DEFAULT_BRANCH_K = 4
+_BRANCH_P_LITERAL = 1e-12
+
 
 def ulp(x: ScalarOrArrayT) -> ScalarOrArrayT:
     """Spacing between adjacent representable numbers at magnitude ``|x|``.
@@ -270,6 +286,36 @@ def unit_roundoff(like: ScalarOrArrayT) -> ScalarOrArrayT:
     else:
         one = np.ones((), dtype=np.asarray(like).dtype)
     return 0.5 * ulp(one)
+
+
+def branch_probability_bounds(
+    like: Any, k: int = DEFAULT_BRANCH_K
+) -> tuple[float, float]:
+    """The interval a detached branch probability is clamped to, for ``like``'s dtype.
+
+    ``[1e-12, min(1 - 1e-12, 1 - k u_T)]``: at float64 exactly the literal
+    pair the engine always used, at float32 ``[1e-12, 1 - 2**-22]``, so that
+    ``1 - p`` stays a representable, non-zero number and the transmit weight
+    ``T / (1 - p)`` is bounded by ``T / (k u_T)`` (see
+    :data:`DEFAULT_BRANCH_K` for the derivation). Read from the dtype's
+    machine limits, so nothing is read from a device.
+
+    Args:
+        like: The probability (an array or tensor in the working dtype), or
+            anything of that dtype.
+        k: Multiple of the unit roundoff kept between ``p`` and 1.
+
+    Returns:
+        ``(lo, hi)`` as Python floats; ``hi`` is exact in ``like``'s dtype.
+    """
+    if is_tensor(like):
+        import torch  # noqa: PLC0415
+
+        eps = float(torch.finfo(like.dtype).eps)
+    else:
+        eps = float(np.finfo(np.asarray(like).dtype).eps)
+    u = 0.5 * eps
+    return _BRANCH_P_LITERAL, min(1.0 - _BRANCH_P_LITERAL, 1.0 - k * u)
 
 
 def radicand_min(like: ScalarOrArrayT, k: int = DEFAULT_RADICAND_K) -> ScalarOrArrayT:

@@ -14,6 +14,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential import _tol
+from optiland.nonsequential._utils import resident_scalar
 from optiland.nonsequential.components.base import BaseComponent
 from optiland.nonsequential.components.coating_support import (
     evaluate_transmissive_coating,
@@ -352,7 +353,10 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             # variance changes. reflect_prob="fresnel" reproduces the
             # original weight formula exactly.
             p_be = resolve_reflect_prob(sampling, R_det) if sampling else R_det
-            p_det = be.clip(_detached(p_be), 1e-12, 1.0 - 1e-12)
+            # [1e-12, 1 - 1e-12] at float64, [1e-12, 1 - 4 u] where the upper
+            # literal would round to 1 (float32): see _tol.branch_probability_bounds.
+            p_lo, p_hi = _tol.branch_probability_bounds(p_be)
+            p_det = be.clip(_detached(p_be), p_lo, p_hi)
             u = rng.uniform(ray_id_key, bounce_key, EventSlot.FRESNEL_BRANCH)
             do_reflect = (u < p_det) | tir
 
@@ -462,8 +466,17 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         back_id = medium_stack_id_value(self.material_back, like=depth)
         # entering_back is a device bool mask; one operand must carry the
         # integer dtype so the ids are not cast to the working float type.
+        # Every integer constant below is held on the device beside the
+        # stack (resident_scalar) rather than uploaded at every call.
         front_arr = backend_int_full(depth.shape, front_id, like=depth, bits=64)
-        mat2 = be.where(entering_back, back_id, front_arr)
+        # Inside the compiled bounce step the id is already a 0-d int64
+        # value on the device (the one resident_scalar would build).
+        back_arr = (
+            back_id
+            if be.is_torch_tensor(back_id)
+            else resident_scalar(self, "medium", back_id, front_arr)
+        )
+        mat2 = be.where(entering_back, back_arr, front_arr)
 
         ambient = transmit & (mat2 == 0)
         underflow = ambient & (depth == 0)
@@ -474,7 +487,7 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         # mask is applied to the value, not to the index.
         deep = depth >= 2
         below = backend_gather_slot(stack, be.where(deep, depth - 2, zero))
-        below = be.where(deep, below, 0)
+        below = be.where(deep, below, resident_scalar(self, "stack", 0, below))
 
         non_ambient = transmit & (mat2 != 0)
         pop = non_ambient & (depth >= 1) & (mat2 == below)
@@ -510,17 +523,23 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         # unaffected ones writing back what they already held.
         slot = be.where(pop, depth - 1, zero)
         held = backend_gather_slot(stack, slot)
-        stack = backend_scatter_slot(
-            stack, slot, be.where(pop, MEDIUM_STACK_EMPTY, held)
-        )
+        empty = resident_scalar(self, "stack", MEDIUM_STACK_EMPTY, held)
+        stack = backend_scatter_slot(stack, slot, be.where(pop, empty, held))
         slot = be.where(push_ok, depth, zero)
         held = backend_gather_slot(stack, slot)
         rays.medium_stack = backend_scatter_slot(
             stack, slot, be.where(push_ok, mat2, held)
         )
 
-        delta = be.where(pop, -1, be.where(push_ok, 1, zero))
-        rays.medium_depth = be.where(ambient, 0, depth + delta)
+        delta = be.where(
+            pop,
+            resident_scalar(self, "depth", -1, zero),
+            be.where(push_ok, resident_scalar(self, "depth", 1, zero), zero),
+        )
+        next_depth = depth + delta
+        rays.medium_depth = be.where(
+            ambient, resident_scalar(self, "depth", 0, next_depth), next_depth
+        )
 
         # A pop on an empty stack, and (when the raise above is disabled) a
         # push past the maximum depth, are both stack inconsistencies and
@@ -551,7 +570,8 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             # Route only a scatter_fraction of the hit rays through the BSDF;
             # the rest keep the refracted direction computed above.
             scatters, sf_gate = scatter_branch(
-                self.scatter_fraction, hit_mask, rng, ray_id_key, bounce_key
+                self.scatter_fraction, hit_mask, rng, ray_id_key, bounce_key,
+                owner=self,
             )
             # A detached decision with a compensating weight: unbiased, but
             # not weight-preserving on this realisation.

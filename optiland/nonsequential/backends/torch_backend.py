@@ -21,6 +21,15 @@ to running it on torch tensors on a device:
   default, and in gradient mode always; ``TorchBackend(allow_splitting=True)``
   runs it in forward-only mode, at the cost of reading the split rows back
   to the host at every bounce that splits.
+- **replayed bounces** (opt-in): ``TorchBackend(graph_replay=True)`` records
+  one fixed-width bounce as a CUDA graph and replays it, on a CUDA device
+  only (:mod:`~optiland.nonsequential.backends.graph_replay`).
+- **generator kernel**: the keyed generator runs as int64 limb arithmetic
+  in torch by default. ``TorchBackend(rng_kernel="warp")`` draws the same
+  numbers from one Warp kernel per draw (:mod:`optiland.nonsequential
+  .rng_warp`) when Warp is installed and the device is CUDA; anywhere else
+  the limb path is kept without a warning, and the result's
+  ``environment`` says which kernel drew the trace and why.
 
 Memory scaling: O(num_rays x max_depth) activations when gradient_mode is
 "autograd". The recommended envelope is ~1e5 rays at depth 16 on a single
@@ -39,11 +48,14 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.backend.utils import to_numpy
+from optiland.nonsequential.backends import graph_replay as _graph
 from optiland.nonsequential.backends.array_backend import (
+    BUCKET_MIN_WIDTH,
     ArrayBackend,
     bounce_body,
     bucketed_width,
 )
+from optiland.nonsequential.backends.graph_replay import GraphReplayUnavailable
 from optiland.nonsequential.ray_bundle import backend_live_permutation
 from optiland.nonsequential.rng import NSQRng
 
@@ -286,6 +298,46 @@ class TorchBackend(ArrayBackend):
             estimator a deterministic ghost series needs (every order to
             floating point, ``docs/theory/03_monte_carlo.md`` 3.6), so a
             device run that needs it can ask for it.
+        graph_replay: Replay one recorded bounce instead of dispatching its
+            kernels one by one (:mod:`~optiland.nonsequential.backends
+            .graph_replay`). Off by default, and with it off nothing in the
+            trace changes. With ``True``, each batch of at least
+            ``BUCKET_MIN_WIDTH`` rays runs two bounces eagerly, is recorded
+            as a CUDA graph for one bounce, and the graph is replayed to
+            ``max_depth``; the live count is still read between replays
+            every ``alive_check_every`` bounces (0: never), and compaction is
+            off, so every number is the eager fixed-width trace's
+            (``compact_every=0``), which differs from the default compacted
+            trace only in the summation order of its totals. It pays where
+            the loop is launch-bound: on the catalogue's integrating sphere
+            (r1_16, 1e6 rays, float64) an A100 measured 814.1 s eager and
+            189.9 s replayed, in the hybrid-engine study of 2026-09-24 (report
+            H4, a patched copy of this engine at 6e175a2f; issue 2 of the
+            research repository).
+
+            It needs a CUDA device: on the CPU and on Apple's ``mps`` torch
+            has no graph capture, and ``True`` is refused there with
+            :class:`GraphReplayUnavailable` rather than silently run
+            eagerly. It is refused the same way in gradient mode, when
+            splitting would run, with ``record_paths``, with a ray-database
+            detector, and when the capture's guard finds an accumulator
+            rebound inside the recorded bounce. ``"emulate"`` runs the same
+            bookkeeping eagerly on any device -- the check that a scene is
+            capture-safe, with the eager fixed-width numbers and no speed-up.
+        rng_kernel: Which implementation of the keyed generator is asked
+            for: ``"torch"`` (the default, the limb path of
+            :mod:`optiland.nonsequential.rng`) or ``"warp"`` (one Warp
+            kernel per draw, :mod:`optiland.nonsequential.rng_warp`). The
+            values are the same bit for bit at float64 and float32; only
+            the number of dispatched operations changes (on the catalogue's
+            sphere cavity, from about 2,470 per bounce to about 650). The
+            Warp kernel is used only when ``warp`` imports and the device
+            is CUDA; otherwise the trace uses the limb path, silently, and
+            ``SimulationResult.environment`` records ``rng_kernel`` (the
+            kernel that drew), ``rng_kernel_requested`` and, on a fallback,
+            ``rng_kernel_note`` (why).
+        rng_kernel_in_use: The kernel the last trace drew from; None before
+            the first trace.
         compile_step: Run each bounce through ``torch.compile`` of the
             bounce body (:func:`compiled_bounce_body`) instead of eagerly:
             True on every device, a device type (``"mps"``) on that device
@@ -301,8 +353,12 @@ class TorchBackend(ArrayBackend):
             the generated kernels fuse and reorder the arithmetic. A trace
             that splits rays (``allow_splitting=True`` and a
             ``split_depth``) runs the eager bounce, whose splitting reads
-            its rows on the host; ``compiled_step_active`` says, after each
-            trace, which bounce ran.
+            its rows on the host, and so does a trace whose generator is the
+            Warp kernel; ``compiled_step_active`` says, after each trace,
+            which bounce ran, and ``SimulationResult.environment`` records
+            it when the step was asked for. It is the Apple GPU's way of
+            fusing the bounce, as ``graph_replay`` is CUDA's: the two are
+            not combined (a ``ValueError`` at construction).
         compile_options: Options for the compiler (see
             :func:`compiled_bounce_body`); on ``mps``,
             ``max_fusion_unique_io_buffers`` defaults to
@@ -313,6 +369,8 @@ class TorchBackend(ArrayBackend):
     supports_splitting = False
     alive_check_every = 1
 
+    RNG_KERNELS: tuple[str, ...] = ("torch", "warp")
+
     def __init__(
         self,
         seed: int | None = None,
@@ -320,6 +378,8 @@ class TorchBackend(ArrayBackend):
         alive_check_every: int | None = None,
         compact_every: int | None = None,
         allow_splitting: bool = False,
+        graph_replay: bool | Literal["emulate"] = False,
+        rng_kernel: Literal["torch", "warp"] = "torch",
         compile_step: bool | str | None = None,
         compile_options: dict | None = None,
     ) -> None:
@@ -338,6 +398,14 @@ class TorchBackend(ArrayBackend):
                 forward-only mode (default False: warn and fall back to the
                 single-branch draw, as before). In gradient mode splitting
                 is refused whatever this says.
+            graph_replay: Replay a recorded bounce as a CUDA graph (default
+                False; see the class docstring). ``True`` needs a CUDA
+                device; ``"emulate"`` runs the same bookkeeping eagerly on
+                any device, as a check. Either keeps each batch at its full
+                width, so ``compact_every`` must be left unset or 0.
+            rng_kernel: ``"torch"`` (default) or ``"warp"``; see the class
+                docstring. The choice is made at the start of each trace,
+                when the device is known.
             compile_step: Run the bounce compiled (see the class
                 docstring): True for every device, a device type
                 (``"mps"``, ``"cuda"``, ``"cpu"``) for traces on that device
@@ -346,7 +414,33 @@ class TorchBackend(ArrayBackend):
                 backend can be switched without a code change; unset, it is
                 off.
             compile_options: Compiler options for the compiled step.
+
+        Raises:
+            ValueError: If ``graph_replay`` is not ``False``, ``True`` or
+                ``"emulate"``, or is combined with a non-zero
+                ``compact_every`` or with an explicit ``compile_step``; if
+                ``rng_kernel`` is not one of :attr:`RNG_KERNELS`; or if
+                ``compile_step`` is not a bool or a device type.
         """
+        if graph_replay not in (False, True, "emulate"):
+            raise ValueError(
+                f"graph_replay must be False, True or 'emulate', got {graph_replay!r}"
+            )
+        if graph_replay and compact_every:
+            raise ValueError(
+                "graph_replay replays one bundle width per batch, so it cannot be "
+                f"combined with compaction (compact_every={compact_every}); leave "
+                "compact_every unset or 0"
+            )
+        if rng_kernel not in self.RNG_KERNELS:
+            raise ValueError(
+                f"rng_kernel must be one of {self.RNG_KERNELS}, got {rng_kernel!r}"
+            )
+        if graph_replay and compile_step is not None and _normalise_compile_step(compile_step):
+            raise ValueError(
+                "graph_replay (CUDA) and compile_step (the Apple GPU) are two ways "
+                "of fusing the bounce; ask for one"
+            )
         self.seed = seed
         self.gradient_mode = gradient_mode
         self.supports_splitting = bool(allow_splitting)
@@ -354,12 +448,25 @@ class TorchBackend(ArrayBackend):
         self.rng = NSQRng(seed)
         if alive_check_every is not None:
             self.alive_check_every = int(alive_check_every)
-        self.compact_every = compact_every
-        self.compile_step = (
-            _compile_step_from_env()
-            if compile_step is None
-            else _normalise_compile_step(compile_step)
-        )
+        if graph_replay != "emulate":
+            graph_replay = bool(graph_replay)
+        self.graph_replay = graph_replay
+        self.compact_every = 0 if graph_replay else compact_every
+        self.rng_kernel = rng_kernel
+        self.rng_kernel_in_use: str | None = None
+        # The current batch's replay buffers, between _graph_handover_depth and
+        # _replay_bounces (graph_replay only).
+        self._graph_static: dict | None = None
+        self._rng_kernel_note: str | None = None
+        # Batches the last trace handed to the replayed graph (a batch below
+        # the compaction ladder's floor runs eagerly even when asked to replay).
+        self.graph_replay_batches = 0
+        # The compiled step: explicit, or the environment's default, which a
+        # replayed bounce overrides (the variable is a harness default; the
+        # replay is this backend's own request).
+        if compile_step is None:
+            compile_step = False if graph_replay else _compile_step_from_env()
+        self.compile_step = _normalise_compile_step(compile_step)
         self.compile_options = dict(compile_options or {})
         # Whether the last trace ran the compiled step (see _bounce_step).
         self.compiled_step_active = False
@@ -399,6 +506,10 @@ class TorchBackend(ArrayBackend):
             # chooses the rows to split on the host and grows the bundle
             # inside the bounce, which a compiled program cannot hold: the
             # trace runs the eager bounce, and says so here.
+            return bounce_body
+        if getattr(self.rng, "kernel", None) == "warp":
+            # The Warp generator is CUDA's fused draw; the two fusions are
+            # not combined (and the pair is unmeasured): the eager bounce.
             return bounce_body
         if self._grad_requested():
             raise CompiledStepError(
@@ -460,6 +571,84 @@ class TorchBackend(ArrayBackend):
             return bool(be.grad_mode.requires_grad)
         except Exception:  # noqa: BLE001 - a backend with no grad mode cannot be in it
             return False
+
+    def _warp_rng_unavailable(self) -> str | None:
+        """Why the Warp generator cannot serve this trace, or None if it can.
+
+        Returns:
+            None when the Warp kernel will draw; otherwise one sentence
+            naming the reason (Warp not installed, not CUDA, no kernel load).
+        """
+        try:
+            from optiland.nonsequential import rng_warp  # noqa: PLC0415
+        except Exception as exc:  # noqa: BLE001 - not installed, or it failed to load
+            return f"warp is not importable ({type(exc).__name__})"
+        return rng_warp.availability(be.get_device())
+
+    def _trace_rng(self, seed: int | None) -> NSQRng:
+        """The generator for this trace: the limb path, or the Warp kernel.
+
+        With the default ``rng_kernel="torch"`` this is exactly the base
+        class's choice. With ``"warp"`` the kernel is checked (and loaded on
+        the device) here, before the first bounce, so no kernel is compiled
+        or loaded inside the bounce loop.
+
+        Args:
+            seed: The trace's seed argument, or None to keep the backend's.
+
+        Returns:
+            The generator for this trace.
+        """
+        self._rng_kernel_note = None
+        if self.rng_kernel == "warp":
+            note = self._warp_rng_unavailable()
+            if note is None:
+                from optiland.nonsequential.rng_warp import (  # noqa: PLC0415
+                    WarpNSQRng,
+                )
+
+                self.rng_kernel_in_use = "warp"
+                return WarpNSQRng(self.rng.seed if seed is None else seed)
+            self._rng_kernel_note = note
+        self.rng_kernel_in_use = "torch"
+        rng = super()._trace_rng(seed)
+        if getattr(rng, "kernel", None) == "warp":
+            # A previous trace on a CUDA device drew through the kernel;
+            # this one cannot, so it gets the limb path with the same seed.
+            rng = NSQRng(rng.seed)
+        return rng
+
+    def _environment(self) -> dict[str, object]:
+        """The base environment, plus the generator and the replay asked for.
+
+        Returns:
+            The base class's entries, ``rng_kernel_requested`` and, when the
+            request could not be honoured, ``rng_kernel_note``. When
+            ``graph_replay`` was asked for, also how the bounces ran:
+            ``graph_replay`` is ``"cuda"`` or ``"emulate"`` when at least one
+            batch was replayed and ``"none"`` when every batch ran eagerly (a
+            batch below the compaction ladder's floor always does), with
+            ``graph_replay_requested`` and ``graph_replay_batches``, the
+            number of batches replayed. Without the request the keys are
+            absent and every bounce ran eagerly. When the compiled step was
+            asked for (``compile_step``), ``compile_step_requested`` and
+            ``compile_step``: ``"compiled"`` when the trace's bounces ran
+            the compiled step, ``"eager"`` when they did not (another device,
+            a splitting trace, the Warp generator).
+        """
+        env = super()._environment()
+        env["rng_kernel_requested"] = self.rng_kernel
+        if self._rng_kernel_note is not None:
+            env["rng_kernel_note"] = self._rng_kernel_note
+        if self.graph_replay:
+            mode = "emulate" if self.graph_replay == "emulate" else "cuda"
+            env["graph_replay"] = mode if self.graph_replay_batches else "none"
+            env["graph_replay_requested"] = self.graph_replay
+            env["graph_replay_batches"] = self.graph_replay_batches
+        if self.compile_step:
+            env["compile_step_requested"] = self.compile_step
+            env["compile_step"] = "compiled" if self.compiled_step_active else "eager"
+        return env
 
     def _gradient_mode(self, rays: NSQRayBundle) -> bool:
         """True when any field of the bundle is on an autograd graph.
@@ -577,6 +766,137 @@ class TorchBackend(ArrayBackend):
                 "splitting.",
                 stacklevel=2,
             )
+
+    # ------------------------------------------------------------------
+    # Replayed bounces (graph_replay)
+    # ------------------------------------------------------------------
+
+    def _check_graph_replay(self, scene, ir, record_paths) -> None:
+        """Refuse ``graph_replay`` where a replayed bounce cannot be right.
+
+        Each refusal is a :class:`GraphReplayUnavailable` naming its reason;
+        none falls back silently.
+
+        Args:
+            scene: The scene about to be traced.
+            ir: The scene's lowered IR.
+            record_paths: The trace's ``record_paths`` argument.
+
+        Raises:
+            GraphReplayUnavailable: On a device without CUDA graphs (for
+                ``graph_replay=True``), in gradient mode, when splitting would
+                run, with path recording, or with a ray-database detector.
+        """
+        self.graph_replay_batches = 0
+        if not self.graph_replay:
+            return
+        import torch as _torch  # noqa: PLC0415
+
+        from optiland.nonsequential.detectors.ray_database import (  # noqa: PLC0415
+            RayDatabaseDetector,
+        )
+
+        if self.graph_replay is True:
+            device = str(be.get_device())
+            if not (device.startswith("cuda") and _torch.cuda.is_available()):
+                raise GraphReplayUnavailable(
+                    "graph_replay=True records a CUDA graph, and the active device "
+                    f"is {device!r}: torch has no graph capture on the CPU or on "
+                    "Apple's mps. Trace eagerly (graph_replay=False), or check a "
+                    "scene's capture safety with graph_replay='emulate'"
+                )
+        try:
+            grad_on = bool(be.grad_mode.requires_grad)
+        except Exception:  # noqa: BLE001 - a backend with no grad mode cannot be in it
+            grad_on = False
+        if grad_on:
+            raise GraphReplayUnavailable(
+                "graph_replay: gradient mode is on; a replayed bounce records no "
+                "autograd graph, so a gradient trace runs eagerly"
+            )
+        if ir.sampling.split_depth > 0 and self._splitting_enabled():
+            raise GraphReplayUnavailable(
+                "graph_replay: bounded splitting grows the bundle and chooses its "
+                "rows on the host, which a replayed bounce cannot do; trace with "
+                "graph_replay=False, or without allow_splitting"
+            )
+        if record_paths:
+            raise GraphReplayUnavailable(
+                "graph_replay: path recording copies ray state to the host at "
+                "every bounce; trace with record_paths=False"
+            )
+        databases = [
+            getattr(d, "name", "") or type(d).__name__
+            for d in scene.detectors
+            if isinstance(d, RayDatabaseDetector)
+        ]
+        if databases:
+            raise GraphReplayUnavailable(
+                "graph_replay: a ray database copies its hits to the host at every "
+                f"bounce ({', '.join(databases)})"
+            )
+
+    def _graph_handover_depth(self, rays: NSQRayBundle) -> int | None:
+        """Hand a batch to the replayed graph after the eager bounces.
+
+        A batch narrower than the compaction ladder's floor
+        (:data:`~optiland.nonsequential.backends.array_backend
+        .BUCKET_MIN_WIDTH`) runs eagerly at its fixed width instead: below it
+        the shared material cache keys on the wavelength array's contents,
+        a host read at every bounce that no graph can hold, and a graph buys
+        nothing at that width anyway. The values are the same either way.
+
+        A batch that will be replayed has its fields moved into the replay's
+        static buffers here, before its eager bounces
+        (:func:`~optiland.nonsequential.backends.graph_replay.static_buffers`),
+        so the glass memo the eager bounces fill is keyed on the wavelength
+        tensor the recorded bounce reads.
+
+        Args:
+            rays: The freshly prepared batch.
+
+        Returns:
+            :data:`~optiland.nonsequential.backends.graph_replay.EAGER_BOUNCES`,
+            or ``None`` for an eager batch.
+        """
+        self._graph_static = None
+        if not self.graph_replay or rays.num_rays < BUCKET_MIN_WIDTH:
+            return None
+        self._graph_static = _graph.static_buffers(rays)
+        return _graph.EAGER_BOUNCES
+
+    def _replay_bounces(
+        self, rays, bounce, depth, max_depth, scene, tallies
+    ) -> NSQRayBundle:
+        """Record the bounce once and replay it to the depth cap.
+
+        See :func:`~optiland.nonsequential.backends.graph_replay
+        .replay_bounces`.
+
+        Args:
+            rays: The batch after the eager bounces.
+            bounce: The loop's bounce body.
+            depth: Bounces already run.
+            max_depth: The depth cap.
+            scene: The scene being traced.
+            tallies: The trace's own tallies.
+
+        Returns:
+            The bundle after the last bounce.
+        """
+        mode = "emulate" if self.graph_replay == "emulate" else "cuda"
+        self.graph_replay_batches += 1
+        static, self._graph_static = self._graph_static, None
+        return _graph.replay_bounces(
+            self,
+            rays,
+            bounce,
+            depth,
+            max_depth,
+            lambda: _graph.accumulator_identities(scene, tallies),
+            static=static,
+            mode=mode,
+        )
 
     def _prepare_bundle(self, rays: NSQRayBundle) -> NSQRayBundle:
         """Promote a generated bundle onto this backend's device.

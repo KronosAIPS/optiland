@@ -24,7 +24,7 @@ from optiland.nonsequential._utils import (
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
-from optiland.nonsequential._tally import masked_count
+from optiland.nonsequential._tally import accumulate, masked_count
 from optiland.nonsequential.detectors.base import (
     BaseDetector,
     _accumulate_into,
@@ -176,7 +176,7 @@ class IrradianceDetector(BaseDetector):
         else:
             self._record_hard(hx_l, hy_l, flux_masked, nx, ny)
 
-        self._num_rays_hit = self._num_rays_hit + masked_count(hit_mask)
+        self._num_rays_hit = accumulate(self._num_rays_hit, masked_count(hit_mask))
 
     def _record_hard(
         self,

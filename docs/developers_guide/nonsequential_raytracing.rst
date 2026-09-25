@@ -71,14 +71,43 @@ explicitly to :class:`~optiland.nonsequential.tracer.NSQTracer` or
    real illumination and stray-light work, and the only backend that supports
    bounded ghost-path splitting (``SamplingPolicy.split_depth``).
 
-**TorchBackend** (differentiable)
+**TorchBackend** (differentiable, device-resident)
    ``be``-unified array ops that build a full PyTorch autograd graph through the
-   Monte Carlo loop. Compaction is **disabled** so tensor shapes stay fixed for
-   the graph, which is why memory scales as ``O(num_rays × max_depth)`` and the
-   practical envelope is ~1e5 rays at depth 16 on a single GPU. This is the
-   engine for optimization and ML layers. It forces ``split_depth=0`` and warns
-   if a scene sets otherwise, since fixed tensor shapes are required for the
-   autograd graph.
+   Monte Carlo loop. In gradient mode compaction is **disabled** so tensor
+   shapes stay fixed for the graph, which is why memory scales as
+   ``O(num_rays × max_depth)`` and the practical envelope is ~1e5 rays at depth
+   16 on a single GPU; in forward-only mode the bundle is compacted to a
+   bucketed width. This is the engine for optimization and ML layers. Its
+   options (the class docstring is the authority):
+
+   ============================ ===============================================
+   option                       effect
+   ============================ ===============================================
+   ``alive_check_every=k``      read the live count every ``k`` bounces (the
+                                loop's only host read); 0 never reads it
+   ``compact_every=k``          compaction period; follows ``alive_check_every``
+                                when unset, 0 disables it
+   ``allow_splitting=True``     honour ``SamplingPolicy.split_depth`` in
+                                forward-only mode (warned and ignored otherwise)
+   ``graph_replay=True``        record one fixed-width bounce as a CUDA graph
+                                after two eager bounces and replay it to
+                                ``max_depth``; CUDA only, off by default
+   ``graph_replay="emulate"``   the same bookkeeping run eagerly on any device:
+                                a capture-safety check, no speed-up
+   ============================ ===============================================
+
+   ``graph_replay`` keeps each batch at its full width (no compaction), so its
+   numbers are those of the eager fixed-width trace (``compact_every=0``) bit
+   for bit; they differ from the default compacted trace only in the summation
+   order of the totals. It pays where the loop is launch-bound: on an A100 the
+   catalogue's integrating sphere (1e6 rays, float64) took 814.1 s eager and
+   189.9 s replayed (measured on a patched copy of this engine in the
+   hybrid-engine study of 2026-09-24). A batch narrower than 2,048 rays runs
+   eagerly. It is refused, with ``GraphReplayUnavailable`` naming the reason,
+   on a device without CUDA graphs (the CPU, Apple's ``mps``), in gradient
+   mode, when splitting would run, with ``record_paths``, with a ray-database
+   detector, and when the capture's guard finds an accumulator rebound inside
+   the recorded bounce.
 
 There is **no separate GPU array backend.** GPU acceleration in the
 differentiable path comes from PyTorch device placement; the forward NumPy path
@@ -159,6 +188,18 @@ compaction on/off, and — for a fixed ``(ray_id, bounce, slot)`` — between th
 NumPy and Torch backends, verified by a fixed-vector conformance suite
 (``tests/nonsequential/test_nsq_rng_conformance.py``) any third-party backend
 can run to prove conformance.
+
+**The generator as one kernel (optional, CUDA).** Torch has no unsigned 64-bit
+type, so on the Torch backend each draw is int64 limb arithmetic, about 150
+array operations. ``TorchBackend(rng_kernel="warp")`` draws the same numbers
+from one NVIDIA Warp kernel per draw (:mod:`optiland.nonsequential.rng_warp`;
+install ``optiland[warp]``): the 32 output bits, the jump-ahead state and the
+uniform at float64 and float32 are equal bit for bit
+(``tests/nonsequential/test_nsq_rng_warp.py``), so every trace is too. It is
+used only when Warp imports and the device is CUDA; otherwise the limb path
+draws, without a warning, and ``SimulationResult.environment["rng_kernel"]``
+says which kernel drew the trace (``rng_kernel_note`` says why a request was
+not honoured).
 
 **Honest scope of the guarantee.** Same random decisions, same code path;
 *final floating-point results* agree only to documented tolerance across
