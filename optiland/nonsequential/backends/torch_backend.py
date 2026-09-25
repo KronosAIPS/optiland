@@ -118,6 +118,18 @@ def _normalise_compile_step(value) -> bool | str:
 _COMPILED_STEPS: dict[tuple, Callable] = {}
 
 
+def _scene_materials(surfaces) -> list:
+    """Every distinct material on either side of the scene's surfaces, in order."""
+    seen: set[int] = set()
+    materials = []
+    for surface in surfaces:
+        for material in (surface.material_front, surface.material_back):
+            if material is not None and id(material) not in seen:
+                seen.add(id(material))
+                materials.append(material)
+    return materials
+
+
 def _complete_metal_codegen() -> None:
     """Give the inductor's Metal code generator the two operations the bounce needs.
 
@@ -403,7 +415,13 @@ class TorchBackend(ArrayBackend):
                 # built inside the compiled program, would break it at every
                 # new scene and send the whole bounce back to eager mode.
                 ctx.compiled_step_warm = True
+                ctx.compiled_step_materials = _scene_materials(ctx.surfaces)
                 return bounce_body(backend, ctx, rays)
+            # The materials' n and k for this bundle's wavelengths, evaluated
+            # here and read inside the program from their memos (a hit
+            # unless compaction replaced the wavelength array).
+            for material in ctx.compiled_step_materials:
+                material.prepare_compiled_step(rays.wavelength)
             state = backend.rng.device_state
             if state is None or state[0].device != rays.x.device:
                 # The trace's seed as device data, so a new seed is a new

@@ -159,6 +159,24 @@ class TestForwardOnly:
             step(backend, None, rays)
 
 
+class TestOneProgramForEveryScene:
+    def test_the_bounce_is_one_graph_across_scenes_and_seeds(self, torch_state):
+        """The whole bounce traces as one graph, with no break, and a new scene
+        with a new seed reuses it: nothing in the program depends on the
+        identity of a scene object or on the seed's value. (A break sends part
+        of the bounce back to eager mode; a recompilation per scene costs the
+        compilation again on every trace of a catalogue case.)"""
+        from torch._dynamo.utils import counters
+
+        be.set_precision("float64")
+        torch._dynamo.reset()
+        counters.clear()
+        _trace(TorchBackend(seed=7, compile_step=True, compile_options=_TRACED))
+        _trace(TorchBackend(seed=8, compile_step=True, compile_options=_TRACED))
+        assert sum(counters["graph_break"].values()) == 0, dict(counters["graph_break"])
+        assert counters["stats"]["unique_graphs"] == 1
+
+
 class TestTracedStepBooksWhatTheEagerStepBooks:
     @pytest.mark.parametrize("precision", ["float64", "float32"])
     def test_bit_identical_to_the_eager_loop(self, torch_state, precision):

@@ -14,6 +14,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential import _tol
+from optiland.nonsequential._compile import compiling
 from optiland.nonsequential._utils import as_float, as_param
 from optiland.nonsequential.components.geometry.base import AABB, AnalyticGeometry
 
@@ -92,10 +93,17 @@ class CylindricalFrustumGeometry(AnalyticGeometry):
         # Construction-time check, evaluated once (not per ray): is this
         # frustum's axial extent itself indistinguishable from zero? Detached
         # float64 (z_front/z_back are geometry parameters, not ray data), k
-        # ulps of the extent's own magnitude with a 1 mm floor.
-        h_val = as_float(h)
-        h_scale = max(abs(as_float(self.z_front)), abs(as_float(self.z_back)), 1.0)
-        if abs(h_val) < _DEGENERACY_K * np.spacing(h_scale):
+        # ulps of the extent's own magnitude with a 1 mm floor. Inside the
+        # torch backend's compiled bounce step the verdict of the trace's
+        # eager first bounce is reused: read there, the parameters would be
+        # a host read the compiled program cannot hold.
+        degenerate = getattr(self, "_degenerate_verdict", None)
+        if degenerate is None or not compiling():
+            h_val = as_float(h)
+            h_scale = max(abs(as_float(self.z_front)), abs(as_float(self.z_back)), 1.0)
+            degenerate = bool(abs(h_val) < _DEGENERACY_K * np.spacing(h_scale))
+            self._degenerate_verdict = degenerate
+        if degenerate:
             # Degenerate frustum (zero height) -- no lateral surface to hit
             N = origins.shape[0]
             return (

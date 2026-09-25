@@ -120,6 +120,40 @@ class NSQMaterial:
         self._n_memo = (None, None)
         self._k_memo = (None, None)
 
+    def prepare_compiled_step(self, wavelength_um) -> None:
+        """Evaluate ``n`` and ``k`` for this bounce's wavelengths, before the compiled step.
+
+        Called by the torch backend's compiled bounce step, outside the
+        compiled program, before every bounce: it fills the identity memo for
+        the bundle's wavelength array (a memo hit costs nothing), and records
+        whether the medium is vacuum as a plain bool. Inside the program,
+        :meth:`n` and :meth:`k` then answer from the memo -- the wavelength
+        array and the memo's are the same object, which the compiler can see
+        -- and the values enter the program as data. Nothing the program
+        reads then depends on the identity of a scene object, so a new scene
+        runs the same compiled program.
+
+        Args:
+            wavelength_um: The bundle's wavelength array.
+        """
+        self._compiled_vacuum = self.optiland_material is None
+        device = getattr(wavelength_um, "device", None)
+        if device is not None:
+            self._compiled_stack_id = _medium_stack_id_tensor(self, device)
+        self.n(wavelength_um)
+        self.k(wavelength_um)
+
+    def _compiled_lookup(self, memo, vacuum_value, name, wavelength_um):
+        """``n``/``k`` inside the compiled step: vacuum, the memo, or one eager call."""
+        if getattr(self, "_compiled_vacuum", False):
+            return vacuum_value(wavelength_um)
+        memo_wavelength, memo_result = memo
+        if memo_wavelength is not None and wavelength_um is memo_wavelength:
+            return memo_result
+        # Not prepared for this array (a caller the step did not foresee):
+        # evaluated as ordinary Python, the value entering the program as data.
+        return run_eagerly(getattr(self, name), wavelength_um)
+
     def n(self, wavelength_um: WavelengthInput) -> WavelengthInput:
         """Refractive index at the given wavelength(s).
 
@@ -137,12 +171,12 @@ class NSQMaterial:
             ones-like array/tensor matching the input shape for array inputs.
         """
         if compiling():
-            # Inside the compiled bounce step the property is evaluated as
-            # ordinary Python and enters the compiled program as data: the
-            # memo and the material library's caches key on the identity and
-            # contents of their arguments, which, traced, would specialise
-            # the program to one scene (_compile.py).
-            return run_eagerly(self.n, wavelength_um)
+            # Inside the compiled bounce step the value comes from the memo
+            # prepare_compiled_step filled before the step: the material
+            # library's caches key on the identity and contents of their
+            # arguments, which, traced, would specialise the program to one
+            # scene (_compile.py).
+            return self._compiled_lookup(self._n_memo, be.ones_like, "n", wavelength_um)
         if self.optiland_material is None:
             # Vacuum: return ones matching the input type/device
             try:
@@ -174,8 +208,8 @@ class NSQMaterial:
             for vacuum when input is a scalar, or a zeros-like array/tensor
             matching the input shape for array inputs.
         """
-        if compiling():
-            return run_eagerly(self.k, wavelength_um)  # as n(), above
+        if compiling():  # as n(), above
+            return self._compiled_lookup(self._k_memo, be.zeros_like, "k", wavelength_um)
         if self.optiland_material is None:
             # Vacuum: non-absorbing.
             try:
@@ -241,6 +275,9 @@ def medium_stack_id_value(material: NSQMaterial, like):
     """
     if not compiling():
         return medium_stack_id(material)
+    prepared = getattr(material, "_compiled_stack_id", None)
+    if prepared is not None:
+        return prepared  # set by prepare_compiled_step, on the bundle's device
     return run_eagerly(_medium_stack_id_tensor, material, like.device)
 
 
