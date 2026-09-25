@@ -14,7 +14,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential import _tol
-from optiland.nonsequential._utils import as_float, as_param
+from optiland.nonsequential._utils import as_float, as_param, resident_scalar
 from optiland.nonsequential.components.geometry.base import AABB, AnalyticGeometry
 
 # Degenerate-quadratic multiple (docs/theory/08_precision.md sec 8.7, k=8):
@@ -115,7 +115,8 @@ class CylindricalFrustumGeometry(AnalyticGeometry):
         c = ox * ox + oy * oy - rz * rz
 
         disc = b * b - 4.0 * a * c
-        disc_safe = be.maximum(disc, 0.0)
+        # Zero as a device constant (resident_scalar), not an upload.
+        disc_safe = be.maximum(disc, resident_scalar(self, "zero", 0.0, disc))
         sqrt_disc = be.sqrt(disc_safe)
 
         if eps is None:
@@ -152,7 +153,9 @@ class CylindricalFrustumGeometry(AnalyticGeometry):
         t_lin = be.where(b_small, inf_val, -c / b_safe)
 
         a_safe = be.where(a_small, be.ones_like(a), a)
-        inv2a = be.where(a_small, 0.0, 1.0 / (2.0 * a_safe))
+        inv2a = be.where(
+            a_small, resident_scalar(self, "zero", 0.0, a_safe), 1.0 / (2.0 * a_safe)
+        )
         t1 = (-b - sqrt_disc) * inv2a
         t2 = (-b + sqrt_disc) * inv2a
 

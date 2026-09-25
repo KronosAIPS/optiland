@@ -49,7 +49,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential import _tol
-from optiland.nonsequential._utils import as_float, as_param
+from optiland.nonsequential._utils import as_float, as_param, resident_scalar
 from optiland.nonsequential.components.geometry.base import AABB, AnalyticGeometry
 
 
@@ -284,9 +284,14 @@ class SphericalCavityGeometry(AnalyticGeometry):
         nz = be.where(hit_mask, hz / self.radius, zero)
         n_geom = be.stack([-nx, -ny, -nz], axis=1)
 
-        # Flip the shading normal to face the incoming ray.
+        # Flip the shading normal to face the incoming ray. The two signs are
+        # device constants (resident_scalar), not uploads every bounce.
         dot = dx * nx + dy * ny + dz * nz
-        flip = be.where(dot > 0, -1.0, 1.0)
+        flip = be.where(
+            dot > 0,
+            resident_scalar(self, "flip", -1.0, dot),
+            resident_scalar(self, "flip", 1.0, dot),
+        )
         normals = be.stack([nx * flip, ny * flip, nz * flip], axis=1)
 
         return t, normals, hit_mask, n_geom

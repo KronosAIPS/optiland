@@ -11,7 +11,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential import _tol
-from optiland.nonsequential._utils import as_float, as_param
+from optiland.nonsequential._utils import as_float, as_param, resident_scalar
 from optiland.nonsequential.components.geometry.base import AABB, AnalyticGeometry
 
 
@@ -99,9 +99,14 @@ class SphereGeometry(AnalyticGeometry):
         nz = be.where(t < be.inf, hz / self.radius, be.zeros_like(hz))
         n_geom = be.stack([-nx, -ny, -nz], axis=1)
 
-        # Flip to face incoming ray
+        # Flip to face incoming ray; the signs are device constants
+        # (resident_scalar), not uploads every bounce.
         dot = dx * nx + dy * ny + dz * nz
-        flip = be.where(dot > 0, -1.0, 1.0)
+        flip = be.where(
+            dot > 0,
+            resident_scalar(self, "flip", -1.0, dot),
+            resident_scalar(self, "flip", 1.0, dot),
+        )
         normals = be.stack([nx * flip, ny * flip, nz * flip], axis=1)
 
         hit_mask = t < be.inf

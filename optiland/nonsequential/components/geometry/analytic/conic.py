@@ -25,7 +25,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential import _tol
-from optiland.nonsequential._utils import as_float, as_param
+from optiland.nonsequential._utils import as_float, as_param, resident_scalar
 from optiland.nonsequential.components.geometry.base import AABB, AnalyticGeometry
 
 
@@ -213,7 +213,12 @@ class ConicGeometry(AnalyticGeometry):
         # textbook (-b +/- sqrt(disc)) / (2a) cancels catastrophically near the
         # paraboloid limit and for near-axial rays, where "a" is tiny. This form
         # also reduces continuously to the linear solution as a -> 0.
-        sign_b = be.where(b >= 0.0, 1.0, -1.0)
+        # The signs are device constants (resident_scalar), not uploads.
+        sign_b = be.where(
+            b >= 0.0,
+            resident_scalar(self, "sign", 1.0, b),
+            resident_scalar(self, "sign", -1.0, b),
+        )
         q = -0.5 * (b + sign_b * sqrt_disc)
         # Guard both denominators in place: masking a division by ~0 after the
         # fact still leaves an inf in the graph, which backpropagates as NaN.
