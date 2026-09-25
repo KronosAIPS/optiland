@@ -395,7 +395,17 @@ class TorchBackend(ArrayBackend):
                     "this bundle carries a gradient (a source or a surface "
                     "parameter requires grad)."
                 )
-            if backend.rng.device_state is None:
+            if not getattr(ctx, "compiled_step_warm", False):
+                # The trace's first bounce runs eagerly. It builds what the
+                # scene's objects make on first use -- a detector's frame and
+                # bin tables, the device-resident tables of the components,
+                # the generator's jump tables, the materials' memos -- which,
+                # built inside the compiled program, would break it at every
+                # new scene and send the whole bounce back to eager mode.
+                ctx.compiled_step_warm = True
+                return bounce_body(backend, ctx, rays)
+            state = backend.rng.device_state
+            if state is None or state[0].device != rays.x.device:
                 # The trace's seed as device data, so a new seed is a new
                 # input of the compiled step rather than a new program.
                 backend.rng.bind_device_state(rays.x)
