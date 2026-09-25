@@ -10,7 +10,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 import optiland.backend as be
@@ -59,6 +58,8 @@ class BaseDistribution(ABC):
         Returns:
             A tuple containing the figure and axes of the plot.
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         fig, ax = plt.subplots()
         ax.plot(be.to_numpy(self.x), be.to_numpy(self.y), "k*")
         t = np.linspace(0, 2 * be.pi, 256)

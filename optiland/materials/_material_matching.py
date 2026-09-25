@@ -12,13 +12,15 @@ from __future__ import annotations
 import pathlib
 import warnings
 from importlib import resources
-
-import pandas as pd
+from typing import TYPE_CHECKING
 
 from optiland._suggest import did_you_mean
 from optiland.materials._catalog_parsing import _levenshtein
 from optiland.materials.material_spec import MatchPolicy
 from optiland.materials.warnings import OptilandMaterialWarning
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 _DATA_NK_DIR = str(resources.files("optiland.database").joinpath("data-nk"))
 
@@ -239,6 +241,8 @@ def _find_matches(
         ]
 
     if dfi.empty:
+        import pandas as pd  # noqa: PLC0415
+
         return pd.DataFrame()
 
     dfi["similarity_score"] = dfi.apply(

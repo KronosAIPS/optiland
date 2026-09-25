@@ -9,25 +9,33 @@ Manuel Fragata Mendes, june 2025
 
 from __future__ import annotations
 
-import matplotlib.pyplot as plt
-from matplotlib.ticker import AutoMinorLocator, ScalarFormatter
-from mpl_toolkits.axes_grid1 import make_axes_locatable
+from typing import TYPE_CHECKING
 
 import optiland.backend as be
 from optiland.visualization.base import BaseViewer
 
+if TYPE_CHECKING:
+    import matplotlib.pyplot as plt
 
-class CustomScalarFormatter(ScalarFormatter):
-    """Custom formatter to handle both small and large numbers automatically."""
 
-    def __call__(self, x, pos=None):
-        # For values close to zero, use scientific notation
-        if abs(x) < 0.01 and x != 0.0:
-            self.set_scientific(True)
-            self.set_powerlimits((-3, 3))
-        else:
-            self.set_scientific(False)
-        return ScalarFormatter.__call__(self, x, pos)
+def _make_custom_scalar_formatter_class():
+    """Build ``CustomScalarFormatter`` on first use (matplotlib stays optional
+    until a caller actually draws)."""
+    from matplotlib.ticker import ScalarFormatter  # noqa: PLC0415
+
+    class CustomScalarFormatter(ScalarFormatter):
+        """Custom formatter to handle both small and large numbers automatically."""
+
+        def __call__(self, x, pos=None):
+            # For values close to zero, use scientific notation
+            if abs(x) < 0.01 and x != 0.0:
+                self.set_scientific(True)
+                self.set_powerlimits((-3, 3))
+            else:
+                self.set_scientific(False)
+            return ScalarFormatter.__call__(self, x, pos)
+
+    return CustomScalarFormatter
 
 
 class SurfaceSagViewer(BaseViewer):
@@ -65,6 +73,12 @@ class SurfaceSagViewer(BaseViewer):
             buffer_factor (float, optional): Factor to multiply the aperture by
                 to add a buffer around the plot. Defaults to 1.1.
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+        from matplotlib.ticker import AutoMinorLocator  # noqa: PLC0415
+        from mpl_toolkits.axes_grid1 import make_axes_locatable  # noqa: PLC0415
+
+        CustomScalarFormatter = _make_custom_scalar_formatter_class()  # noqa: N806
+
         is_gui_embedding = fig_to_plot_on is not None
 
         if is_gui_embedding:

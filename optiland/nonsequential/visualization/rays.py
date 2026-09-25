@@ -13,13 +13,9 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
-import contextlib
 from typing import TYPE_CHECKING
 
 import numpy as np
-
-with contextlib.suppress(ImportError):
-    import vtk
 
 from optiland.nonsequential.tracer import NSQTracer
 from optiland.visualization.system.utils import project_rays
@@ -297,13 +293,15 @@ class NSQRays3D(NSQRays2D):
     def _plot_lines(
         self, renderer, theme=None, projection=None, color_by="source", num_rays=0
     ):
+        import vtk  # noqa: PLC0415
+
         ray_cycle = theme.parameters.get("ray_cycle") if theme else None
 
         if ray_cycle is None:
             color = self._rgb_colors[0]
             ray_cycle = [color]
         else:
-            from matplotlib.colors import to_rgb
+            from matplotlib.colors import to_rgb  # noqa: PLC0415
 
             ray_cycle = [to_rgb(rc) for rc in ray_cycle]
             color = ray_cycle[0]
@@ -368,6 +366,8 @@ class NSQRays3D(NSQRays2D):
         self, renderer, ray_cycle, color, color_by, num_rays=0
     ) -> None:
         """Plot rays from the new structured event-log format (3D)."""
+        import vtk  # noqa: PLC0415
+
         for ev in _paths_from_events(self.recorded_paths["events"], num_rays):
             for b in range(1, len(ev)):
                 p0 = [ev["x"][b - 1], ev["y"][b - 1], ev["z"][b - 1]]

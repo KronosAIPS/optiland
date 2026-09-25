@@ -8,7 +8,6 @@ Kramer Harrison, 2024
 from __future__ import annotations
 
 import numpy as np  # noqa: TC002
-import vtk
 
 import optiland.backend as be
 from optiland.rays import RealRays
@@ -59,6 +58,8 @@ def transform_3d(actor, surface):
         The transformed actor with the applied rotation and translation.
 
     """
+    import vtk  # noqa: PLC0415
+
     cs = surface.geometry.cs
     translation, rot_mat = cs.get_effective_transform()
     dx, dy, dz = be.to_numpy(translation)
@@ -121,6 +122,8 @@ def revolve_contour(x, y, z):
         vtk.vtkActor: VTK actor representing the revolved 3D surface.
 
     """
+    import vtk  # noqa: PLC0415
+
     pts = [(xi, yi, zi) for xi, yi, zi in zip(x, y, z, strict=False)]
 
     points = vtk.vtkPoints()

@@ -15,8 +15,6 @@ from __future__ import annotations
 import warnings
 from importlib import resources
 
-import pandas as pd
-
 from optiland.materials.material_file import MaterialFile
 from optiland.materials.material_spec import MatchPolicy
 from optiland.materials.registry import MaterialRegistry
@@ -189,6 +187,8 @@ class Material(MaterialFile):
 
         # If no rows match, return an empty DataFrame
         if dfi.empty:
+            import pandas as pd  # noqa: PLC0415
+
             return pd.DataFrame()
 
         # Calculate similarity scores using Levenshtein distance

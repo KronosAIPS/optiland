@@ -15,9 +15,12 @@ import pathlib
 import tempfile
 import warnings
 from importlib import resources
+from typing import TYPE_CHECKING
 
-import pandas as pd
 import yaml
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 import optiland.plugins as plugins
 from optiland.materials._catalog_parsing import (
@@ -73,6 +76,8 @@ class MaterialRegistry:
     def built_in_df(self) -> pd.DataFrame:
         """Lazy-loaded, cached built-in catalog DataFrame."""
         if self.__built_in_df is None:
+            import pandas as pd  # noqa: PLC0415
+
             self.__built_in_df = pd.read_csv(_CATALOG_CSV)
         return self.__built_in_df
 
@@ -180,6 +185,8 @@ class MaterialRegistry:
 
         index_csv = d / "catalog.csv"
         if index_csv.exists():
+            import pandas as pd  # noqa: PLC0415
+
             extra_df = pd.read_csv(index_csv)
             catalog_name = d.name.lower()
             if "catalog_dir" not in extra_df.columns:
@@ -306,6 +313,8 @@ class MaterialRegistry:
         """Return built-in + user entries as a single DataFrame (cached)."""
         if self._combined_cache is not None:
             return self._combined_cache
+
+        import pandas as pd  # noqa: PLC0415
 
         built_in = self.built_in_df.copy()
         built_in["catalog_dir"] = built_in.apply(

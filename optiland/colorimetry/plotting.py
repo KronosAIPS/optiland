@@ -4,15 +4,15 @@ Colorimetry plotting utilities.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.collections import LineCollection
-from matplotlib.path import Path
 from scipy.interpolate import interp1d
 
 import optiland.backend as be
+
+if TYPE_CHECKING:
+    import matplotlib.pyplot as plt
 
 from .constants import CIE_1931_2DEG, WAVELENGTHS_STD
 
@@ -58,6 +58,10 @@ def plot_cie_1931_chromaticity_diagram(
     Returns:
         Tuple (Figure, Axes).
     """
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    from matplotlib.collections import LineCollection  # noqa: PLC0415
+    from matplotlib.path import Path  # noqa: PLC0415
+
     if ax is None:
         fig, ax = plt.subplots(figsize=(6, 6))
     else:

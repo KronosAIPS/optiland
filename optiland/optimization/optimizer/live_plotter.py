@@ -3,10 +3,7 @@
 from __future__ import annotations
 
 import gc
-from typing import Any
-
-import matplotlib
-import matplotlib.pyplot as plt
+from typing import TYPE_CHECKING, Any
 
 try:
     from IPython.display import display
@@ -15,11 +12,17 @@ except ImportError:  # IPython optional; only needed for the Jupyter inline back
 
 import optiland.backend as be
 
+if TYPE_CHECKING:
+    import matplotlib.pyplot as plt
+
 
 class LiveOptimizationPlotter:
     """Live matplotlib plot of the optimizer's merit-function history."""
 
     def __init__(self, optimizer: Any) -> None:
+        import matplotlib  # noqa: PLC0415
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         self.optimizer = optimizer
         self.history: list[float] = []
 
@@ -43,6 +46,8 @@ class LiveOptimizationPlotter:
     def initialize(self) -> None:
         """Create persistent figures once so CLI backends keep the windows alive
         and draw a placeholder content immediately."""
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         if self._initialized:
             return
 
@@ -176,6 +181,8 @@ class LiveOptimizationPlotter:
 
     def _force_render(self) -> None:
         """Force an immediate GUI draw so the user sees populated windows."""
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         assert self._system_fig is not None
         assert self._merit_fig is not None
 
@@ -205,6 +212,8 @@ class LiveOptimizationPlotter:
         gc.collect()
 
     def finalize(self) -> None:
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         if self._is_inline_backend:
             if self._merit_fig is not None:
                 plt.close(self._merit_fig)

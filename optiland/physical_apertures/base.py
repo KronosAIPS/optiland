@@ -15,8 +15,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING
 
-import matplotlib.pyplot as plt
-
 import optiland.backend as be
 
 if TYPE_CHECKING:
@@ -136,6 +134,8 @@ class BaseAperture(ABC):
             tuple: A tuple containing the figure and axes objects.
 
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         x_min, x_max, y_min, y_max = self.extent
         x_min = x_min * buffer
         x_max = x_max * buffer

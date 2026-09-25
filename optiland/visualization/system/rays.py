@@ -8,7 +8,6 @@ Kramer Harrison, 2024
 from __future__ import annotations
 
 import numpy as np
-import vtk
 
 import optiland.backend as be
 from optiland.utils import resolve_fields, resolve_wavelengths
@@ -438,8 +437,10 @@ class Rays3D(Rays2D):
             theme (Theme, optional): The theme to apply. Defaults to None.
 
         """
+        import vtk  # noqa: PLC0415
+
         if theme:
-            from matplotlib.colors import to_rgb
+            from matplotlib.colors import to_rgb  # noqa: PLC0415
 
             ray_cycle = theme.parameters.get("ray_cycle")
             color = to_rgb(ray_cycle[color_idx % len(ray_cycle)])

@@ -15,9 +15,9 @@ from optiland.colorimetry import core as color_core
 from optiland.colorimetry.plotting import plot_cie_1931_chromaticity_diagram
 
 if TYPE_CHECKING:
-    from .stack import ThinFilmStack
+    import matplotlib.pyplot as plt
 
-import matplotlib.pyplot as plt
+    from .stack import ThinFilmStack
 
 # Physical constants
 SPEED_OF_LIGHT = 299792458.0  # m/s
@@ -197,6 +197,8 @@ class SpectralAnalyzer:
         Returns:
             Tuple of (figure, axes)
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         # Convert inputs
         wl_um = self._convert_to_wavelength_um(wavelength_values, wavelength_unit)
         aoi_rad = float(self._convert_angle_to_radians(aoi, aoi_unit).item())
@@ -267,6 +269,8 @@ class SpectralAnalyzer:
         Returns:
             Tuple of (figure, axes)
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         # Convert inputs
         aoi_rad = self._convert_angle_to_radians(aoi_values, aoi_unit)
         wl_um = float(
@@ -366,6 +370,8 @@ class SpectralAnalyzer:
     ) -> tuple[plt.Figure, list[list[plt.Axes]]]:
         """Create or normalize the figure/axes grid for map_view."""
         if fig is None or axs is None:
+            import matplotlib.pyplot as plt  # noqa: PLC0415
+
             # Organize subplots: polarizations as columns, quantities as rows
             fig, axs = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows))
 

@@ -10,10 +10,7 @@ from __future__ import annotations
 import warnings
 from typing import Any
 
-import matplotlib.pyplot as plt
 import numpy as np
-import vtk
-from matplotlib.patches import Polygon
 
 import optiland.backend as be
 from optiland.physical_apertures import (
@@ -158,6 +155,8 @@ class Lens2D:
         self.artist_surfaces = {}
         self.boundary_coordinates = {}
         if projection == "XY":
+            import matplotlib.pyplot as plt  # noqa: PLC0415
+
             # For XY projection, draw a circle representing the lens aperture
             max_extent = self._get_max_extent()
 
@@ -307,6 +306,8 @@ class Lens2D:
                 'XZ', or 'YZ'. Defaults to 'YZ'.
 
         """
+        from matplotlib.patches import Polygon  # noqa: PLC0415
+
         facecolor = (0.8, 0.8, 0.8, 0.6)
         edgecolor = (0.5, 0.5, 0.5)
         if theme:
@@ -567,6 +568,8 @@ class Lens3D(Lens2D):
                             attributes.
             renderer (vtkRenderer): The VTK renderer to add the annulus actor to.
         """
+        import vtk  # noqa: PLC0415
+
         surf_props = surface_3d_obj.surf  # Actual Surface object with .geometry
         surf_geom = surf_props.geometry
 
@@ -663,6 +666,8 @@ class Lens3D(Lens2D):
                 circles.
 
         """
+        import vtk  # noqa: PLC0415
+
         num_points = len(circle1)
 
         # Create vtkPoints object to hold all the points from both circles

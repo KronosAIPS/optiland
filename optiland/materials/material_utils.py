@@ -8,15 +8,14 @@ from importlib import resources
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import matplotlib.pyplot as plt
 import yaml
-from matplotlib.axes import Axes
 from scipy.cluster.vq import kmeans2
 
 import optiland.backend as be
 from optiland.materials.material import Material
 
 if TYPE_CHECKING:
+    from matplotlib.axes import Axes
     from matplotlib.figure import Figure
 
 
@@ -281,6 +280,8 @@ def plot_glass_map(
         - The V_d axis is reversed to match
           optical engineering conventions.
     """
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+
     # Buffers for standard and highlighted glasses
     x_vd, y_nd, labels = [], [], []
     x_vd_hl, y_nd_hl, labels_hl = [], [], []
@@ -406,6 +407,9 @@ def _resolve_nk_axes(
     ax: Axes | tuple[Axes, Axes] | None,
 ) -> tuple[Figure, Axes, Axes]:
     """Resolve the ``ax`` argument of ``plot_nk`` into ``(fig, ax_n, ax_k)``."""
+    import matplotlib.pyplot as plt  # noqa: PLC0415
+    from matplotlib.axes import Axes  # noqa: PLC0415
+
     if ax is None:
         fig, ax_n = plt.subplots()
         ax_k = ax_n.twinx()

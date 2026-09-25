@@ -13,8 +13,6 @@ re-worked by Manuel Fragata Mendes, june 2025
 
 from __future__ import annotations
 
-import pandas as pd
-
 import optiland.backend as be
 from optiland.geometries import (
     ChebyshevPolynomialGeometry,
@@ -51,6 +49,8 @@ class LensInfoViewer(BaseViewer):
         The lens information includes the surface type, radius, thickness,
         material, conic, and semi-aperture of each surface.
         """
+        import pandas as pd  # noqa: PLC0415
+
         self.optic.updater.update_paraxial()
 
         surf_type = self._get_surface_types()

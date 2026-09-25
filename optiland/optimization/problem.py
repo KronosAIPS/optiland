@@ -13,8 +13,6 @@ from __future__ import annotations
 import warnings
 from typing import TYPE_CHECKING
 
-import pandas as pd
-
 import optiland.backend as be
 from optiland.optimization.operand import OperandManager
 from optiland.optimization.variable import VariableManager
@@ -227,6 +225,8 @@ class OptimizationProblem:
 
     def operand_info(self):
         """Print information about the operands in the merit function"""
+        import pandas as pd  # noqa: PLC0415
+
         data = {
             "Operand Type": [op.operand_type.replace("_", " ") for op in self.operands],
             "Target": [
@@ -273,6 +273,8 @@ class OptimizationProblem:
 
     def variable_info(self):
         """Print information about the variables in the merit function."""
+        import pandas as pd  # noqa: PLC0415
+
         data = {
             "Variable Type": [var.type for var in self.variables],
             "Surface": [var.surface_number for var in self.variables],
@@ -289,6 +291,8 @@ class OptimizationProblem:
 
     def merit_info(self):
         """Print information about the merit function."""
+        import pandas as pd  # noqa: PLC0415
+
         current_value = self.sum_squared()
 
         # Convert tensor to a Python scalar for calculations and printing

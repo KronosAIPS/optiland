@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Literal
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 from optiland import backend as be
@@ -143,6 +142,8 @@ class ZernikeFit:
         Raises:
             ValueError: If `projection` is not '2d' or '3d'.
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         is_gui_embedding = fig_to_plot_on is not None
         if is_gui_embedding:
             current_fig = fig_to_plot_on
@@ -207,6 +208,8 @@ class ZernikeFit:
         Returns:
             tuple: A tuple containing the figure and axes objects.
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         # Compute fitted values and residuals
         fitted = self.zernike.poly(self.radius, self.phi)
         residuals = fitted - self.z
@@ -249,6 +252,8 @@ class ZernikeFit:
                 (default is 'OPD (waves)').
 
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         im = ax.imshow(np.flipud(z), extent=[-1, 1, -1, 1])
         ax.set_xlabel("Pupil X")
         ax.set_ylabel("Pupil Y")

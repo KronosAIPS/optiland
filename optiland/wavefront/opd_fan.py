@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, cast
 
-import matplotlib.pyplot as plt
 import numpy as np
 
 import optiland.backend as be
@@ -94,6 +93,8 @@ class OPDFan(Wavefront):
             wavelengths, or if the number of fields is not equal to the
             number of rays.
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         num_rows = len(self.fields)
         is_gui_embedding = fig_to_plot_on is not None
 

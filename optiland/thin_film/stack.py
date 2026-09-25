@@ -20,10 +20,10 @@ from .core import _tmm_coh
 from .layer import Layer
 
 if TYPE_CHECKING:
+    import matplotlib.pyplot as plt
+
     from optiland.materials import BaseMaterial
 import re
-
-import matplotlib.pyplot as plt
 
 Pol = Literal["s", "p", "u"]
 PlotType = Literal["R", "T", "A"]
@@ -573,6 +573,8 @@ class ThinFilmStack:
             tuple[plt.Figure, plt.Axes]: The matplotlib Figure and Axes objects
                 containing the plot.
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         if ax is None:
             fig, ax = plt.subplots()
 
@@ -638,10 +640,11 @@ class ThinFilmStack:
             tuple[plt.Figure, plt.Axes]: The matplotlib Figure and Axes objects
                 containing the plot.
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
 
         if ax is None:
             fig, ax = plt.subplots()
-        import matplotlib.colors as mcolors
+        import matplotlib.colors as mcolors  # noqa: PLC0415
 
         ax.grid(True, alpha=0.3)
         color_cycle = list(mcolors.TABLEAU_COLORS.values())

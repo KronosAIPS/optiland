@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, TypedDict, cast
 
-import matplotlib.pyplot as plt
 import numpy as np
 from scipy.interpolate import griddata
 
@@ -127,6 +126,8 @@ class OPD(Wavefront):
         Raises:
             ValueError: If the projection is not '2d' or '3d'.
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         is_gui_embedding = fig_to_plot_on is not None
         if is_gui_embedding:
             current_fig = cast("Figure", fig_to_plot_on)
@@ -180,6 +181,8 @@ class OPD(Wavefront):
             figsize (tuple, optional): The figure size. Defaults to (7, 5.5).
 
         """
+        import matplotlib.pyplot as plt  # noqa: PLC0415
+
         im = ax.imshow(
             np.flipud(data["z"]), extent=(-1, 1, -1, 1)
         )  # np.flipud is fine here as data['z'] is already numpy
