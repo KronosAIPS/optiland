@@ -353,7 +353,10 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             # variance changes. reflect_prob="fresnel" reproduces the
             # original weight formula exactly.
             p_be = resolve_reflect_prob(sampling, R_det) if sampling else R_det
-            p_det = be.clip(_detached(p_be), 1e-12, 1.0 - 1e-12)
+            # [1e-12, 1 - 1e-12] at float64, [1e-12, 1 - 4 u] where the upper
+            # literal would round to 1 (float32): see _tol.branch_probability_bounds.
+            p_lo, p_hi = _tol.branch_probability_bounds(p_be)
+            p_det = be.clip(_detached(p_be), p_lo, p_hi)
             u = rng.uniform(ray_id_key, bounce_key, EventSlot.FRESNEL_BRANCH)
             do_reflect = (u < p_det) | tir
 
