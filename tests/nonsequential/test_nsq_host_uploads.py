@@ -20,8 +20,6 @@ previous bounce ran on, so a once-per-trace upload (a glass table, a
 detector's bin edges) and a once-per-batch one (the fresh batch itself) are
 not mistaken for per-bounce costs. The traces run at a fixed width
 (``alive_check_every=0``), the configuration a CUDA graph captures.
-
-Kramer Harrison, 2026
 """
 
 from __future__ import annotations

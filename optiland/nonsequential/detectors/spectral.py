@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Literal
 import numpy as np
 
 import optiland.backend as be
-from optiland.nonsequential._tally import masked_count
+from optiland.nonsequential._tally import accumulate, masked_count
 from optiland.nonsequential._utils import (
     as_detached_param,
     clamp_int,
@@ -177,7 +177,7 @@ class SpectralDetector(BaseDetector):
             self._record_gaussian(hx_l, hy_l, flux_masked, iwl, nx, ny, dx, dy)
         else:
             self._record_bilinear(hx_l, hy_l, flux_masked, iwl, nx, ny, dx, dy)
-        self._num_rays_hit = self._num_rays_hit + masked_count(hit_mask)
+        self._num_rays_hit = accumulate(self._num_rays_hit, masked_count(hit_mask))
 
     def _flat_index(self, iy, ix, iwl):
         """Flatten (iy, ix, iwl) into the flux-map buffer's flat index."""

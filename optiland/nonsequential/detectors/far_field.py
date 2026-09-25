@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 import optiland.backend as be
-from optiland.nonsequential._tally import Tally, masked_count, masked_sum
+from optiland.nonsequential._tally import Tally, accumulate, masked_count, masked_sum
 from optiland.nonsequential._utils import clamp_int, to_numpy
 from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
@@ -164,7 +164,7 @@ class FarFieldDetector(BaseDetector):
             i_theta * self.num_bins_phi + i_phi,
             flux_masked / solid_angle,
         )
-        self._num_rays_hit = self._num_rays_hit + masked_count(hit_mask)
+        self._num_rays_hit = accumulate(self._num_rays_hit, masked_count(hit_mask))
         # Track the radiometric flux separately: _intensity is divided by the
         # per-bin solid angle, so summing it gives W/sr, not W.
         self._total_flux.add(masked_sum(rays.flux, hit_mask))
