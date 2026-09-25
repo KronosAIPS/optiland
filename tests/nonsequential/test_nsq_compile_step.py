@@ -141,6 +141,22 @@ class TestTheOption:
         assert TorchBackend(compile_step="cpu", compile_options=_TRACED)._bounce_step(None) is not bounce_body
 
 
+class TestWithTheOtherOptions:
+    def test_not_combined_with_graph_replay(self, monkeypatch):
+        with pytest.raises(ValueError, match="ask for one"):
+            TorchBackend(graph_replay="emulate", compile_step=True)
+        # The environment's default is a harness default: an asked-for replay wins.
+        monkeypatch.setenv(COMPILE_STEP_ENV, "1")
+        assert TorchBackend(graph_replay="emulate").compile_step is False
+
+    def test_the_environment_block_records_the_step(self, torch_state):
+        be.set_precision("float64")
+        backend = TorchBackend(seed=7, compile_step=True, compile_options=_TRACED)
+        env = _trace(backend).environment
+        assert env["compile_step_requested"] is True and env["compile_step"] == "compiled"
+        assert "compile_step" not in _trace(TorchBackend(seed=7, compile_step=False)).environment
+
+
 class TestSplittingRunsTheEagerBounce:
     def test_a_splitting_trace_runs_the_eager_body_and_says_so(self, torch_state):
         """Bounded splitting reads its rows on the host and grows the bundle

@@ -94,6 +94,11 @@ explicitly to :class:`~optiland.nonsequential.tracer.NSQTracer` or
                                 ``max_depth``; CUDA only, off by default
    ``graph_replay="emulate"``   the same bookkeeping run eagerly on any device:
                                 a capture-safety check, no speed-up
+   ``compile_step="mps"``       run each bounce through ``torch.compile`` on
+                                the Apple GPU (``True``: every device);
+                                forward only, off by default; the environment
+                                variable ``OPTILAND_NSQ_COMPILE_STEP`` sets the
+                                default for a backend built without it
    ============================ ===============================================
 
    ``graph_replay`` keeps each batch at its full width (no compaction), so its
@@ -108,6 +113,25 @@ explicitly to :class:`~optiland.nonsequential.tracer.NSQTracer` or
    mode, when splitting would run, with ``record_paths``, with a ray-database
    detector, and when the capture's guard finds an accumulator rebound inside
    the recorded bounce.
+
+   ``compile_step`` is the Apple GPU's counterpart: ``torch.compile`` of the
+   bounce body (``array_backend.bounce_body``, from traversal to Russian
+   roulette), so its some 2,500 array operations run as a few generated Metal
+   kernels instead of one launch each. The body compiles as one graph that
+   every scene and seed reuses: the seed enters as device data
+   (``NSQRng.bind_device_state``), the materials' indices and the medium ids
+   are prepared before each bounce, and each trace's first bounce runs
+   eagerly to build what the scene's objects make on first use. The numbers
+   are the eager loop's to within float32 rounding (fused kernels round
+   differently), not bit for bit; traced without generating kernels
+   (``compile_options={"backend": "eager"}``) they are bit-identical, which is
+   what the tests check. It is refused in gradient mode
+   (``CompiledStepError``), runs the eager bounce for a splitting trace or the
+   Warp generator (``compiled_step_active`` and
+   ``SimulationResult.environment["compile_step"]`` say which ran), and is not
+   combined with ``graph_replay``. Compilation costs seconds to a minute per
+   scene and bundle width, so it pays on long, launch-bound traces (the
+   integrating sphere), not on a few bounces of a window.
 
 There is **no separate GPU array backend.** GPU acceleration in the
 differentiable path comes from PyTorch device placement; the forward NumPy path

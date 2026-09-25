@@ -30,6 +30,11 @@ to running it on torch tensors on a device:
   .rng_warp`) when Warp is installed and the device is CUDA; anywhere else
   the limb path is kept without a warning, and the result's
   ``environment`` says which kernel drew the trace and why.
+- **compiled bounce step** (opt-in): ``TorchBackend(compile_step="mps")``
+  runs each bounce through ``torch.compile`` of the bounce body, as a few
+  generated kernels instead of some 2,500 launches; forward only, meant for
+  the Apple GPU, where torch has no graph capture
+  (:func:`compiled_bounce_body`).
 
 Memory scaling: O(num_rays x max_depth) activations when gradient_mode is
 "autograd". The recommended envelope is ~1e5 rays at depth 16 on a single
