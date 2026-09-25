@@ -79,6 +79,15 @@ class SimulationResult:
             (:class:`~optiland.nonsequential.results.reflection_histogram
             .ReflectionHistogram`), keyed by detector name, for every
             detector built with ``reflection_bins > 0``; empty otherwise.
+        environment: What the trace ran on: ``array_backend`` (``numpy``
+            or ``torch``), ``device``, ``precision`` and ``rng_kernel``,
+            the implementation of the keyed generator that drew every
+            random number (``numpy`` or ``torch`` for the limb path of
+            :mod:`optiland.nonsequential.rng`, ``warp`` for the fused kernel
+            of :mod:`optiland.nonsequential.rng_warp`; the values are the
+            same bit for bit, only the cost differs). A backend with a
+            choice also records what was asked for (``rng_kernel_requested``)
+            and, when it could not be honoured, why (``rng_kernel_note``).
     """
 
     detectors: dict[str, object] = field(default_factory=dict)
@@ -101,6 +110,7 @@ class SimulationResult:
     ray_paths: dict | None = None
     diagnostics: Diagnostics = field(default_factory=Diagnostics)
     reflection_histograms: dict[str, object] = field(default_factory=dict)
+    environment: dict[str, object] = field(default_factory=dict)
 
     def report(self) -> str:
         """Full human-readable diagnostic report for this trace.
