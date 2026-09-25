@@ -549,6 +549,9 @@ def _register_geometries() -> None:
     from optiland.nonsequential.components.geometry.analytic.frustum import (  # noqa: PLC0415
         CylindricalFrustumGeometry,
     )
+    from optiland.nonsequential.components.geometry.analytic.lenslet_array import (  # noqa: PLC0415
+        LensletArrayGeometry,
+    )
     from optiland.nonsequential.components.geometry.analytic.plane import (  # noqa: PLC0415
         FinitePlaneGeometry,
         PlaneGeometry,
@@ -637,6 +640,21 @@ def _register_geometries() -> None:
         lambda g: {
             "vertices": np.asarray(g.mesh.vertices, dtype=np.float64).tolist(),
             "faces": np.asarray(g.mesh.faces, dtype=np.int64).tolist(),
+        },
+    )
+    kinds.register_geometry(
+        "lenslet_array",
+        LensletArrayGeometry,
+        lambda g: {
+            "pitch_x": g.pitch_x,
+            "pitch_y": g.pitch_y,
+            "radius": g.radius,
+            "conic": g.conic,
+            "num_x": g.num_x,
+            "num_y": g.num_y,
+            "sag_offsets": (
+                g.sag_offsets.tolist() if g.sag_offsets is not None else None
+            ),
         },
     )
 

@@ -70,7 +70,7 @@ Public API (selected)::
         ConicGeometry, FinitePlaneGeometry, MeshGeometry, SphereGeometry,
         ParaboloidGeometry, PlaneGeometry,
         CylindricalFrustumGeometry, AnnularPlaneGeometry,
-        SphericalCavityGeometry, SphericalPort,
+        SphericalCavityGeometry, SphericalPort, LensletArrayGeometry,
         # BSDF
         SpecularBRDF, LambertianBSDF, HarveyShackBSDF, TabulatedBSDF,
         # Detectors
@@ -281,6 +281,7 @@ from optiland.nonsequential.components.geometry import (
 from optiland.nonsequential.components.geometry.analytic import (
     AnnularPlaneGeometry,
     CylindricalFrustumGeometry,
+    LensletArrayGeometry,
 )
 
 # Converter
