@@ -527,19 +527,139 @@ class TestRefusals:
         assert backend.compact_every is None
 
 
+#: How far a float64 sum of a replayed trace on CUDA may lie from the eager
+#: trace's, in units in the last place of the larger of the two.
+_CUDA_F64_ULPS = 8
+#: The absolute window for a near-zero residual of cancellation, on CUDA at
+#: float64: the conservation error and the sampling residual are sums of O(1)
+#: terms that cancel, so their rounding is absolute, about n u, and a window in
+#: ulps of the tiny result means nothing.
+_CUDA_F64_RESIDUAL_ABS = 1e-15
+_RESIDUALS = ("conservation_error", "sampling_residual")
+
+
+def _numbers(result) -> dict:
+    """Every number a trace returns, on the host, for a comparison within a window."""
+    out = {key: _host(v) for key, v in vars(result).items() if key not in _SKIP}
+    out["underflows"] = result.diagnostics.medium_stack_underflows
+    for name, det in result.detectors.items():
+        for key, value in vars(det).items():
+            out[f"{name}.{key}"] = _host(value)
+    for name, hist in (result.reflection_histograms or {}).items():
+        for key, value in vars(hist).items():
+            out[f"{name}.hist.{key}"] = _host(value)
+    return out
+
+
+def _cuda_float64_mismatches(a: dict, b: dict) -> list[str]:
+    """The keys whose values differ by more than CUDA's float64 sums vary.
+
+    A floating-point value passes within :data:`_CUDA_F64_ULPS` ulps of the
+    larger magnitude, element by element; a residual of cancellation (a key
+    naming one of :data:`_RESIDUALS`) also passes within
+    :data:`_CUDA_F64_RESIDUAL_ABS`. Everything else -- counts, integer arrays,
+    shapes, dtypes, names -- must be equal.
+    """
+    bad = []
+    for key in sorted(a.keys() | b.keys()):
+        if key not in a or key not in b:
+            bad.append(key)
+            continue
+        x, y = a[key], b[key]
+        is_float = isinstance(x, (float, np.floating, np.ndarray)) and isinstance(
+            y, (float, np.floating, np.ndarray)
+        )
+        xa, ya = (np.asarray(x), np.asarray(y)) if is_float else (None, None)
+        if not (
+            is_float
+            and xa.dtype.kind == "f"
+            and ya.dtype.kind == "f"
+            and xa.dtype == ya.dtype
+            and xa.shape == ya.shape
+        ):
+            if _bits(x) != _bits(y):
+                bad.append(key)
+            continue
+        xa = xa.astype(np.float64)
+        ya = ya.astype(np.float64)
+        window = _CUDA_F64_ULPS * np.spacing(np.maximum(np.abs(xa), np.abs(ya)))
+        if any(r in key for r in _RESIDUALS):
+            window = np.maximum(window, _CUDA_F64_RESIDUAL_ABS)
+        same = (xa == ya) | (np.isnan(xa) & np.isnan(ya))
+        if not np.all(same | (np.abs(xa - ya) <= window)):
+            bad.append(key)
+    return bad
+
+
+class TestTheCudaFloat64Window:
+    """The window the CUDA float64 comparison below applies, checked on any machine."""
+
+    def test_eight_ulps_pass_and_nine_do_not(self):
+        x = 0.9202572144827852
+        near = x + 8 * np.spacing(x)
+        far = x + 9 * np.spacing(x)
+        assert _cuda_float64_mismatches({"flux": x}, {"flux": near}) == []
+        assert _cuda_float64_mismatches({"flux": x}, {"flux": far}) == ["flux"]
+        arr = np.array([1.0, 2.0**-40, 0.0])
+        moved = arr + 4 * np.spacing(arr)
+        assert _cuda_float64_mismatches({"D.data": arr}, {"D.data": moved}) == []
+
+    def test_a_residual_passes_absolutely_and_nothing_else_does(self):
+        # The measured pair of the A100 check: 1.2e-16 against 1.4e-17.
+        a = {"flux_conservation_error": 1.2e-16, "total_flux_escaped": 1.2e-16}
+        b = {"flux_conservation_error": 1.4e-17, "total_flux_escaped": 1.4e-17}
+        assert _cuda_float64_mismatches(a, b) == ["total_flux_escaped"]
+        assert _cuda_float64_mismatches(
+            {"flux_conservation_error": 0.0}, {"flux_conservation_error": 2e-15}
+        ) == ["flux_conservation_error"]
+
+    def test_counts_and_integer_arrays_stay_exact(self):
+        a = {"num_rays_escaped": 10, "D.hits": np.array([1, 2], dtype=np.int64)}
+        b = {"num_rays_escaped": 11, "D.hits": np.array([1, 3], dtype=np.int64)}
+        assert _cuda_float64_mismatches(a, b) == ["D.hits", "num_rays_escaped"]
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
 class TestOnCuda:
-    """The recorded graph itself: every number equals the eager fixed-width trace's."""
+    """The recorded graph itself, against the eager fixed-width trace on CUDA.
 
+    At float32 every number must be identical. At float64 every value must lie
+    within 8 ulps of the eager trace's, and the near-zero residuals of
+    cancellation (the conservation error, the sampling residual) within an
+    absolute 1e-15 (:func:`_cuda_float64_mismatches`). The reason is CUDA, not
+    the replay: its float64 scatter-add into the detector buffers uses atomic
+    additions, whose order varies from run to run. The control, on one A100 on
+    2026-09-25: two identical eager float64 traces differed by up to 6 ulps in
+    a detector buffer and 2 ulps in the detected flux, and were bit-identical
+    under ``torch.use_deterministic_algorithms(True)``. The replay against the
+    eager trace, same machine: 1 to 4 ulps (the ghost histogram's flux 2, its
+    flux squared 4, the spectral tap's total 1) and conservation residuals of
+    1.2e-16 against 1.4e-17 and 2.8e-16 against 5.6e-17. Float32 terms sum
+    exactly into the float64 accumulators at these counts, so float32 stays
+    exact; the CPU stays exact too (the emulated replay above).
+    """
+
+    @pytest.mark.parametrize("precision", ["float64", "float32"])
     @pytest.mark.parametrize("scene_name", sorted(_SCENES))
-    def test_the_replayed_trace_is_the_eager_fixed_width_trace(self, scene_name):
+    def test_the_replayed_trace_is_the_eager_fixed_width_trace(
+        self, scene_name, precision
+    ):
         be.set_device("cuda")
+        be.set_precision(precision)
         try:
             scene_fn, depth = _SCENES[scene_name]
             eager = TorchBackend(seed=11, alive_check_every=0, compact_every=0)
             replayed = TorchBackend(seed=11, alive_check_every=0, graph_replay=True)
-            a = _ledger(_trace(scene_fn, depth, eager))
-            b = _ledger(_trace(scene_fn, depth, replayed))
+            eager_result = _trace(scene_fn, depth, eager)
+            replayed_result = _trace(scene_fn, depth, replayed)
         finally:
+            be.set_precision("float64")
             be.set_device("cpu")
-        assert a == b, sorted(k for k in a if a[k] != b.get(k))
+        if precision == "float32":
+            a, b = _ledger(eager_result), _ledger(replayed_result)
+            assert a == b, sorted(k for k in a if a[k] != b.get(k))
+        else:
+            bad = _cuda_float64_mismatches(
+                _numbers(eager_result), _numbers(replayed_result)
+            )
+            assert bad == [], bad
