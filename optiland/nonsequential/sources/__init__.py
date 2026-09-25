@@ -11,6 +11,7 @@ from .configs import (
     TabulatedSourceConfig,
 )
 from .extended import ExtendedSource
+from .photometric_files import PhotometricTable, read_eulumdat, read_ies, write_ies
 from .point import PointSource
 from .registry import SourceRegistry
 from .spectra import PiecewiseLinearSpectrum
@@ -24,9 +25,13 @@ __all__ = [
     "ExtendedSourceConfig",
     "PointSource",
     "PointSourceConfig",
+    "PhotometricTable",
     "PiecewiseLinearSpectrum",
     "Spectrum",
     "SourceRegistry",
     "TabulatedSource",
     "TabulatedSourceConfig",
+    "read_eulumdat",
+    "read_ies",
+    "write_ies",
 ]

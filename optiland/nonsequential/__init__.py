@@ -327,6 +327,7 @@ from optiland.nonsequential.sources import (
     CollimatedSourceConfig,
     ExtendedSource,
     ExtendedSourceConfig,
+    PhotometricTable,
     PiecewiseLinearSpectrum,
     PointSource,
     PointSourceConfig,
@@ -334,6 +335,9 @@ from optiland.nonsequential.sources import (
     Spectrum,
     TabulatedSource,
     TabulatedSourceConfig,
+    read_eulumdat,
+    read_ies,
+    write_ies,
 )
 from optiland.nonsequential.tracer import NSQTracer, SimulationResult
 
@@ -367,6 +371,10 @@ __all__ = [
     "Spectrum",
     "TabulatedSource",
     "TabulatedSourceConfig",
+    "PhotometricTable",
+    "read_eulumdat",
+    "read_ies",
+    "write_ies",
     # Components -- raw
     "AbsorbingComponent",
     "ParaxialLensComponent",
