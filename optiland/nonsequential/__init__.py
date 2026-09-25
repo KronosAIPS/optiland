@@ -192,6 +192,17 @@ Monte Carlo trace is numerically delicate near surface edges.
 - *Forward mode (no-grad / NumPy backend)*: 1 × 10\ :sup:`7`\+ rays, depth
   16, fully batched.
 
+Adding a kind
+-------------
+Sources, detectors, geometries, scatter models, compound components and
+spectra are *kinds* held in registries (:mod:`optiland.nonsequential.kinds`).
+The scene builder, JSON serialization and the lowering to the scene IR all
+look a kind up there, so a new kind -- inside the engine or in a separate
+package, through the ``optiland.nonsequential`` entry-point group -- is one
+``register_source`` / ``register_detector`` / ... call, and a gradient on a
+config field the kind does not declare ``attached`` raises instead of being
+dropped.
+
 Limitations & Roadmap
 ---------------------
 The biggest limitation is that **visibility gradients are zero** (silhouette,

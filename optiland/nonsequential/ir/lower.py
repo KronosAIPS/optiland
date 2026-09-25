@@ -129,7 +129,8 @@ class _MediumRegistry:
 
 
 def _lower_geometry(geometry: object) -> tuple[str, dict[str, Any]]:
-    """Map a live ``ComponentGeometry`` to an (IR kind, params) pair.
+    """Map a live ``ComponentGeometry`` to an (IR kind, params) pair, through
+    its geometry kind (:data:`optiland.nonsequential.kinds.GEOMETRIES`).
 
     Args:
         geometry: Any geometry object exposed by a scene surface.
@@ -141,90 +142,21 @@ def _lower_geometry(geometry: object) -> tuple[str, dict[str, Any]]:
     Raises:
         TypeError: If no lowering is registered for this geometry type.
     """
-    from optiland.nonsequential.components.geometry.analytic.annulus import (  # noqa: PLC0415
-        AnnularPlaneGeometry,
-    )
-    from optiland.nonsequential.components.geometry.analytic.conic import (  # noqa: PLC0415
-        ConicGeometry,
-    )
-    from optiland.nonsequential.components.geometry.analytic.frustum import (  # noqa: PLC0415
-        CylindricalFrustumGeometry,
-    )
-    from optiland.nonsequential.components.geometry.analytic.plane import (  # noqa: PLC0415
-        FinitePlaneGeometry,
-        PlaneGeometry,
-    )
-    from optiland.nonsequential.components.geometry.analytic.sphere import (  # noqa: PLC0415
-        SphereGeometry,
-    )
-    from optiland.nonsequential.components.geometry.analytic.spherical_cavity import (  # noqa: PLC0415
-        SphericalCavityGeometry,
-    )
-    from optiland.nonsequential.components.geometry.mesh.mesh_geometry import (  # noqa: PLC0415
-        MeshGeometry,
-    )
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    # ConicGeometry check also covers ParaboloidGeometry (a subclass that
-    # only fixes conic=-1 at construction time).
-    if isinstance(geometry, ConicGeometry):
-        return "conic", {
-            "radius": geometry.radius,
-            "conic": geometry.conic,
-            "aperture_radius": geometry.aperture_radius,
-        }
-    if isinstance(geometry, FinitePlaneGeometry):
-        return "plane", {
-            "width": geometry.width,
-            "height": geometry.height,
-            "aperture_radius": geometry.aperture_radius,
-        }
-    if isinstance(geometry, PlaneGeometry):
-        # Infinite plane: no width/height/aperture limit.
-        return "plane", {"width": None, "height": None, "aperture_radius": None}
-    if isinstance(geometry, AnnularPlaneGeometry):
-        return "annulus", {
-            "inner_radius": geometry.inner_radius,
-            "outer_radius": geometry.outer_radius,
-            "z_offset": geometry.z_offset,
-        }
-    if isinstance(geometry, CylindricalFrustumGeometry):
-        return "frustum", {
-            "r_front": geometry.r_front,
-            "r_back": geometry.r_back,
-            "z_front": geometry.z_front,
-            "z_back": geometry.z_back,
-        }
-    if isinstance(geometry, SphereGeometry):
-        return "sphere", {
-            "radius": geometry.radius,
-            "aperture_radius": geometry.aperture_radius,
-        }
-    if isinstance(geometry, SphericalCavityGeometry):
-        # Ports are plain data -- axis and angular radius -- so the cavity
-        # round-trips through the IR's JSON without a geometry object.
-        return "spherical_cavity", {
-            "radius": geometry.radius,
-            "ports": [
-                {
-                    "axis": list(port.unit_axis),
-                    "half_angle_deg": float(port.half_angle_deg),
-                }
-                for port in geometry.ports
-            ],
-        }
-    if isinstance(geometry, MeshGeometry):
-        mesh = geometry.mesh
-        return "mesh", {
-            "vertices": np.asarray(mesh.vertices, dtype=np.float64).tolist(),
-            "faces": np.asarray(mesh.faces, dtype=np.int64).tolist(),
-        }
-    raise TypeError(
-        f"No scene-IR lowering registered for geometry type {type(geometry).__name__}."
-    )
+    try:
+        spec = kinds.GEOMETRIES.for_object(geometry)
+    except TypeError:
+        raise TypeError(
+            "No scene-IR lowering registered for geometry type "
+            f"{type(geometry).__name__}."
+        ) from None
+    return spec.lowered_kind, spec.lower(geometry)
 
 
 def _lower_bsdf(bsdf: object | None) -> BsdfIR:
-    """Map a live ``BaseBSDF`` (or ``None``) to a :class:`BsdfIR`.
+    """Map a live ``BaseBSDF`` (or ``None``) to a :class:`BsdfIR`, through its
+    scatter kind (:data:`optiland.nonsequential.kinds.BSDFS`).
 
     Args:
         bsdf: A BSDF instance, or ``None`` for no attached scatter lobe.
@@ -235,46 +167,17 @@ def _lower_bsdf(bsdf: object | None) -> BsdfIR:
     Raises:
         TypeError: If no lowering is registered for this BSDF type.
     """
-    from optiland.nonsequential.bsdf.harvey_shack import (
-        HarveyShackBSDF,  # noqa: PLC0415
-    )
-    from optiland.nonsequential.bsdf.lambertian import LambertianBSDF  # noqa: PLC0415
-    from optiland.nonsequential.bsdf.specular import SpecularBRDF  # noqa: PLC0415
-    from optiland.nonsequential.bsdf.tabulated import TabulatedBSDF  # noqa: PLC0415
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
     if bsdf is None:
         return BsdfIR(kind="none")
-    if isinstance(bsdf, LambertianBSDF):
-        return BsdfIR(
-            kind="lambertian",
-            params={
-                "reflectance_value": bsdf.reflectance_value,
-                "transmissive_fraction": bsdf.transmissive_fraction,
-            },
-        )
-    if isinstance(bsdf, HarveyShackBSDF):
-        return BsdfIR(
-            kind="harvey_shack",
-            params={
-                "b0": bsdf.b0,
-                "l0": bsdf.l0,
-                "s": bsdf.s,
-                "transmissive_fraction": bsdf.transmissive_fraction,
-            },
-        )
-    if isinstance(bsdf, TabulatedBSDF):
-        return BsdfIR(
-            kind="tabulated",
-            params={
-                "path": str(bsdf.path),
-                "transmissive_fraction": bsdf.transmissive_fraction,
-            },
-        )
-    if isinstance(bsdf, SpecularBRDF):
-        return BsdfIR(kind="specular")
-    raise TypeError(
-        f"No scene-IR lowering registered for BSDF type {type(bsdf).__name__}."
-    )
+    try:
+        spec = kinds.BSDFS.for_object(bsdf)
+    except TypeError:
+        raise TypeError(
+            f"No scene-IR lowering registered for BSDF type {type(bsdf).__name__}."
+        ) from None
+    return BsdfIR(kind=spec.lowered_kind, params=spec.lower(bsdf))
 
 
 def _component_kind(component: BaseComponent) -> str:
@@ -319,28 +222,32 @@ def _component_kind(component: BaseComponent) -> str:
 
 
 def _lower_spectrum(spectrum: object) -> dict[str, Any]:
-    """Lower a ``Spectrum`` to a plain dict.
+    """Lower a spectrum to a plain dict, through its spectrum kind.
 
     Args:
-        spectrum: A ``Spectrum`` instance.
+        spectrum: A spectrum registered to a spectrum kind.
 
     Returns:
-        ``{"wavelengths": [...], "weights": [...]}``.
+        ``{"wavelengths": [...], "weights": [...]}`` for a line spectrum;
+        other kinds add ``"kind"``.
     """
-    return {
-        "wavelengths": np.asarray(spectrum.wavelengths, dtype=np.float64).tolist(),
-        "weights": np.asarray(spectrum.weights, dtype=np.float64).tolist(),
-    }
+    from optiland.nonsequential import kinds  # noqa: PLC0415
+
+    spec = kinds.SPECTRA.for_object(spectrum)
+    params = spec.lower(spectrum)
+    if spec.name == "lines":
+        return params
+    return {"kind": spec.name, **params}
 
 
 def _lower_source(
     idx: int, source: object, media: _MediumRegistry, *, strict: bool = True
 ) -> EmitterIR:
-    """Map a live source to an :class:`EmitterIR`.
+    """Map a live source to an :class:`EmitterIR`, through its source kind.
 
     Args:
         idx: Index to assign in ``SceneIR.emitters``.
-        source: A ``BaseNSQSource`` instance.
+        source: A source registered to a source kind.
         media: Shared medium registry to resolve/add the source's medium.
         strict: Forwarded to :meth:`_MediumRegistry.get_id`.
 
@@ -350,46 +257,26 @@ def _lower_source(
     Raises:
         TypeError: If no lowering is registered for this source type.
     """
-    from optiland.nonsequential.sources.collimated import (
-        CollimatedSource,  # noqa: PLC0415
-    )
-    from optiland.nonsequential.sources.extended import ExtendedSource  # noqa: PLC0415
-    from optiland.nonsequential.sources.point import PointSource  # noqa: PLC0415
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    common: dict[str, Any] = {
+    try:
+        spec = kinds.SOURCES.for_object(source)
+    except TypeError:
+        raise TypeError(
+            "No scene-IR lowering registered for source type "
+            f"{type(source).__name__}."
+        ) from None
+    params: dict[str, Any] = {
         "total_flux": source.total_flux,
         "spectrum": _lower_spectrum(source.spectrum),
+        **spec.lower(source),
     }
-    if isinstance(source, PointSource):
-        kind = "point"
-        params = {**common, "half_angle_deg": source.half_angle_deg}
-    elif isinstance(source, CollimatedSource):
-        kind = "collimated"
-        params = {
-            **common,
-            "aperture_radius": source.aperture_radius,
-            "profile": source.profile,
-            "gaussian_sigma": source.gaussian_sigma,
-        }
-    elif isinstance(source, ExtendedSource):
-        kind = "extended"
-        params = {
-            **common,
-            "width": source.width,
-            "height": source.height,
-            "aperture_radius": source.aperture_radius,
-            "half_angle_deg": source.half_angle_deg,
-        }
-    else:
-        raise TypeError(
-            f"No scene-IR lowering registered for source type {type(source).__name__}."
-        )
 
     medium = getattr(source, "medium", None)
     medium_id = media.get_id(medium, strict=strict) if medium is not None else None
     return EmitterIR(
         id=idx,
-        kind=kind,
+        kind=spec.lowered_kind,
         to_world=_to_world_matrix(source.cs),
         params=params,
         medium_id=medium_id,
@@ -398,11 +285,11 @@ def _lower_source(
 
 
 def _lower_detector(idx: int, detector: object) -> SensorIR:
-    """Map a live detector to a :class:`SensorIR`.
+    """Map a live detector to a :class:`SensorIR`, through its detector kind.
 
     Args:
         idx: Index to assign in ``SceneIR.sensors``.
-        detector: A ``BaseDetector`` instance.
+        detector: A detector registered to a detector kind.
 
     Returns:
         The corresponding :class:`SensorIR`.
@@ -410,82 +297,23 @@ def _lower_detector(idx: int, detector: object) -> SensorIR:
     Raises:
         TypeError: If no lowering is registered for this detector type.
     """
-    from optiland.nonsequential.detectors.far_field import (
-        FarFieldDetector,  # noqa: PLC0415
-    )
-    from optiland.nonsequential.detectors.hemisphere import (
-        HemisphereDetector,  # noqa: PLC0415
-    )
-    from optiland.nonsequential.detectors.irradiance import (
-        IrradianceDetector,  # noqa: PLC0415
-    )
-    from optiland.nonsequential.detectors.ray_database import (  # noqa: PLC0415
-        RayDatabaseDetector,
-    )
-    from optiland.nonsequential.detectors.spectral import (
-        SpectralDetector,  # noqa: PLC0415
-    )
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    if isinstance(detector, SpectralDetector):
-        kind = "spectral"
-        params = {
-            "width": detector.width,
-            "height": detector.height,
-            "num_pixels_x": detector.num_pixels_x,
-            "num_pixels_y": detector.num_pixels_y,
-            "wavelength_bins": np.asarray(
-                detector.wavelength_bins, dtype=np.float64
-            ).tolist(),
-            "splat": detector.splat,
-            "splat_sigma": detector.splat_sigma,
-        }
-    elif isinstance(detector, IrradianceDetector):
-        kind = "irradiance"
-        params = {
-            "width": detector.width,
-            "height": detector.height,
-            "num_pixels_x": detector.num_pixels_x,
-            "num_pixels_y": detector.num_pixels_y,
-            "splat": detector.splat,
-            "splat_sigma": detector.splat_sigma,
-            "side": detector.side,
-        }
-    elif isinstance(detector, HemisphereDetector):
-        # Before FarFieldDetector: the hemispherical collector is a
-        # subclass of it, and lowering it as a flat far-field detector
-        # would drop the shell radius from the IR.
-        kind = "hemisphere"
-        params = {
-            "radius": detector.radius,
-            "num_bins_theta": detector.num_bins_theta,
-            "num_bins_phi": detector.num_bins_phi,
-        }
-    elif isinstance(detector, FarFieldDetector):
-        kind = "far_field"
-        params = {
-            "num_bins_theta": detector.num_bins_theta,
-            "num_bins_phi": detector.num_bins_phi,
-            "side": detector.side,
-        }
-    elif isinstance(detector, RayDatabaseDetector):
-        kind = "ray_database"
-        geom = detector.geometry
-        params = {
-            "width": getattr(geom, "width", 10.0),
-            "height": getattr(geom, "height", 10.0),
-        }
-    else:
+    try:
+        spec = kinds.DETECTORS.for_object(detector)
+    except TypeError:
         raise TypeError(
-            f"No scene-IR lowering registered for detector type "
+            "No scene-IR lowering registered for detector type "
             f"{type(detector).__name__}."
-        )
+        ) from None
+    params = dict(spec.lower(detector))
     # A base-detector option, so every sensor kind carries it: the number of
     # exact reflection-count bins its flux is also booked by (0 = none).
     params["reflection_bins"] = int(getattr(detector, "reflection_bins", 0))
 
     return SensorIR(
         id=idx,
-        kind=kind,
+        kind=spec.lowered_kind,
         to_world=_to_world_matrix(detector.cs),
         params=params,
         primitive_id=None,  # still not literally in SceneIR.primitives
