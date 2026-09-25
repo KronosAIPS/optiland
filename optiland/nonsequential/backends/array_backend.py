@@ -151,6 +151,279 @@ def _cull_to_budget(
     return kept, culled_flux, culled_np
 
 
+
+class _BounceContext:
+    """What one bounce of a trace reads and books, fixed for the whole trace.
+
+    The scene and its lowered IR, the path recorder, the ray-id allocator of
+    bounded splitting, the per-trace tallies and the loop's constants. Built
+    once per ``trace`` call and handed to :func:`bounce_body` with the ray
+    bundle; the tallies and the recorder are the same objects the trace reads
+    back after the loop.
+    """
+
+    def __init__(
+        self,
+        *,
+        scene,
+        ir,
+        path_recorder,
+        allocator,
+        hit_counts,
+        bounding_scale,
+        max_depth,
+        min_flux_fraction,
+        flux_per_ray,
+        num_rays_escaped,
+        num_rays_flux_killed,
+        num_rays_depth_killed,
+        total_flux_escaped,
+        total_flux_bulk_absorbed,
+        total_flux_depth_killed,
+        total_flux_rr_killed,
+        total_flux_sampling_residual,
+    ) -> None:
+        self.scene = scene
+        self.ir = ir
+        self.path_recorder = path_recorder
+        self.allocator = allocator
+        self.hit_counts = hit_counts
+        self.bounding_scale = bounding_scale
+        self.max_depth = max_depth
+        self.min_flux_fraction = min_flux_fraction
+        self.flux_per_ray = flux_per_ray
+        self.num_rays_escaped = num_rays_escaped
+        self.num_rays_flux_killed = num_rays_flux_killed
+        self.num_rays_depth_killed = num_rays_depth_killed
+        self.total_flux_escaped = total_flux_escaped
+        self.total_flux_bulk_absorbed = total_flux_bulk_absorbed
+        self.total_flux_depth_killed = total_flux_depth_killed
+        self.total_flux_rr_killed = total_flux_rr_killed
+        self.total_flux_sampling_residual = total_flux_sampling_residual
+
+
+def bounce_body(backend, ctx: _BounceContext, rays: NSQRayBundle):
+    """One bounce of the trace loop, from traversal to Russian roulette.
+
+    Traversal (components and detectors), Beer-Lambert attenuation over the
+    segment, detector recording and the detector advance, the component
+    interactions, escape, depth truncation and roulette: the part of a bounce
+    that works on the bundle at one width. The bundle is updated in place and
+    the tallies in ``ctx`` are booked. The splitting merge, the medium-stack
+    flush and compaction stay in the loop, where the host reads they need
+    are allowed.
+
+    Args:
+        backend: The :class:`ArrayBackend` running the trace.
+        ctx: The trace's :class:`_BounceContext`.
+        rays: The live bundle, updated in place.
+
+    Returns:
+        The transmit children spawned by bounded splitting this bounce, or
+        ``None``.
+    """
+    # --- traversal -------------------------------------
+    t_min, hit_normals, comp_idx, hit_n_geom = backend.intersect_scene(
+        rays, ctx.scene.surfaces
+    )
+    (
+        det_t_min,
+        _det_normals,
+        det_idx,
+        det_absorb,
+        det_n_geom,
+    ) = intersect_detectors(rays, ctx.scene.detectors)
+
+    # Nearest hit: component vs detector
+    comp_closer = t_min <= det_t_min
+    any_comp_hit = comp_idx >= 0
+    any_det_hit = det_idx >= 0
+
+    det_first = any_det_hit & (~comp_closer | ~any_comp_hit)
+    comp_first = any_comp_hit & (~det_first)
+
+    # Rays that reach no detector carry t = inf. Zero those
+    # before multiplying by a direction: inf * 0 is NaN, which
+    # the be.where below discards but not before NumPy warns.
+    det_t_safe = be.where(
+        det_first, det_t_min, be.zeros_like(det_t_min)
+    )
+
+    # --- Beer-Lambert bulk absorption -------------------
+    # Attenuate flux over the segment each ray just
+    # travelled through its *current* medium (rays.k_current,
+    # set at its last crossing or its source's ambient
+    # medium) before this bounce's nearest hit -- component
+    # or detector, whichever is closer. Applied before
+    # interact()/detector recording touch flux or k_current
+    # so both see the already-attenuated value; k_current
+    # itself is only updated afterwards, by
+    # RefractiveComponent.interact(), for the medium the ray
+    # is now entering.
+    hit_first = comp_first | det_first
+    if not backend._empty(hit_first):
+        comp_t_safe = be.where(
+            comp_first, t_min, be.zeros_like(t_min)
+        )
+        hit_t = be.where(comp_first, comp_t_safe, det_t_safe)
+        alpha = 4.0 * be.pi * rays.k_current / rays.wavelength
+        # hit_t is in mm; alpha is in 1/um -> convert to um.
+        transmittance = be.exp(-alpha * hit_t * 1e3)
+        flux_before = rays.flux
+        rays.flux = flux_before * be.where(
+            hit_first, transmittance, be.ones_like(rays.flux)
+        )
+        ctx.total_flux_bulk_absorbed.add(
+            be.sum(flux_before - rays.flux)
+        )
+
+    # --- detector recording -----------------------------
+    for di, det in enumerate(ctx.scene.detectors):
+        mask_di = det_first & (det_idx == di)
+        if backend._empty(mask_di):
+            continue
+        det_name = getattr(det, "name", f"detector_{di}")
+        ctx.path_recorder.log_hits(
+            rays, mask_di, det_name, t_offset=det_t_safe
+        )
+        det.record(rays, det_t_safe, mask_di)
+        # Arriving flux by ghost order; a no-op unless the
+        # detector was built with reflection_bins.
+        det.record_reflections(rays, mask_di)
+
+    # Advance detector-hit rays. Absorbing detectors
+    # terminate the ray; absorb=False detectors are
+    # transmissive: the hit is recorded (above) and the ray
+    # continues on its unchanged direction.
+    if not backend._empty(det_first):
+        # An absorbing detector is terminal, so the plain
+        # global advance is all its rays' positions are ever
+        # used for -- p + t*d carries u*|t| of rounding and
+        # nothing reads it again.
+        terminal = det_first & det_absorb
+        dx = det_t_safe * rays.L
+        dy = det_t_safe * rays.M
+        dz = det_t_safe * rays.N
+        rays.x = be.where(terminal, rays.x + dx, rays.x)
+        rays.y = be.where(terminal, rays.y + dy, rays.y)
+        rays.z = be.where(terminal, rays.z + dz, rays.z)
+        # A transmissive detector is not terminal: the ray
+        # carries on from where this puts it and the next
+        # bounce tests the same plane again. It therefore
+        # gets a surface's treatment -- the hit point
+        # rebuilt in the detector's own frame, then pushed
+        # clear of the plane along the geometric normal, or
+        # a grazing crossing is recorded twice (R-07-6,
+        # docs/build/X7_grazing_exit.md section 6).
+        for di, det in enumerate(ctx.scene.detectors):
+            if det.absorb:
+                continue
+            crossed = det_first & (det_idx == di)
+            det.advance_to_hit(rays, det_t_safe, crossed)
+            det.offset_from_surface(rays, det_n_geom, crossed)
+        rays.bounce = be.where(det_first, rays.bounce + 1, rays.bounce)
+        rays.alive = rays.alive & ~terminal
+
+    # --- component interactions -------------------------
+    # Dispatched from the IR (ir.primitives[i].component_kind
+    # / .bsdf.kind) rather than by iterating scene.surfaces
+    # and checking isinstance. ray_id_allocator enables
+    # bounded splitting (NumPy forward engine only): a hit
+    # ray below ir.sampling.split_depth spawns both Fresnel
+    # children instead of drawing one, and the transmit child
+    # comes back as spawned (merged into `rays` below, after
+    # this bounce's own kill checks -- see the merge
+    # comment).
+    spawned = apply_primitive_interactions(
+        rays,
+        ctx.ir,
+        ctx.scene.surfaces,
+        t_min,
+        hit_normals,
+        hit_n_geom,
+        comp_idx,
+        comp_first,
+        backend.rng,
+        log_hit_fn=ctx.path_recorder.log_hits,
+        ray_id_allocator=ctx.allocator,
+        skip_unhit=backend.host_reads_free,
+        hit_counts=ctx.hit_counts,
+    )
+
+    # --- escape -----------------------------------------
+    no_hit = ~any_comp_hit & ~any_det_hit
+    escaped_now = no_hit & rays.alive
+    if not backend._empty(escaped_now):
+        ctx.num_rays_escaped.add_count(escaped_now)
+        ctx.total_flux_escaped.add_masked_sum(rays.flux, escaped_now)
+        ctx.path_recorder.log_deaths(rays, escaped_now, "escaped")
+        ex = ctx.bounding_scale * rays.L
+        ey = ctx.bounding_scale * rays.M
+        ez = ctx.bounding_scale * rays.N
+        rays.x = be.where(escaped_now, rays.x + ex, rays.x)
+        rays.y = be.where(escaped_now, rays.y + ey, rays.y)
+        rays.z = be.where(escaped_now, rays.z + ez, rays.z)
+    rays.alive = rays.alive & ~no_hit
+
+    # --- depth truncation -------------------------------
+    # Hard kill. Inherent, reported bias (unlike roulette
+    # below, there is no unbiased way to "continue" a ray
+    # past a hard bounce-count cap).
+    alive_depth = rays.bounce < ctx.max_depth
+    newly_depth_killed = rays.alive & ~alive_depth
+    if not backend._empty(newly_depth_killed):
+        ctx.num_rays_depth_killed.add_count(newly_depth_killed)
+        ctx.total_flux_depth_killed.add_masked_sum(
+            rays.flux, newly_depth_killed
+        )
+        ctx.path_recorder.log_deaths(
+            rays, newly_depth_killed, "depth_killed"
+        )
+    rays.alive = rays.alive & alive_depth
+
+    # --- Russian roulette -------------------------------
+    # Unbiased stochastic termination of low-flux rays (kill
+    # with probability p, boost survivors by 1/(1-p)), so
+    # total_flux_lost reports a genuine diagnostic -- ~0 for
+    # a well-configured scene -- rather than an expected
+    # bookkeeping entry.
+    rr_threshold_fraction = max(
+        ctx.min_flux_fraction, ctx.ir.sampling.rr_start_flux
+    )
+    flux_before_rr = rays.flux
+    rays.flux, rays.alive, rr_killed = russian_roulette(
+        rays.flux,
+        rays.alive,
+        rr_threshold_fraction,
+        ctx.flux_per_ray,
+        backend.rng,
+        rays.ray_id,
+        rays.bounce,
+        fast_path=backend.host_reads_free,
+    )
+    # Ch. 10 (10.2): roulette does not preserve weight on a
+    # realisation. A killed ray takes its whole weight out
+    # of the trace and a survivor is handed -w(1-q)/q that
+    # came from nowhere; both are the event residual, and
+    # booking only the first is the 3.13% error of sec 10.2.
+    # flux is left untouched on a killed ray, so the first
+    # term below is zero there and the second picks it up.
+    ctx.total_flux_sampling_residual.add(
+        be.sum(flux_before_rr - rays.flux)
+    )
+    ctx.total_flux_sampling_residual.add_masked_sum(
+        flux_before_rr, rr_killed
+    )
+    if not backend._empty(rr_killed):
+        ctx.num_rays_flux_killed.add_count(rr_killed)
+        ctx.total_flux_rr_killed.add_masked_sum(
+            flux_before_rr, rr_killed
+        )
+        ctx.path_recorder.log_deaths(rays, rr_killed, "flux_killed")
+
+    return spawned
+
+
 class ArrayBackend(TracerBackend):
     """The array-based trace loop, shared by every array backend.
 
@@ -268,6 +541,21 @@ class ArrayBackend(TracerBackend):
             when asked) narrows it.
         """
         return bool(self.supports_splitting)
+
+    def _bounce_step(self, ctx: _BounceContext):
+        """The function the trace loop calls for each bounce.
+
+        :func:`bounce_body` itself by default. ``TorchBackend`` returns a
+        compiled version of it when built with ``compile_step=True``.
+
+        Args:
+            ctx: The trace's bounce context.
+
+        Returns:
+            A callable ``step(backend, ctx, rays)`` returning the spawned
+            bundle or ``None``.
+        """
+        return bounce_body
 
     # ------------------------------------------------------------------
     # Shared per-bounce pieces
@@ -486,6 +774,32 @@ class ArrayBackend(TracerBackend):
 
         allocator = _alloc_ray_ids if self._splitting_enabled() else None
 
+        # Everything the bounce body reads for the whole trace, in one
+        # object: the body lives outside this method (:func:`bounce_body`)
+        # so a backend can hand the loop a compiled version of it
+        # (``TorchBackend(compile_step=True)``). With the default step the
+        # loop runs exactly the statements it always ran, in the same order.
+        ctx = _BounceContext(
+            scene=scene,
+            ir=ir,
+            path_recorder=path_recorder,
+            allocator=allocator,
+            hit_counts=hit_counts,
+            bounding_scale=bounding_scale,
+            max_depth=max_depth,
+            min_flux_fraction=min_flux_fraction,
+            flux_per_ray=flux_per_ray,
+            num_rays_escaped=num_rays_escaped,
+            num_rays_flux_killed=num_rays_flux_killed,
+            num_rays_depth_killed=num_rays_depth_killed,
+            total_flux_escaped=total_flux_escaped,
+            total_flux_bulk_absorbed=total_flux_bulk_absorbed,
+            total_flux_depth_killed=total_flux_depth_killed,
+            total_flux_rr_killed=total_flux_rr_killed,
+            total_flux_sampling_residual=total_flux_sampling_residual,
+        )
+        step = self._bounce_step(ctx)
+
         # Main trace loop
         for source_idx, (source, source_num_rays) in enumerate(
             zip(sources, rays_per_source, strict=False)
@@ -522,204 +836,7 @@ class ArrayBackend(TracerBackend):
                     # that read is the one the next bounce's check reuses.
                     self._live_count_cache = None
 
-                    # --- traversal -------------------------------------
-                    t_min, hit_normals, comp_idx, hit_n_geom = self.intersect_scene(
-                        rays, scene.surfaces
-                    )
-                    (
-                        det_t_min,
-                        _det_normals,
-                        det_idx,
-                        det_absorb,
-                        det_n_geom,
-                    ) = intersect_detectors(rays, scene.detectors)
-
-                    # Nearest hit: component vs detector
-                    comp_closer = t_min <= det_t_min
-                    any_comp_hit = comp_idx >= 0
-                    any_det_hit = det_idx >= 0
-
-                    det_first = any_det_hit & (~comp_closer | ~any_comp_hit)
-                    comp_first = any_comp_hit & (~det_first)
-
-                    # Rays that reach no detector carry t = inf. Zero those
-                    # before multiplying by a direction: inf * 0 is NaN, which
-                    # the be.where below discards but not before NumPy warns.
-                    det_t_safe = be.where(
-                        det_first, det_t_min, be.zeros_like(det_t_min)
-                    )
-
-                    # --- Beer-Lambert bulk absorption -------------------
-                    # Attenuate flux over the segment each ray just
-                    # travelled through its *current* medium (rays.k_current,
-                    # set at its last crossing or its source's ambient
-                    # medium) before this bounce's nearest hit -- component
-                    # or detector, whichever is closer. Applied before
-                    # interact()/detector recording touch flux or k_current
-                    # so both see the already-attenuated value; k_current
-                    # itself is only updated afterwards, by
-                    # RefractiveComponent.interact(), for the medium the ray
-                    # is now entering.
-                    hit_first = comp_first | det_first
-                    if not self._empty(hit_first):
-                        comp_t_safe = be.where(
-                            comp_first, t_min, be.zeros_like(t_min)
-                        )
-                        hit_t = be.where(comp_first, comp_t_safe, det_t_safe)
-                        alpha = 4.0 * be.pi * rays.k_current / rays.wavelength
-                        # hit_t is in mm; alpha is in 1/um -> convert to um.
-                        transmittance = be.exp(-alpha * hit_t * 1e3)
-                        flux_before = rays.flux
-                        rays.flux = flux_before * be.where(
-                            hit_first, transmittance, be.ones_like(rays.flux)
-                        )
-                        total_flux_bulk_absorbed.add(
-                            be.sum(flux_before - rays.flux)
-                        )
-
-                    # --- detector recording -----------------------------
-                    for di, det in enumerate(scene.detectors):
-                        mask_di = det_first & (det_idx == di)
-                        if self._empty(mask_di):
-                            continue
-                        det_name = getattr(det, "name", f"detector_{di}")
-                        path_recorder.log_hits(
-                            rays, mask_di, det_name, t_offset=det_t_safe
-                        )
-                        det.record(rays, det_t_safe, mask_di)
-                        # Arriving flux by ghost order; a no-op unless the
-                        # detector was built with reflection_bins.
-                        det.record_reflections(rays, mask_di)
-
-                    # Advance detector-hit rays. Absorbing detectors
-                    # terminate the ray; absorb=False detectors are
-                    # transmissive: the hit is recorded (above) and the ray
-                    # continues on its unchanged direction.
-                    if not self._empty(det_first):
-                        # An absorbing detector is terminal, so the plain
-                        # global advance is all its rays' positions are ever
-                        # used for -- p + t*d carries u*|t| of rounding and
-                        # nothing reads it again.
-                        terminal = det_first & det_absorb
-                        dx = det_t_safe * rays.L
-                        dy = det_t_safe * rays.M
-                        dz = det_t_safe * rays.N
-                        rays.x = be.where(terminal, rays.x + dx, rays.x)
-                        rays.y = be.where(terminal, rays.y + dy, rays.y)
-                        rays.z = be.where(terminal, rays.z + dz, rays.z)
-                        # A transmissive detector is not terminal: the ray
-                        # carries on from where this puts it and the next
-                        # bounce tests the same plane again. It therefore
-                        # gets a surface's treatment -- the hit point
-                        # rebuilt in the detector's own frame, then pushed
-                        # clear of the plane along the geometric normal, or
-                        # a grazing crossing is recorded twice (R-07-6,
-                        # docs/build/X7_grazing_exit.md section 6).
-                        for di, det in enumerate(scene.detectors):
-                            if det.absorb:
-                                continue
-                            crossed = det_first & (det_idx == di)
-                            det.advance_to_hit(rays, det_t_safe, crossed)
-                            det.offset_from_surface(rays, det_n_geom, crossed)
-                        rays.bounce = be.where(det_first, rays.bounce + 1, rays.bounce)
-                        rays.alive = rays.alive & ~terminal
-
-                    # --- component interactions -------------------------
-                    # Dispatched from the IR (ir.primitives[i].component_kind
-                    # / .bsdf.kind) rather than by iterating scene.surfaces
-                    # and checking isinstance. ray_id_allocator enables
-                    # bounded splitting (NumPy forward engine only): a hit
-                    # ray below ir.sampling.split_depth spawns both Fresnel
-                    # children instead of drawing one, and the transmit child
-                    # comes back as spawned (merged into `rays` below, after
-                    # this bounce's own kill checks -- see the merge
-                    # comment).
-                    spawned = apply_primitive_interactions(
-                        rays,
-                        ir,
-                        scene.surfaces,
-                        t_min,
-                        hit_normals,
-                        hit_n_geom,
-                        comp_idx,
-                        comp_first,
-                        self.rng,
-                        log_hit_fn=path_recorder.log_hits,
-                        ray_id_allocator=allocator,
-                        skip_unhit=self.host_reads_free,
-                        hit_counts=hit_counts,
-                    )
-
-                    # --- escape -----------------------------------------
-                    no_hit = ~any_comp_hit & ~any_det_hit
-                    escaped_now = no_hit & rays.alive
-                    if not self._empty(escaped_now):
-                        num_rays_escaped.add_count(escaped_now)
-                        total_flux_escaped.add_masked_sum(rays.flux, escaped_now)
-                        path_recorder.log_deaths(rays, escaped_now, "escaped")
-                        ex = bounding_scale * rays.L
-                        ey = bounding_scale * rays.M
-                        ez = bounding_scale * rays.N
-                        rays.x = be.where(escaped_now, rays.x + ex, rays.x)
-                        rays.y = be.where(escaped_now, rays.y + ey, rays.y)
-                        rays.z = be.where(escaped_now, rays.z + ez, rays.z)
-                    rays.alive = rays.alive & ~no_hit
-
-                    # --- depth truncation -------------------------------
-                    # Hard kill. Inherent, reported bias (unlike roulette
-                    # below, there is no unbiased way to "continue" a ray
-                    # past a hard bounce-count cap).
-                    alive_depth = rays.bounce < max_depth
-                    newly_depth_killed = rays.alive & ~alive_depth
-                    if not self._empty(newly_depth_killed):
-                        num_rays_depth_killed.add_count(newly_depth_killed)
-                        total_flux_depth_killed.add_masked_sum(
-                            rays.flux, newly_depth_killed
-                        )
-                        path_recorder.log_deaths(
-                            rays, newly_depth_killed, "depth_killed"
-                        )
-                    rays.alive = rays.alive & alive_depth
-
-                    # --- Russian roulette -------------------------------
-                    # Unbiased stochastic termination of low-flux rays (kill
-                    # with probability p, boost survivors by 1/(1-p)), so
-                    # total_flux_lost reports a genuine diagnostic -- ~0 for
-                    # a well-configured scene -- rather than an expected
-                    # bookkeeping entry.
-                    rr_threshold_fraction = max(
-                        min_flux_fraction, ir.sampling.rr_start_flux
-                    )
-                    flux_before_rr = rays.flux
-                    rays.flux, rays.alive, rr_killed = russian_roulette(
-                        rays.flux,
-                        rays.alive,
-                        rr_threshold_fraction,
-                        flux_per_ray,
-                        self.rng,
-                        rays.ray_id,
-                        rays.bounce,
-                        fast_path=self.host_reads_free,
-                    )
-                    # Ch. 10 (10.2): roulette does not preserve weight on a
-                    # realisation. A killed ray takes its whole weight out
-                    # of the trace and a survivor is handed -w(1-q)/q that
-                    # came from nowhere; both are the event residual, and
-                    # booking only the first is the 3.13% error of sec 10.2.
-                    # flux is left untouched on a killed ray, so the first
-                    # term below is zero there and the second picks it up.
-                    total_flux_sampling_residual.add(
-                        be.sum(flux_before_rr - rays.flux)
-                    )
-                    total_flux_sampling_residual.add_masked_sum(
-                        flux_before_rr, rr_killed
-                    )
-                    if not self._empty(rr_killed):
-                        num_rays_flux_killed.add_count(rr_killed)
-                        total_flux_rr_killed.add_masked_sum(
-                            flux_before_rr, rr_killed
-                        )
-                        path_recorder.log_deaths(rays, rr_killed, "flux_killed")
+                    spawned = step(self, ctx, rays)
 
                     # --- bounded-splitting merge ------------------------
                     # Now that this bounce's own escape/depth/RR kill checks
