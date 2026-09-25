@@ -28,21 +28,35 @@ What a replay needs from the bounce, and how each need is met:
 - **Every dtype settled.** The first bounces run eagerly
   (:data:`EAGER_BOUNCES`): they build every lazy table and constant and give
   every tally its first term, so the recorded bounce is the steady one.
+- **Every identity-keyed cache warm.** A glass's index is memoised on the
+  *identity* of the wavelength tensor (``NSQMaterial.n``/``k``); a miss
+  evaluates the catalogue glass, whose cache reads the glass's coefficients to
+  the host -- a copy the capture refuses. So the static buffers below are made
+  when the batch starts, before the eager bounces
+  (:func:`static_buffers`): the fields the bounce never rebinds (the
+  wavelength) are then the very tensors the eager bounces memoised, and the
+  recorded bounce hits every memo.
 
 The ray state lives in static buffers: each tensor field of the bundle is
-cloned once before the capture, the recorded bounce reads them, and at its end
-copies every field it rebound back into them, so one replay advances the
-bundle one bounce.
+cloned once at the start of the batch, the eager bounces run on them, the
+fields they rebound are copied back into them before the capture, the recorded
+bounce reads them, and at its end copies every field it rebound back into
+them, so one replay advances the bundle one bounce.
 
 ``mode="emulate"`` runs the same bookkeeping without CUDA: the bounce runs
-eagerly through the static buffers and the same guard, trip for trip. It is a
-check of the data flow and of a scene's capture safety on a machine without a
-CUDA device, not a graph -- torch has no graph capture on the CPU or on
-Apple's ``mps`` -- and its numbers are the eager fixed-width numbers.
+eagerly through the static buffers and the same guard, trip for trip, and the
+bounce that would be recorded runs under a host-transfer check that refuses,
+by name and site, every read of a tensor to the host and every tensor built
+from host data -- the copies a CUDA capture refuses. It is a check of the data
+flow and of a scene's capture safety on a machine without a CUDA device, not a
+graph -- torch has no graph capture on the CPU or on Apple's ``mps`` -- and its
+numbers are the eager fixed-width numbers.
 """
 
 from __future__ import annotations
 
+import contextlib
+import traceback
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -116,6 +130,112 @@ def _rebound(before: dict[str, Any], after: dict[str, Any]) -> list[str]:
     return sorted(k for k in keys if before.get(k) != after.get(k))
 
 
+def static_buffers(rays: NSQRayBundle) -> dict[str, Any]:
+    """Move a fresh batch's tensor fields into static buffers of their own.
+
+    Called when the batch starts, before its eager bounces: every tensor field
+    is cloned and the bundle is pointed at the clone. A field the bounce never
+    rebinds (the wavelength) keeps that object from the first bounce to the
+    last replay, so every cache keyed on its identity -- the glass memo of
+    ``NSQMaterial.n``/``k`` above all -- is filled with it by the eager bounces
+    and hit by the recorded one. Cloning at the capture instead presented the
+    recorded bounce a wavelength tensor the memo had never seen.
+
+    Args:
+        rays: The batch as the backend prepared it.
+
+    Returns:
+        ``{field: buffer}``, the bundle's fields now being these buffers.
+    """
+    import torch  # noqa: PLC0415
+
+    static = {k: v.clone() for k, v in vars(rays).items() if torch.is_tensor(v)}
+    for field, buffer in static.items():
+        setattr(rays, field, buffer)
+    return static
+
+
+#: The ways a tensor's value reaches the host (``to_numpy`` is
+#: ``detach().cpu().numpy()``, so it meets ``cpu``), and the torch entry points
+#: that build a tensor from host data -- the census of
+#: ``tests/nonsequential/test_nsq_host_reads.py`` and ``test_nsq_host_uploads.py``.
+_READS = ("cpu", "item", "tolist", "numpy", "__array__", "__bool__", "__float__",
+          "__int__", "__index__")
+_UPLOADS = ("tensor", "as_tensor", "from_numpy", "asarray")
+
+
+def _engine_site() -> str:
+    """Where a transfer comes from: the innermost package frame, and the engine's call.
+
+    The innermost frame of the package outside this module and the array
+    backend layer (``optiland/backend``), and, when that is not already in
+    the non-sequential engine, the innermost engine frame that led to it.
+    """
+    inner = engine = None
+    for frame in reversed(traceback.extract_stack(limit=60)):
+        name = frame.filename.replace("\\", "/")
+        if "/optiland/" not in name or name.endswith("backends/graph_replay.py"):
+            continue
+        short = name.split("/optiland/")[-1]
+        if short.startswith("backend/"):
+            continue
+        where = f"{short}:{frame.lineno} {frame.name}"
+        if inner is None:
+            inner = where
+        if short.startswith("nonsequential/"):
+            engine = where
+            break
+    if inner is None:
+        return "outside the package"
+    return inner if engine in (None, inner) else f"{inner}, from {engine}"
+
+
+@contextlib.contextmanager
+def host_transfer_check():
+    """Record every host transfer made inside the block, without changing any.
+
+    Wraps the entry points of :data:`_READS` and :data:`_UPLOADS` for the
+    block's duration; each call still runs as before and is recorded as
+    ``(kind, site)``. Nothing is raised inside the block -- a transfer inside
+    a ``try`` of the engine could not be swallowed and the values stay the
+    eager ones -- the caller judges the list afterwards.
+
+    Yields:
+        The list the transfers are appended to.
+    """
+    import torch  # noqa: PLC0415
+
+    seen: list[tuple[str, str]] = []
+    saved: list[tuple[object, str, object]] = []
+
+    for name in _READS:
+        original = getattr(torch.Tensor, name)
+        saved.append((torch.Tensor, name, original))
+
+        def read(tensor, *a, _original=original, _name=name, **k):
+            seen.append((f"reads a tensor to the host ({_name})", _engine_site()))
+            return _original(tensor, *a, **k)
+
+        setattr(torch.Tensor, name, read)
+    for name in _UPLOADS:
+        original = getattr(torch, name)
+        saved.append((torch, name, original))
+
+        def upload(data, *a, _original=original, _name=name, **k):
+            if not isinstance(data, torch.Tensor):
+                seen.append(
+                    (f"builds a tensor from host data (torch.{_name})", _engine_site())
+                )
+            return _original(data, *a, **k)
+
+        setattr(torch, name, upload)
+    try:
+        yield seen
+    finally:
+        for owner, name, original in reversed(saved):
+            setattr(owner, name, original)
+
+
 def replay_bounces(
     backend: Any,
     rays: NSQRayBundle,
@@ -123,6 +243,7 @@ def replay_bounces(
     depth: int,
     max_depth: int,
     accumulators: Callable[[], dict[str, Any]],
+    static: dict[str, Any] | None = None,
     mode: str = "cuda",
 ) -> NSQRayBundle:
     """Run bounces ``depth .. max_depth - 1`` of one batch as a replayed graph.
@@ -136,6 +257,10 @@ def replay_bounces(
         depth: Bounces already run.
         max_depth: The trace's depth cap.
         accumulators: Returns :func:`accumulator_identities` for this trace.
+        static: The batch's buffers from :func:`static_buffers`, made before
+            its eager bounces. ``None`` makes them here, which leaves every
+            identity-keyed cache cold for the recorded bounce; kept only for
+            a caller that has no batch start to make them at.
         mode: ``"cuda"`` records and replays a CUDA graph; ``"emulate"`` runs
             the same bookkeeping eagerly (see the module docstring).
 
@@ -144,7 +269,8 @@ def replay_bounces(
 
     Raises:
         GraphReplayUnavailable: If the bundle carries a gradient, if the
-            bounce replaces the bundle or rebinds an accumulator, or if the
+            bounce replaces the bundle or rebinds an accumulator, if the
+            emulated recorded bounce transfers to or from the host, or if the
             CUDA capture itself fails.
     """
     import torch  # noqa: PLC0415
@@ -159,8 +285,18 @@ def replay_bounces(
             f"({', '.join(attached)}); a replayed bounce records no autograd "
             "graph, so gradient mode runs eagerly (graph_replay=False)"
         )
-    static = {f: getattr(rays, f).clone() for f in fields}
+    static = dict(static or {})
     for f in fields:
+        current = getattr(rays, f)
+        if f not in static:
+            # A field that was not a tensor when the batch started.
+            static[f] = current.clone()
+        elif current is not static[f]:
+            # Rebound by an eager bounce: its value goes back into the buffer
+            # the batch started with. A field no bounce rebinds (the
+            # wavelength) is already its buffer, the tensor every
+            # identity-keyed cache was filled with.
+            static[f].copy_(current)
         setattr(rays, f, static[f])
 
     def write_back() -> None:
@@ -182,11 +318,20 @@ def replay_bounces(
 
     if mode == "emulate":
         # The recorded bounce, run instead of recorded: it executes, so the
-        # replays that follow are one fewer than on CUDA.
-        check_bundle(bounce(rays, depth))
-        write_back()
+        # replays that follow are one fewer than on CUDA. It runs under the
+        # host-transfer check, the CPU's stand-in for the capture's refusal.
+        with host_transfer_check() as transfers:
+            check_bundle(bounce(rays, depth))
+            write_back()
         for f in fields:
             setattr(rays, f, static[f])
+        if transfers:
+            sites = sorted({f"{kind} at {site}" for kind, site in transfers})
+            raise GraphReplayUnavailable(
+                "graph_replay: the bounce a capture would record copies between "
+                "the host and the device, which a CUDA capture refuses: "
+                + "; ".join(sites)
+            )
         rebound = _rebound(before, accumulators())
         if rebound:
             raise GraphReplayUnavailable(

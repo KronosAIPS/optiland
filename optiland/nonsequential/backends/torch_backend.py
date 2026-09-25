@@ -251,6 +251,9 @@ class TorchBackend(ArrayBackend):
         self.compact_every = 0 if graph_replay else compact_every
         self.rng_kernel = rng_kernel
         self.rng_kernel_in_use: str | None = None
+        # The current batch's replay buffers, between _graph_handover_depth and
+        # _replay_bounces (graph_replay only).
+        self._graph_static: dict | None = None
         self._rng_kernel_note: str | None = None
 
     def _warp_rng_unavailable(self) -> str | None:
@@ -507,6 +510,12 @@ class TorchBackend(ArrayBackend):
         a host read at every bounce that no graph can hold, and a graph buys
         nothing at that width anyway. The values are the same either way.
 
+        A batch that will be replayed has its fields moved into the replay's
+        static buffers here, before its eager bounces
+        (:func:`~optiland.nonsequential.backends.graph_replay.static_buffers`),
+        so the glass memo the eager bounces fill is keyed on the wavelength
+        tensor the recorded bounce reads.
+
         Args:
             rays: The freshly prepared batch.
 
@@ -514,8 +523,10 @@ class TorchBackend(ArrayBackend):
             :data:`~optiland.nonsequential.backends.graph_replay.EAGER_BOUNCES`,
             or ``None`` for an eager batch.
         """
+        self._graph_static = None
         if not self.graph_replay or rays.num_rays < BUCKET_MIN_WIDTH:
             return None
+        self._graph_static = _graph.static_buffers(rays)
         return _graph.EAGER_BOUNCES
 
     def _replay_bounces(
@@ -538,6 +549,7 @@ class TorchBackend(ArrayBackend):
             The bundle after the last bounce.
         """
         mode = "emulate" if self.graph_replay == "emulate" else "cuda"
+        static, self._graph_static = self._graph_static, None
         return _graph.replay_bounces(
             self,
             rays,
@@ -545,6 +557,7 @@ class TorchBackend(ArrayBackend):
             depth,
             max_depth,
             lambda: _graph.accumulator_identities(scene, tallies),
+            static=static,
             mode=mode,
         )
 

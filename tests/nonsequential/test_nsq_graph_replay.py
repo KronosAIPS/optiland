@@ -11,7 +11,8 @@ nothing here records a graph. What runs here:
   recording, a ray database, conflicting options, and a bounce that rebinds
   an accumulator (the guard the capture relies on);
 - ``graph_replay="emulate"``: the same static-buffer bookkeeping, eager
-  bounces, guard and trip count, with the bounce run instead of recorded. Its
+  bounces, guard and trip count, with the bounce run instead of recorded, and
+  that bounce checked for host transfers (the copies a capture refuses). Its
   every number must equal the eager fixed-width trace's, bit for bit; that is
   the data-flow half of the proof. The CUDA half (the graph itself, on a GPU)
   is a separate run and is not in this suite; ``TestOnCuda`` runs it where a
@@ -286,6 +287,92 @@ class TestTheGuard:
         labels = set(gr.accumulator_identities(scene, []))
         for suffix in ("._data", "._num_rays_hit", "._refl_flux", "._coating_loss"):
             assert any(label.endswith(suffix) for label in labels), (suffix, labels)
+
+
+class TestTheRecordedBounceHitsTheMaterialMemo:
+    """A glass's index is read from its memo in the recorded bounce, not from the glass.
+
+    ``NSQMaterial.n``/``k`` keep one memo keyed on the *identity* of the
+    wavelength tensor, and a miss evaluates the catalogue glass, whose cache
+    reads its coefficients to the host -- a copy a CUDA capture refuses (found
+    by the A100 check of the prototype: every scene with a catalogue glass was
+    refused). The replay's static buffers are therefore made before the eager
+    bounces, so the memo already holds the static wavelength tensor when the
+    bounce is recorded. On the CPU that order is asserted directly: the
+    recorded (emulated) bounce presents the same wavelength object as the
+    eager ones, and every glass lookup in it is a memo hit.
+    """
+
+    @staticmethod
+    def _observe(monkeypatch):
+        from optiland.nonsequential.backends.array_backend import ArrayBackend
+        from optiland.nonsequential.materials.nsq_material import NSQMaterial
+
+        state = {"batch": -1, "bounce": -1}
+        calls = []  # (batch, bounce, wavelength object, memo hit)
+
+        original_prepare = TorchBackend._prepare_bundle
+
+        def prepare(backend, rays):
+            state["batch"] += 1
+            state["bounce"] = -1
+            return original_prepare(backend, rays)
+
+        original_intersect = ArrayBackend.intersect_scene
+
+        def intersect(backend, rays, *a, **k):
+            state["bounce"] += 1
+            return original_intersect(backend, rays, *a, **k)
+
+        original_n = NSQMaterial.n
+
+        def n(material, wavelength_um):
+            if material.optiland_material is not None:
+                hit = wavelength_um is material._n_memo[0]
+                calls.append((state["batch"], state["bounce"], wavelength_um, hit))
+            return original_n(material, wavelength_um)
+
+        monkeypatch.setattr(TorchBackend, "_prepare_bundle", prepare)
+        monkeypatch.setattr(ArrayBackend, "intersect_scene", intersect)
+        monkeypatch.setattr(NSQMaterial, "n", n)
+        return calls
+
+    def test_the_recorded_bounce_sees_the_eager_wavelength_and_hits(self, monkeypatch):
+        calls = self._observe(monkeypatch)
+        backend = TorchBackend(seed=11, alive_check_every=0, graph_replay="emulate")
+        _trace(_singlet, 16, backend, num_rays=4_096, batch_size=2_048)
+
+        recorded = gr.EAGER_BOUNCES
+        for batch in (0, 1):
+            eager = [c for c in calls if c[0] == batch and c[1] < recorded]
+            replay = [c for c in calls if c[0] == batch and c[1] == recorded]
+            # The control: the glass is looked up in both phases.
+            assert eager and replay, (batch, len(eager), len(replay))
+            wavelength = eager[0][2]
+            assert all(c[2] is wavelength for c in eager + replay), (
+                "the recorded bounce presents another wavelength tensor than the "
+                "eager bounces, so the glass's identity memo misses there"
+            )
+            assert all(c[3] for c in replay), "a glass lookup missed the memo"
+
+    def test_a_host_read_in_the_recorded_bounce_is_refused(self, monkeypatch):
+        """The CPU stand-in for the CUDA refusal: emulate refuses a host transfer.
+
+        With the memo bypassed, every lookup evaluates the catalogue glass,
+        whose cache reads the glass's coefficients to the host.
+        """
+        from optiland.nonsequential.materials.nsq_material import NSQMaterial
+
+        def no_memo(material, wavelength_um):
+            if material.optiland_material is None:
+                return be.ones_like(wavelength_um)
+            return material.optiland_material.n(wavelength_um)
+
+        monkeypatch.setattr(NSQMaterial, "n", no_memo)
+        backend = TorchBackend(seed=11, alive_check_every=0, graph_replay="emulate")
+        with pytest.raises(GraphReplayUnavailable, match="host") as info:
+            _trace(_singlet, 16, backend, num_rays=4_096, batch_size=2_048)
+        assert "materials/" in str(info.value), str(info.value)
 
 
 class TestRefusals:
