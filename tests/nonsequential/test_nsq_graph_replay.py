@@ -262,6 +262,88 @@ class TestEmulatedReplayIsTheEagerFixedWidthTrace:
         assert a == b
 
 
+def _coated_singlet(layers: str):
+    """The singlet with a thin-film stack on its front face (the catalogue's two).
+
+    ``"quarter_wave"`` is r1_13's single antireflection layer, ``"ten_layer"``
+    r1_23's five high/low pairs. The coating is evaluated at every bounce, and
+    the stack's characteristic denominator used to upload a complex scalar
+    each time -- a copy the emulated capture refused.
+    """
+
+    def build() -> NSQScene:
+        from optiland.materials import IdealMaterial
+        from optiland.nonsequential.components.coating_support import (
+            UnpolarizedThinFilmCoating,
+        )
+        from optiland.thin_film import ThinFilmStack
+
+        if layers == "quarter_wave":
+            stack = ThinFilmStack(
+                incident_material=IdealMaterial(1.0),
+                substrate_material=IdealMaterial(1.5168),
+                reference_wl_um=0.5876,
+            )
+            stack.add_layer_qwot(IdealMaterial(1.2315843454672522), qwot_thickness=1.0)
+        else:
+            stack = ThinFilmStack(
+                incident_material=IdealMaterial(1.0),
+                substrate_material=IdealMaterial(1.5),
+                reference_wl_um=0.55,
+            )
+            for _ in range(5):
+                stack.add_layer_qwot(IdealMaterial(2.32))
+                stack.add_layer_qwot(IdealMaterial(1.38))
+        scene = NSQScene()
+        _source(scene)
+        scene.add_lens(
+            "L1",
+            CoordinateSystem(z=50),
+            LensConfig(
+                r1=100.0,
+                r2=-100.0,
+                thickness=5.0,
+                material="N-BK7",
+                front_aperture_radius=12.5,
+                front=SurfaceConfig(coating=UnpolarizedThinFilmCoating(stack)),
+            ),
+        )
+        for name, z in (("D1", 150.0), ("back", -20.0)):
+            scene.add_detector(
+                name,
+                CoordinateSystem(z=z),
+                IrradianceDetectorConfig(
+                    width=40, height=40, num_pixels_x=16, num_pixels_y=16
+                ),
+            )
+        return scene
+
+    return build
+
+
+class TestACoatedSingletIsReplayed:
+    """Emulate accepts a singlet with a thin-film coating, and changes no number."""
+
+    @pytest.mark.parametrize("precision", ["float64", "float32"])
+    @pytest.mark.parametrize("layers", ["quarter_wave", "ten_layer"])
+    def test_accepted_and_identical(self, layers, precision, monkeypatch):
+        be.set_precision(precision)
+        calls = []
+        original = gr.replay_bounces
+        monkeypatch.setattr(
+            gr, "replay_bounces", lambda *a, **k: calls.append(1) or original(*a, **k)
+        )
+        build = _coated_singlet(layers)
+        eager = TorchBackend(seed=11, alive_check_every=0, compact_every=0)
+        emulated = TorchBackend(seed=11, alive_check_every=0, graph_replay="emulate")
+        a = _ledger(_trace(build, 12, eager, num_rays=4_096))
+        b = _ledger(_trace(build, 12, emulated, num_rays=4_096))
+        # The control: both batches were handed to the (emulated) replay, so the
+        # coating ran under the host-transfer check.
+        assert len(calls) == 2
+        assert a == b, sorted(k for k in a if a[k] != b.get(k))
+
+
 class TestTheGuard:
     """An accumulator rebound inside the recorded bounce refuses the replay."""
 

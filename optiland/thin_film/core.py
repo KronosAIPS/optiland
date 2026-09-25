@@ -19,6 +19,41 @@ if TYPE_CHECKING:
 Array: TypeAlias = Any  # be.ndarray
 PolSP = Literal["s", "p"]
 
+#: What a zero characteristic denominator is replaced by in :func:`_tmm_coh`.
+_DENOM_FLOOR = 1e-30 + 0j
+
+#: That floor as a 0-dim tensor, one per (dtype, device), built on first use.
+_DENOM_FLOOR_TENSORS: dict[tuple[str, str], Any] = {}
+
+
+def _denominator_floor(like: Array) -> Any:
+    """The denominator floor beside ``like``: a resident tensor, or the bare number.
+
+    ``be.where(mask, 1e-30 + 0j, denom)`` builds the scalar into a tensor with
+    ``torch.tensor`` at every call, which on a device is a host-to-device copy
+    per evaluation -- per ray bounce when a non-sequential trace evaluates a
+    coating -- and an operation a CUDA graph capture refuses. The torch
+    backend's ``where`` builds exactly this tensor (the scalar in ``like``'s
+    dtype, on its device); it is built once here and kept. A NumPy array gets
+    the bare number, so the NumPy path is unchanged.
+
+    Args:
+        like: The denominator the floor is selected into.
+
+    Returns:
+        The floor, as ``like``'s kind of value.
+    """
+    if not hasattr(like, "detach"):
+        return _DENOM_FLOOR
+    key = (str(like.dtype), str(like.device))
+    floor = _DENOM_FLOOR_TENSORS.get(key)
+    if floor is None:
+        import torch  # noqa: PLC0415
+
+        floor = torch.tensor(_DENOM_FLOOR, dtype=like.dtype, device=like.device)
+        _DENOM_FLOOR_TENSORS[key] = floor
+    return floor
+
 
 def _complex_index(material: BaseMaterial, wavelength_um: float | Array) -> Array:
     if be.get_backend() == "torch" and hasattr(wavelength_um, "detach"):
@@ -135,7 +170,7 @@ def _tmm_coh(stack: ThinFilmStack, wavelength_um, theta0_rad, pol: PolSP):
         A, B, C, D = A * mA + B * mC, A * mB + B * mD, C * mA + D * mC, C * mB + D * mD
 
     denom = eta0 * (A + etas * B) + C + etas * D
-    denom = be.where(be.abs(denom) == 0, 1e-30 + 0j, denom)
+    denom = be.where(be.abs(denom) == 0, _denominator_floor(denom), denom)
 
     r = (eta0 * A + eta0 * etas * B - C - etas * D) / denom
     t = be.conj((2 * eta0) / denom)
