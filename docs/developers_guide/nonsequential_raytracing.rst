@@ -213,6 +213,17 @@ NumPy and Torch backends, verified by a fixed-vector conformance suite
 (``tests/nonsequential/test_nsq_rng_conformance.py``) any third-party backend
 can run to prove conformance.
 
+**The uniform.** Each draw's 32-bit output ``k`` becomes a uniform in the
+working dtype, always in [0, 1): at float64 ``k * 2**-32`` (exact; the largest
+value is ``1 - 2**-32``), at float32 ``(k >> 8) * 2**-24``, the top 24 bits
+(exact on every device; the largest value is ``1 - 2**-24``). Before issue 62
+of the research repository the float32 uniform was ``k`` rounded to float32
+and then scaled, which gave exactly 1.0 once in about 3.4e7 draws; float64 was
+not changed. :func:`optiland.nonsequential.rng.uniform_bits` returns 32 or 24
+for a precision, and a float32 trace records it as
+``SimulationResult.environment["uniform_bits"]``
+(``tests/nonsequential/test_nsq_uniform24.py``).
+
 **The generator as one kernel (optional, CUDA).** Torch has no unsigned 64-bit
 type, so on the Torch backend each draw is int64 limb arithmetic, about 150
 array operations. ``TorchBackend(rng_kernel="warp")`` draws the same numbers

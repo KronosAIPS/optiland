@@ -137,7 +137,10 @@ DEFAULT_RADICAND_K = 4
 # The upper bound is therefore the smaller of the literal and 1 - k u, which
 # is exact in the working dtype (1 - 2**-22 at float32). The lower literal is
 # kept in every dtype: 1e-12 is a normal float32 number, well away from 0,
-# and the reflect weight R / p it bounds is finite with it.
+# and the reflect weight R / p it bounds is finite with it. Since issue 62 the
+# float32 uniform is below 1 (at most 1 - 2**-24, rng.pcg32_uniform), so no
+# draw is 1.0 any more; the bound is still what lets a probability at the
+# clamp transmit, on the draws from 1 - 4 u up.
 DEFAULT_BRANCH_K = 4
 _BRANCH_P_LITERAL = 1e-12
 
