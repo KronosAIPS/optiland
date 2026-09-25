@@ -24,6 +24,12 @@ to running it on torch tensors on a device:
 - **replayed bounces** (opt-in): ``TorchBackend(graph_replay=True)`` records
   one fixed-width bounce as a CUDA graph and replays it, on a CUDA device
   only (:mod:`~optiland.nonsequential.backends.graph_replay`).
+- **generator kernel**: the keyed generator runs as int64 limb arithmetic
+  in torch by default. ``TorchBackend(rng_kernel="warp")`` draws the same
+  numbers from one Warp kernel per draw (:mod:`optiland.nonsequential
+  .rng_warp`) when Warp is installed and the device is CUDA; anywhere else
+  the limb path is kept without a warning, and the result's
+  ``environment`` says which kernel drew the trace and why.
 
 Memory scaling: O(num_rays x max_depth) activations when gradient_mode is
 "autograd". The recommended envelope is ~1e5 rays at depth 16 on a single
@@ -156,11 +162,27 @@ class TorchBackend(ArrayBackend):
             rebound inside the recorded bounce. ``"emulate"`` runs the same
             bookkeeping eagerly on any device -- the check that a scene is
             capture-safe, with the eager fixed-width numbers and no speed-up.
+        rng_kernel: Which implementation of the keyed generator is asked
+            for: ``"torch"`` (the default, the limb path of
+            :mod:`optiland.nonsequential.rng`) or ``"warp"`` (one Warp
+            kernel per draw, :mod:`optiland.nonsequential.rng_warp`). The
+            values are the same bit for bit at float64 and float32; only
+            the number of dispatched operations changes (on the catalogue's
+            sphere cavity, from about 2,470 per bounce to about 650). The
+            Warp kernel is used only when ``warp`` imports and the device
+            is CUDA; otherwise the trace uses the limb path, silently, and
+            ``SimulationResult.environment`` records ``rng_kernel`` (the
+            kernel that drew), ``rng_kernel_requested`` and, on a fallback,
+            ``rng_kernel_note`` (why).
+        rng_kernel_in_use: The kernel the last trace drew from; None before
+            the first trace.
     """
 
     host_reads_free = False
     supports_splitting = False
     alive_check_every = 1
+
+    RNG_KERNELS: tuple[str, ...] = ("torch", "warp")
 
     def __init__(
         self,
@@ -170,6 +192,7 @@ class TorchBackend(ArrayBackend):
         compact_every: int | None = None,
         allow_splitting: bool = False,
         graph_replay: bool | Literal["emulate"] = False,
+        rng_kernel: Literal["torch", "warp"] = "torch",
     ) -> None:
         """Initialize TorchBackend.
 
@@ -191,11 +214,15 @@ class TorchBackend(ArrayBackend):
                 device; ``"emulate"`` runs the same bookkeeping eagerly on
                 any device, as a check. Either keeps each batch at its full
                 width, so ``compact_every`` must be left unset or 0.
+            rng_kernel: ``"torch"`` (default) or ``"warp"``; see the class
+                docstring. The choice is made at the start of each trace,
+                when the device is known.
 
         Raises:
             ValueError: If ``graph_replay`` is not ``False``, ``True`` or
                 ``"emulate"``, or is combined with a non-zero
-                ``compact_every``.
+                ``compact_every``; or if ``rng_kernel`` is not one of
+                :attr:`RNG_KERNELS`.
         """
         if graph_replay not in (False, True, "emulate"):
             raise ValueError(
@@ -206,6 +233,10 @@ class TorchBackend(ArrayBackend):
                 "graph_replay replays one bundle width per batch, so it cannot be "
                 f"combined with compaction (compact_every={compact_every}); leave "
                 "compact_every unset or 0"
+            )
+        if rng_kernel not in self.RNG_KERNELS:
+            raise ValueError(
+                f"rng_kernel must be one of {self.RNG_KERNELS}, got {rng_kernel!r}"
             )
         self.seed = seed
         self.gradient_mode = gradient_mode
@@ -218,6 +249,68 @@ class TorchBackend(ArrayBackend):
             graph_replay = bool(graph_replay)
         self.graph_replay = graph_replay
         self.compact_every = 0 if graph_replay else compact_every
+        self.rng_kernel = rng_kernel
+        self.rng_kernel_in_use: str | None = None
+        self._rng_kernel_note: str | None = None
+
+    def _warp_rng_unavailable(self) -> str | None:
+        """Why the Warp generator cannot serve this trace, or None if it can.
+
+        Returns:
+            None when the Warp kernel will draw; otherwise one sentence
+            naming the reason (Warp not installed, not CUDA, no kernel load).
+        """
+        try:
+            from optiland.nonsequential import rng_warp  # noqa: PLC0415
+        except Exception as exc:  # noqa: BLE001 - not installed, or it failed to load
+            return f"warp is not importable ({type(exc).__name__})"
+        return rng_warp.availability(be.get_device())
+
+    def _trace_rng(self, seed: int | None) -> NSQRng:
+        """The generator for this trace: the limb path, or the Warp kernel.
+
+        With the default ``rng_kernel="torch"`` this is exactly the base
+        class's choice. With ``"warp"`` the kernel is checked (and loaded on
+        the device) here, before the first bounce, so no kernel is compiled
+        or loaded inside the bounce loop.
+
+        Args:
+            seed: The trace's seed argument, or None to keep the backend's.
+
+        Returns:
+            The generator for this trace.
+        """
+        self._rng_kernel_note = None
+        if self.rng_kernel == "warp":
+            note = self._warp_rng_unavailable()
+            if note is None:
+                from optiland.nonsequential.rng_warp import (  # noqa: PLC0415
+                    WarpNSQRng,
+                )
+
+                self.rng_kernel_in_use = "warp"
+                return WarpNSQRng(self.rng.seed if seed is None else seed)
+            self._rng_kernel_note = note
+        self.rng_kernel_in_use = "torch"
+        rng = super()._trace_rng(seed)
+        if getattr(rng, "kernel", None) == "warp":
+            # A previous trace on a CUDA device drew through the kernel;
+            # this one cannot, so it gets the limb path with the same seed.
+            rng = NSQRng(rng.seed)
+        return rng
+
+    def _environment(self) -> dict[str, object]:
+        """The base environment, plus the generator kernel asked for.
+
+        Returns:
+            The base class's entries, ``rng_kernel_requested`` and, when the
+            request could not be honoured, ``rng_kernel_note``.
+        """
+        env = super()._environment()
+        env["rng_kernel_requested"] = self.rng_kernel
+        if self._rng_kernel_note is not None:
+            env["rng_kernel_note"] = self._rng_kernel_note
+        return env
 
     def _gradient_mode(self, rays: NSQRayBundle) -> bool:
         """True when any field of the bundle is on an autograd graph.

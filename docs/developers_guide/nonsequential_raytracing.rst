@@ -189,6 +189,18 @@ NumPy and Torch backends, verified by a fixed-vector conformance suite
 (``tests/nonsequential/test_nsq_rng_conformance.py``) any third-party backend
 can run to prove conformance.
 
+**The generator as one kernel (optional, CUDA).** Torch has no unsigned 64-bit
+type, so on the Torch backend each draw is int64 limb arithmetic, about 150
+array operations. ``TorchBackend(rng_kernel="warp")`` draws the same numbers
+from one NVIDIA Warp kernel per draw (:mod:`optiland.nonsequential.rng_warp`;
+install ``optiland[warp]``): the 32 output bits, the jump-ahead state and the
+uniform at float64 and float32 are equal bit for bit
+(``tests/nonsequential/test_nsq_rng_warp.py``), so every trace is too. It is
+used only when Warp imports and the device is CUDA; otherwise the limb path
+draws, without a warning, and ``SimulationResult.environment["rng_kernel"]``
+says which kernel drew the trace (``rng_kernel_note`` says why a request was
+not honoured).
+
 **Honest scope of the guarantee.** Same random decisions, same code path;
 *final floating-point results* agree only to documented tolerance across
 backends, because arithmetic order, FMA usage, and transcendental

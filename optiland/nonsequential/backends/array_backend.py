@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 import optiland.backend as be
+from optiland.backend.base import BackendCapabilityError
 from optiland.backend.utils import to_numpy
 from optiland.nonsequential._utils import (
     DEFAULT_BATCH_SIZE,
@@ -50,7 +51,7 @@ from optiland.nonsequential.path_recording import (  # noqa: F401
     PathRecorder,
 )
 from optiland.nonsequential.ray_bundle import NSQRayBundle
-from optiland.nonsequential.rng import EventSlot
+from optiland.nonsequential.rng import EventSlot, NSQRng
 from optiland.nonsequential.sampling import russian_roulette
 
 if TYPE_CHECKING:
@@ -313,6 +314,40 @@ class ArrayBackend(TracerBackend):
             The bundle after the last bounce.
         """
         raise NotImplementedError
+    def _trace_rng(self, seed: int | None) -> NSQRng:
+        """The keyed generator this trace draws from.
+
+        Called once at the start of every trace. The default keeps the
+        backend's generator unless the trace names a seed, in which case it
+        is rebuilt with that seed. A backend with a choice of generator
+        kernel (the Torch backend's ``rng_kernel``) makes the choice here,
+        where the device is known.
+
+        Args:
+            seed: The trace's seed argument, or None.
+
+        Returns:
+            The generator for this trace.
+        """
+        return self.rng if seed is None else NSQRng(seed)
+
+    def _environment(self) -> dict[str, object]:
+        """What this trace ran on, for ``SimulationResult.environment``.
+
+        Returns:
+            The array library, the device, the working precision and the
+            generator kernel that drew the trace's random numbers.
+        """
+        try:
+            device = str(be.get_device())
+        except (AttributeError, BackendCapabilityError):
+            device = "cpu"
+        return {
+            "array_backend": be.get_backend(),
+            "device": device,
+            "precision": f"float{be.get_precision()}",
+            "rng_kernel": getattr(self.rng, "kernel", be.get_backend()),
+        }
 
     # ------------------------------------------------------------------
     # Shared per-bounce pieces
@@ -425,13 +460,11 @@ class ArrayBackend(TracerBackend):
         from optiland.nonsequential.components.absorbing import (
             AbsorbingComponent,  # noqa: PLC0415
         )
-        from optiland.nonsequential.rng import NSQRng  # noqa: PLC0415
         from optiland.nonsequential.tracer import (
             SimulationResult,  # noqa: PLC0415, I001
         )
 
-        if seed is not None:
-            self.rng = NSQRng(seed)
+        self.rng = self._trace_rng(seed)
 
         # Reset detectors and absorber stats
         for det in scene.detectors:
@@ -991,6 +1024,7 @@ class ArrayBackend(TracerBackend):
             ray_paths=ray_paths,
             diagnostics=diagnostics,
             reflection_histograms=reflection_histograms,
+            environment=self._environment(),
         )
 
     def _continue_bounce(

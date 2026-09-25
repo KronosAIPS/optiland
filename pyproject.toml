@@ -37,6 +37,9 @@ torch = ["torch"]
 # Non-sequential photometry: EULUMDAT files (eulumdat-py, MIT, pinned: an early
 # release) and CIE illuminants, CCT and CRI (colour-science, BSD-3-Clause).
 nsq-photometry = ["eulumdat-py==1.0.0", "colour-science>=0.4.7,<0.5"]
+# The non-sequential engine's keyed generator as one Warp kernel on CUDA
+# (TorchBackend(rng_kernel="warp"), optiland/nonsequential/rng_warp.py).
+warp = ["torch", "warp-lang>=1.17"]
 
 [project.urls]
 Homepage = "https://github.com/optiland/optiland"
