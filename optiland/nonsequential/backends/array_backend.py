@@ -155,11 +155,18 @@ def _cull_to_budget(
 class _BounceContext:
     """What one bounce of a trace reads and books, fixed for the whole trace.
 
-    The scene and its lowered IR, the path recorder, the ray-id allocator of
-    bounded splitting, the per-trace tallies and the loop's constants. Built
-    once per ``trace`` call and handed to :func:`bounce_body` with the ray
-    bundle; the tallies and the recorder are the same objects the trace reads
-    back after the loop.
+    The scene's surfaces and detectors and its lowered IR, the path
+    recorder, the ray-id allocator of bounded splitting, the per-trace
+    tallies and the loop's constants. Built once per ``trace`` call and
+    handed to :func:`bounce_body` with the ray bundle; the tallies and the
+    recorder are the same objects the trace reads back after the loop.
+
+    The surface and detector lists are taken from the scene once, here: the
+    scene rebuilds them on every read (``NSQScene.surfaces`` walks its
+    registry, whose single-surface wrappers are classes made per
+    ``add_component`` call), which a compiled step would have to guard on
+    and compile again for every new scene. The lists hold the same objects
+    in the same order as every read would.
     """
 
     def __init__(
@@ -183,7 +190,8 @@ class _BounceContext:
         total_flux_rr_killed,
         total_flux_sampling_residual,
     ) -> None:
-        self.scene = scene
+        self.surfaces = scene.surfaces
+        self.detectors = scene.detectors
         self.ir = ir
         self.path_recorder = path_recorder
         self.allocator = allocator
@@ -224,7 +232,7 @@ def bounce_body(backend, ctx: _BounceContext, rays: NSQRayBundle):
     """
     # --- traversal -------------------------------------
     t_min, hit_normals, comp_idx, hit_n_geom = backend.intersect_scene(
-        rays, ctx.scene.surfaces
+        rays, ctx.surfaces
     )
     (
         det_t_min,
@@ -232,7 +240,7 @@ def bounce_body(backend, ctx: _BounceContext, rays: NSQRayBundle):
         det_idx,
         det_absorb,
         det_n_geom,
-    ) = intersect_detectors(rays, ctx.scene.detectors)
+    ) = intersect_detectors(rays, ctx.detectors)
 
     # Nearest hit: component vs detector
     comp_closer = t_min <= det_t_min
@@ -278,7 +286,7 @@ def bounce_body(backend, ctx: _BounceContext, rays: NSQRayBundle):
         )
 
     # --- detector recording -----------------------------
-    for di, det in enumerate(ctx.scene.detectors):
+    for di, det in enumerate(ctx.detectors):
         mask_di = det_first & (det_idx == di)
         if backend._empty(mask_di):
             continue
@@ -315,7 +323,7 @@ def bounce_body(backend, ctx: _BounceContext, rays: NSQRayBundle):
         # clear of the plane along the geometric normal, or
         # a grazing crossing is recorded twice (R-07-6,
         # docs/build/X7_grazing_exit.md section 6).
-        for di, det in enumerate(ctx.scene.detectors):
+        for di, det in enumerate(ctx.detectors):
             if det.absorb:
                 continue
             crossed = det_first & (det_idx == di)
@@ -337,7 +345,7 @@ def bounce_body(backend, ctx: _BounceContext, rays: NSQRayBundle):
     spawned = apply_primitive_interactions(
         rays,
         ctx.ir,
-        ctx.scene.surfaces,
+        ctx.surfaces,
         t_min,
         hit_normals,
         hit_n_geom,

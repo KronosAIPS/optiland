@@ -67,6 +67,10 @@ def backend_int_full(shape, fill_value: int, like=None, bits: int = 64):
         import torch  # noqa: PLC0415
 
         dtype = torch.int64 if bits == 64 else torch.int32
+        if isinstance(fill_value, torch.Tensor):
+            # A 0-d device value (a medium id inside the compiled bounce
+            # step): broadcast, not read back to the host.
+            return fill_value.to(dtype=dtype).expand(tuple(shape)).clone()
         return torch.full(
             tuple(shape), int(fill_value), dtype=dtype, device=like.device
         )

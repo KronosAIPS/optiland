@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Union
 import numpy as np
 
 import optiland.backend as be
+from optiland.nonsequential._compile import compiling, run_eagerly
 
 if TYPE_CHECKING:
     import torch
@@ -135,6 +136,13 @@ class NSQMaterial:
             ``1.0`` (scalar) for vacuum when input is a scalar, or a
             ones-like array/tensor matching the input shape for array inputs.
         """
+        if compiling():
+            # Inside the compiled bounce step the property is evaluated as
+            # ordinary Python and enters the compiled program as data: the
+            # memo and the material library's caches key on the identity and
+            # contents of their arguments, which, traced, would specialise
+            # the program to one scene (_compile.py).
+            return run_eagerly(self.n, wavelength_um)
         if self.optiland_material is None:
             # Vacuum: return ones matching the input type/device
             try:
@@ -166,6 +174,8 @@ class NSQMaterial:
             for vacuum when input is a scalar, or a zeros-like array/tensor
             matching the input shape for array inputs.
         """
+        if compiling():
+            return run_eagerly(self.k, wavelength_um)  # as n(), above
         if self.optiland_material is None:
             # Vacuum: non-absorbing.
             try:
@@ -211,3 +221,36 @@ def medium_stack_id(material: NSQMaterial) -> int:
     if material.optiland_material is None:
         return 0
     return id(material)
+
+
+def medium_stack_id_value(material: NSQMaterial, like):
+    """:func:`medium_stack_id`, in the form the bounce can use on ``like``'s device.
+
+    Outside the compiled bounce step this is the Python int itself. Inside
+    it, it is the same number as a 0-d int64 tensor on ``like``'s device,
+    made once per material and device and returned as data: an object's
+    identity read inside the compiled program would be a constant of it, and
+    every new scene would compile the bounce again.
+
+    Args:
+        material: The medium to identify.
+        like: A tensor on the device the medium stack lives on.
+
+    Returns:
+        ``medium_stack_id(material)``, as an int or a 0-d tensor.
+    """
+    if not compiling():
+        return medium_stack_id(material)
+    return run_eagerly(_medium_stack_id_tensor, material, like.device)
+
+
+def _medium_stack_id_tensor(material: NSQMaterial, device):
+    import torch  # noqa: PLC0415
+
+    cache = material.__dict__.setdefault("_stack_id_tensors", {})
+    key = str(device)
+    value = cache.get(key)
+    if value is None:
+        value = torch.tensor(medium_stack_id(material), dtype=torch.int64, device=device)
+        cache[key] = value
+    return value

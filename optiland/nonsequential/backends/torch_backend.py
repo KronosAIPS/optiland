@@ -31,6 +31,7 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
+import os
 import warnings
 from typing import TYPE_CHECKING, Literal
 
@@ -40,13 +41,162 @@ import optiland.backend as be
 from optiland.backend.utils import to_numpy
 from optiland.nonsequential.backends.array_backend import (
     ArrayBackend,
+    bounce_body,
     bucketed_width,
 )
 from optiland.nonsequential.ray_bundle import backend_live_permutation
 from optiland.nonsequential.rng import NSQRng
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from optiland.nonsequential.ray_bundle import NSQRayBundle
+
+
+#: The environment variable that switches the compiled bounce step on for a
+#: ``TorchBackend`` built without an explicit ``compile_step`` -- the one a
+#: harness that builds its backends itself (a catalogue runner, a notebook
+#: that calls ``scene.trace()``) can be run under unchanged: ``1``, ``true``,
+#: ``yes`` or ``on`` switch it on for every device; a device type (``mps``,
+#: ``cuda``, ``cpu``) switches it on for traces on that device only, so a run
+#: that compares the Apple GPU with the CPU can compile the one and keep the
+#: other eager; anything else, or unset, leaves it off.
+COMPILE_STEP_ENV = "OPTILAND_NSQ_COMPILE_STEP"
+
+_DEVICE_TYPES = ("mps", "cuda", "cpu")
+
+#: Largest number of distinct buffers one generated kernel may read or write
+#: on Apple's ``mps`` device. A Metal compute function's buffer argument
+#: table has 31 entries (Metal feature set tables), and the inductor's Metal
+#: kernels add an error buffer and size arguments of their own; unbounded
+#: fusion of the bounce produced a kernel of 60-odd buffers that the Metal
+#: compiler refused ("no 'buffer' resource location available"). 24 leaves
+#: room for those.
+MPS_MAX_KERNEL_BUFFERS = 24
+
+#: Recompilations the compiled step may make before torch's guard falls back
+#: to running the step uncompiled. One compilation per (scene, bundle width,
+#: dtype) the trace meets: the compaction ladder gives O(log N) widths per
+#: batch and a catalogue run meets tens of scenes, which torch's default of
+#: 8 would exhaust within one case.
+COMPILE_RECOMPILE_LIMIT = 256
+
+
+class CompiledStepError(RuntimeError):
+    """The compiled bounce step was asked to run a trace it does not run.
+
+    Raised in gradient mode: the compiled step is forward-only. A backward
+    pass through a generated Metal kernel of the bounce does not compile
+    (it exceeds Metal's 31-buffer argument table, measured with torch 2.14),
+    and a compiled forward whose backward silently falls back would be a
+    gradient nobody measured.
+    """
+
+
+def _compile_step_from_env() -> bool | str:
+    """What :data:`COMPILE_STEP_ENV` asks for: True, a device type, or False."""
+    value = os.environ.get(COMPILE_STEP_ENV, "").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in _DEVICE_TYPES:
+        return value
+    return False
+
+
+def _normalise_compile_step(value) -> bool | str:
+    """``compile_step`` as True, False or one device type."""
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in _DEVICE_TYPES:
+            return value
+        raise ValueError(
+            f"compile_step must be a bool or one of {_DEVICE_TYPES}, got {value!r}"
+        )
+    return bool(value)
+
+
+_COMPILED_STEPS: dict[tuple, Callable] = {}
+
+
+def _complete_metal_codegen() -> None:
+    """Give the inductor's Metal code generator the two operations the bounce needs.
+
+    torch 2.14's Metal kernel generator (``torch._inductor.codegen.mps
+    .MetalOverrides``) has no ``copysign`` and no ``hypot``: its base class
+    raises ``NotImplementedError`` and the compilation of the bounce fails
+    (``copysign`` is in the conic intersection's stable root and in the
+    Lambertian lobe's tangent frame; ``hypot`` is in the complex square root
+    the thin-film coating takes on the Apple GPU). Both are added here, on the
+    Metal generator only, when it does not already define them:
+    ``copysign`` as Metal's own ``metal::copysign`` (exact: it moves one bit),
+    ``hypot`` as ``metal::precise::sqrt(x*x + y*y)`` (no overflow below 1.8e19
+    at float32, far beyond any coordinate or index here). No other device's
+    code generation is touched. ``nextafter``, also absent, is not needed: the
+    engine's one use (``_tol.ulp``) takes an exact integer route inside a
+    compiled region.
+    """
+    try:
+        from torch._inductor.codegen import mps as _mps  # noqa: PLC0415
+    except Exception:  # noqa: BLE001 - no Metal generator in this torch build
+        return
+    cls = getattr(_mps, "MetalOverrides", None)
+    if cls is None:
+        return
+
+    def _cast_pair(a, b):
+        return (
+            f"static_cast<decltype({a}+{b})>({a})",
+            f"static_cast<decltype({a}+{b})>({b})",
+        )
+
+    if "copysign" not in cls.__dict__:
+
+        def copysign(a, b):
+            ca, cb = _cast_pair(a, b)
+            return f"metal::copysign({ca}, {cb})"
+
+        cls.copysign = staticmethod(copysign)
+    if "hypot" not in cls.__dict__:
+
+        def hypot(a, b):
+            ca, cb = _cast_pair(a, b)
+            return f"metal::precise::sqrt({ca} * {ca} + {cb} * {cb})"
+
+        cls.hypot = staticmethod(hypot)
+
+
+def compiled_bounce_body(options: dict | None = None) -> Callable:
+    """``torch.compile`` of :func:`bounce_body`, built once per option set.
+
+    Static shapes (``dynamic=False``): the compaction ladder already limits a
+    trace to a few widths, and each is compiled once and reused by every batch
+    and every trace of the same scene.
+
+    Args:
+        options: Options for the inductor (``torch.compile(options=...)``),
+            plus the optional key ``"backend"`` naming the ``torch.compile``
+            backend (``"inductor"`` by default; ``"eager"`` or
+            ``"aot_eager"`` trace the step without generating kernels, which is
+            what the tests use on a host without a kernel compiler).
+
+    Returns:
+        The compiled step, called as ``step(backend, ctx, rays)``.
+    """
+    import torch  # noqa: PLC0415
+
+    options = dict(options or {})
+    compile_backend = options.pop("backend", "inductor")
+    key = (compile_backend, tuple(sorted(options.items())))
+    step = _COMPILED_STEPS.get(key)
+    if step is None:
+        step = torch.compile(
+            bounce_body,
+            backend=compile_backend,
+            dynamic=False,
+            options=(options or None) if compile_backend == "inductor" else None,
+        )
+        _COMPILED_STEPS[key] = step
+    return step
 
 
 class TorchBackend(ArrayBackend):
@@ -124,6 +274,23 @@ class TorchBackend(ArrayBackend):
             estimator a deterministic ghost series needs (every order to
             floating point, ``docs/theory/03_monte_carlo.md`` 3.6), so a
             device run that needs it can ask for it.
+        compile_step: Run each bounce through ``torch.compile`` of the
+            bounce body (:func:`compiled_bounce_body`) instead of eagerly:
+            True on every device, a device type (``"mps"``) on that device
+            only. Forward-only: a trace in gradient mode raises
+            :class:`CompiledStepError`. Off by default, and with it off every
+            number is the eager loop's, to the bit. Meant for the Apple GPU
+            (``mps``), where the eager bounce is bound by the launch of each
+            of its some 2,500 small operations; the step is compiled once
+            per scene and bundle width, so the first trace of a scene pays
+            the compilation. The loop around the step -- the alive check,
+            compaction, the splitting merge -- is unchanged. The numbers
+            are the eager loop's to within float32 rounding, not to the bit:
+            the generated kernels fuse and reorder the arithmetic.
+        compile_options: Options for the compiler (see
+            :func:`compiled_bounce_body`); on ``mps``,
+            ``max_fusion_unique_io_buffers`` defaults to
+            :data:`MPS_MAX_KERNEL_BUFFERS`.
     """
 
     host_reads_free = False
@@ -137,6 +304,8 @@ class TorchBackend(ArrayBackend):
         alive_check_every: int | None = None,
         compact_every: int | None = None,
         allow_splitting: bool = False,
+        compile_step: bool | str | None = None,
+        compile_options: dict | None = None,
     ) -> None:
         """Initialize TorchBackend.
 
@@ -153,6 +322,14 @@ class TorchBackend(ArrayBackend):
                 forward-only mode (default False: warn and fall back to the
                 single-branch draw, as before). In gradient mode splitting
                 is refused whatever this says.
+            compile_step: Run the bounce compiled (see the class
+                docstring): True for every device, a device type
+                (``"mps"``, ``"cuda"``, ``"cpu"``) for traces on that device
+                only, False for none. ``None`` (the default) reads
+                :data:`COMPILE_STEP_ENV`, so a harness that builds its own
+                backend can be switched without a code change; unset, it is
+                off.
+            compile_options: Compiler options for the compiled step.
         """
         self.seed = seed
         self.gradient_mode = gradient_mode
@@ -162,6 +339,84 @@ class TorchBackend(ArrayBackend):
         if alive_check_every is not None:
             self.alive_check_every = int(alive_check_every)
         self.compact_every = compact_every
+        self.compile_step = (
+            _compile_step_from_env()
+            if compile_step is None
+            else _normalise_compile_step(compile_step)
+        )
+        self.compile_options = dict(compile_options or {})
+
+    def _compiles_here(self) -> bool:
+        """Whether this trace runs the compiled step, on the active device."""
+        if isinstance(self.compile_step, str):
+            return str(be.get_device()).split(":")[0] == self.compile_step
+        return bool(self.compile_step)
+
+    def _bounce_step(self, ctx):
+        """The bounce the loop runs: eager, or compiled when asked for.
+
+        With ``compile_step`` off this is :func:`bounce_body` itself, so the
+        trace is the eager loop's, statement for statement. With it on the
+        step is :func:`compiled_bounce_body`, called with torch's
+        recompilation limit raised to :data:`COMPILE_RECOMPILE_LIMIT` and
+        autograd off; a trace in gradient mode is refused, here and again
+        for any bundle that arrives carrying a gradient.
+
+        Args:
+            ctx: The trace's bounce context.
+
+        Returns:
+            ``step(backend, ctx, rays)``.
+
+        Raises:
+            CompiledStepError: With ``compile_step`` on, when gradients are
+                requested (``be.grad_mode``) or a bundle carries one.
+        """
+        if not self._compiles_here():
+            return bounce_body
+        if self._grad_requested():
+            raise CompiledStepError(
+                "TorchBackend(compile_step=True) runs forward traces only; "
+                "gradient mode is on (be.grad_mode). Build the backend with "
+                "compile_step=False to differentiate through the trace."
+            )
+        import torch  # noqa: PLC0415
+
+        options = dict(self.compile_options)
+        if str(be.get_device()).startswith("mps"):
+            options.setdefault("max_fusion_unique_io_buffers", MPS_MAX_KERNEL_BUFFERS)
+            _complete_metal_codegen()
+        compiled = compiled_bounce_body(options)
+
+        def step(backend, ctx, rays):
+            if backend._gradient_mode(rays):
+                raise CompiledStepError(
+                    "TorchBackend(compile_step=True) runs forward traces only; "
+                    "this bundle carries a gradient (a source or a surface "
+                    "parameter requires grad)."
+                )
+            if backend.rng.device_state is None:
+                # The trace's seed as device data, so a new seed is a new
+                # input of the compiled step rather than a new program.
+                backend.rng.bind_device_state(rays.x)
+            with (
+                torch._dynamo.config.patch(
+                    recompile_limit=COMPILE_RECOMPILE_LIMIT,
+                    accumulated_recompile_limit=16 * COMPILE_RECOMPILE_LIMIT,
+                ),
+                torch.no_grad(),
+            ):
+                return compiled(backend, ctx, rays)
+
+        return step
+
+    @staticmethod
+    def _grad_requested() -> bool:
+        """True when ``be.grad_mode`` asks for gradients."""
+        try:
+            return bool(be.grad_mode.requires_grad)
+        except Exception:  # noqa: BLE001 - a backend with no grad mode cannot be in it
+            return False
 
     def _gradient_mode(self, rays: NSQRayBundle) -> bool:
         """True when any field of the bundle is on an autograd graph.

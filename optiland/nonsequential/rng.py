@@ -69,6 +69,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.backend.base import BackendCapabilityError
+from optiland.nonsequential._compile import compiling
 
 # PCG32 default multiplier (O'Neill, "PCG: A Family of Simple Fast
 # Space-Efficient Statistically Good Algorithms for Random Number
@@ -494,7 +495,9 @@ def pcg32_uint32(
     the host and neither is the result.
 
     Args:
-        seed: Trace-level RNG seed.
+        seed: Trace-level RNG seed, or the seed already mixed, as the pair
+            of 32-bit limbs ``(hi, lo)`` of the initial state (0-d integer
+            arrays; see :meth:`NSQRng.bind_device_state`).
         ray_id: Per-ray identifiers, shape (N,). Must be non-negative.
         bounce: Per-ray bounce/step index, shape (N,) or a scalar
             broadcastable to (N,). Must be non-negative.
@@ -512,8 +515,13 @@ def pcg32_uint32(
 
     # The seed mixes to one scalar shared by every ray, so it is folded on
     # the host as a Python int -- no array is built for it and no value
-    # crosses the device boundary.
-    initstate = _splitmix64_int(int(seed) & _M64)
+    # crosses the device boundary. A seed given as a pair of limbs is that
+    # scalar already mixed (NSQRng.bind_device_state: the compiled bounce
+    # step's form, a device value rather than a constant of the program).
+    if isinstance(seed, tuple):
+        initstate_limbs = seed
+    else:
+        initstate_limbs = _const_limbs(_splitmix64_int(int(seed) & _M64))
     slot_mix = (int(event_slot) * _SLOT_CONST) & _M64
 
     # Mix ray_id and event_slot into the stream selector so every ray gets
@@ -527,7 +535,7 @@ def pcg32_uint32(
 
     inc = _shl64_1(initseq)
     inc = (inc[0], inc[1] | 1)
-    state = _add64(inc, _const_limbs(initstate))
+    state = _add64(inc, initstate_limbs)
     state = _add64(_mul64(state, _const_limbs(_MULT_INT)), inc)
 
     return _output_limbs(_advance_limbs(state, inc, delta))
@@ -585,6 +593,33 @@ class NSQRng:
                 must be reproducible from the key alone.
         """
         self.seed = 0 if seed is None else int(seed)
+        self.device_state = None
+
+    def bind_device_state(self, like: Any) -> None:
+        """Hold the mixed seed as two 0-d int64 arrays on ``like``'s device.
+
+        For the torch backend's compiled bounce step. A seed read inside a
+        ``torch.compile`` region is a constant of the compiled program, so
+        every trace with a new seed would compile the bounce again; the same
+        value held as device data is an input of the program instead. Inside
+        a compiled region :meth:`uniform` draws from it; everywhere else it
+        draws from :attr:`seed` as before. The two give the same bits: the
+        limb arithmetic is exact integer arithmetic either way.
+
+        Args:
+            like: An array on the device the draws run on.
+        """
+        hi, lo = _const_limbs(_splitmix64_int(self.seed & _M64))
+        device = getattr(like, "device", None)
+        if be.is_torch_tensor(like):
+            import torch  # noqa: PLC0415
+
+            self.device_state = (
+                torch.tensor(hi, dtype=torch.int64, device=device),
+                torch.tensor(lo, dtype=torch.int64, device=device),
+            )
+        else:
+            self.device_state = (np.int64(hi), np.int64(lo))
 
     def uniform(
         self,
@@ -604,4 +639,6 @@ class NSQRng:
         Returns:
             Backend float array in [0, 1), shape (N,).
         """
+        if self.device_state is not None and compiling():
+            return pcg32_uniform(self.device_state, ray_id, bounce, event_slot, offset)
         return pcg32_uniform(self.seed, ray_id, bounce, event_slot, offset)

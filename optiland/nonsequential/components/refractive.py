@@ -26,7 +26,7 @@ from optiland.nonsequential.components.sampling_support import (
 from optiland.nonsequential.components.sampling_support import (
     scatter_branch,
 )
-from optiland.nonsequential.materials.nsq_material import medium_stack_id
+from optiland.nonsequential.materials.nsq_material import medium_stack_id_value
 from optiland.nonsequential.ray_bundle import (
     MEDIUM_STACK_EMPTY,
     MEDIUM_STACK_MAX_DEPTH,
@@ -456,8 +456,10 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         transmit = hit_mask & ~do_reflect
         zero = backend_int_full(depth.shape, 0, like=depth, bits=32)
 
-        front_id = medium_stack_id(self.material_front)
-        back_id = medium_stack_id(self.material_back)
+        # The ids as Python ints; inside the compiled bounce step, as device
+        # values (medium_stack_id_value), the same numbers.
+        front_id = medium_stack_id_value(self.material_front, like=depth)
+        back_id = medium_stack_id_value(self.material_back, like=depth)
         # entering_back is a device bool mask; one operand must carry the
         # integer dtype so the ids are not cast to the working float type.
         front_arr = backend_int_full(depth.shape, front_id, like=depth, bits=64)
