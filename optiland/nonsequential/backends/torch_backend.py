@@ -252,9 +252,6 @@ class TorchBackend(ArrayBackend):
         self.rng_kernel = rng_kernel
         self.rng_kernel_in_use: str | None = None
         self._rng_kernel_note: str | None = None
-        # Batches the last trace handed to the replayed graph (a batch below
-        # the compaction ladder's floor runs eagerly even when asked to replay).
-        self.graph_replay_batches = 0
 
     def _warp_rng_unavailable(self) -> str | None:
         """Why the Warp generator cannot serve this trace, or None if it can.
@@ -303,28 +300,16 @@ class TorchBackend(ArrayBackend):
         return rng
 
     def _environment(self) -> dict[str, object]:
-        """The base environment, plus the generator and the replay asked for.
+        """The base environment, plus the generator kernel asked for.
 
         Returns:
             The base class's entries, ``rng_kernel_requested`` and, when the
-            request could not be honoured, ``rng_kernel_note``. When
-            ``graph_replay`` was asked for, also how the bounces ran:
-            ``graph_replay`` is ``"cuda"`` or ``"emulate"`` when at least one
-            batch was replayed and ``"none"`` when every batch ran eagerly (a
-            batch below the compaction ladder's floor always does), with
-            ``graph_replay_requested`` and ``graph_replay_batches``, the
-            number of batches replayed. Without the request the keys are
-            absent and every bounce ran eagerly.
+            request could not be honoured, ``rng_kernel_note``.
         """
         env = super()._environment()
         env["rng_kernel_requested"] = self.rng_kernel
         if self._rng_kernel_note is not None:
             env["rng_kernel_note"] = self._rng_kernel_note
-        if self.graph_replay:
-            mode = "emulate" if self.graph_replay == "emulate" else "cuda"
-            env["graph_replay"] = mode if self.graph_replay_batches else "none"
-            env["graph_replay_requested"] = self.graph_replay
-            env["graph_replay_batches"] = self.graph_replay_batches
         return env
 
     def _gradient_mode(self, rays: NSQRayBundle) -> bool:
@@ -464,7 +449,6 @@ class TorchBackend(ArrayBackend):
                 ``graph_replay=True``), in gradient mode, when splitting would
                 run, with path recording, or with a ray-database detector.
         """
-        self.graph_replay_batches = 0
         if not self.graph_replay:
             return
         import torch as _torch  # noqa: PLC0415
@@ -554,7 +538,6 @@ class TorchBackend(ArrayBackend):
             The bundle after the last bounce.
         """
         mode = "emulate" if self.graph_replay == "emulate" else "cuda"
-        self.graph_replay_batches += 1
         return _graph.replay_bounces(
             self,
             rays,
