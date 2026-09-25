@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from .base import BaseDetector
+from .colorimetric import ColorimetricDetector, ColorimetricFarFieldDetector
 from .configs import (
+    ColorimetricDetectorConfig,
+    ColorimetricFarFieldDetectorConfig,
     FarFieldDetectorConfig,
     HemisphereDetectorConfig,
     IrradianceDetectorConfig,
@@ -19,6 +22,10 @@ from .spectral import SpectralDetector
 
 __all__ = [
     "BaseDetector",
+    "ColorimetricDetector",
+    "ColorimetricDetectorConfig",
+    "ColorimetricFarFieldDetector",
+    "ColorimetricFarFieldDetectorConfig",
     "DetectorRegistry",
     "FarFieldDetector",
     "FarFieldDetectorConfig",

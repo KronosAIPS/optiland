@@ -141,3 +141,17 @@ class RayDatabaseConfig:
     height: float
     max_rays: int = 0
     absorb: bool = True
+
+
+@dataclass
+class ColorimetricDetectorConfig(IrradianceDetectorConfig):
+    """Configuration for a ColorimetricDetector: an irradiance detector that
+    also books the CIE 1931 tristimulus flux X, Y, Z per pixel (illuminance,
+    chromaticity, correlated colour temperature). Same fields."""
+
+
+@dataclass
+class ColorimetricFarFieldDetectorConfig(FarFieldDetectorConfig):
+    """Configuration for a ColorimetricFarFieldDetector: a far-field detector
+    that also books the tristimulus intensity per bin (candela, chromaticity
+    over angle). Same fields."""

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import optiland.backend as be
 from optiland.nonsequential._utils import DEFAULT_BATCH_SIZE
 from optiland.nonsequential.components.registry import ComponentRegistry
 from optiland.nonsequential.detectors.registry import DetectorRegistry
@@ -477,161 +476,45 @@ def _resolve_total_flux(config) -> float:
 
 
 def _build_source(cs: CoordinateSystem, config) -> object:
-    """Instantiate a BaseNSQSource from a config dataclass.
+    """Instantiate a source from its config through the source kind registry.
 
     Args:
         cs: Coordinate system for the source.
-        config: One of PointSourceConfig, CollimatedSourceConfig,
-            ExtendedSourceConfig.
+        config: A config registered to a source kind (the built-ins:
+            PointSourceConfig, CollimatedSourceConfig, ExtendedSourceConfig;
+            see :mod:`optiland.nonsequential.kinds`).
 
     Returns:
         Constructed source object.
 
     Raises:
-        TypeError: If the config type is not recognised.
+        TypeError: If the config type is not registered to a source kind.
+        NotImplementedError: If a config field carries a gradient its kind
+            does not declare attached.
     """
-    from optiland.nonsequential.sources.collimated import (  # noqa: PLC0415
-        CollimatedSource,
-    )
-    from optiland.nonsequential.sources.configs import (  # noqa: PLC0415
-        CollimatedSourceConfig,
-        ExtendedSourceConfig,
-        PointSourceConfig,
-    )
-    from optiland.nonsequential.sources.extended import ExtendedSource  # noqa: PLC0415
-    from optiland.nonsequential.sources.point import PointSource  # noqa: PLC0415
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    if isinstance(config, PointSourceConfig):
-        return PointSource(
-            cs=cs,
-            spectrum=config.spectrum,
-            total_flux=_resolve_total_flux(config),
-            half_angle_deg=config.half_angle_deg,
-            medium=getattr(config, "medium", None),
-        )
-    if isinstance(config, CollimatedSourceConfig):
-        return CollimatedSource(
-            cs=cs,
-            spectrum=config.spectrum,
-            total_flux=_resolve_total_flux(config),
-            aperture_radius=config.aperture_radius,
-            profile=config.profile,
-            gaussian_sigma=config.gaussian_sigma,
-            medium=getattr(config, "medium", None),
-        )
-    if isinstance(config, ExtendedSourceConfig):
-        return ExtendedSource(
-            cs=cs,
-            spectrum=config.spectrum,
-            total_flux=_resolve_total_flux(config),
-            width=config.width,
-            height=config.height,
-            aperture_radius=config.aperture_radius,
-            half_angle_deg=config.half_angle_deg,
-            medium=getattr(config, "medium", None),
-        )
-    raise TypeError(
-        f"Unrecognised source config type: {type(config).__name__}. "
-        "Expected PointSourceConfig, CollimatedSourceConfig, or ExtendedSourceConfig."
-    )
+    return kinds.SOURCES.build(cs, config)
 
 
 def _build_detector(cs: CoordinateSystem, config) -> object:
-    """Instantiate a BaseDetector from a config dataclass.
+    """Instantiate a detector from its config through the detector kind registry.
 
     Args:
         cs: Coordinate system for the detector.
-        config: One of IrradianceDetectorConfig, SpectralDetectorConfig,
-            FarFieldDetectorConfig, RayDatabaseConfig.
+        config: A config registered to a detector kind (the built-ins:
+            IrradianceDetectorConfig, SpectralDetectorConfig,
+            FarFieldDetectorConfig, HemisphereDetectorConfig,
+            RayDatabaseConfig; see :mod:`optiland.nonsequential.kinds`).
 
     Returns:
         Constructed detector object.
 
     Raises:
-        TypeError: If the config type is not recognised.
+        TypeError: If the config type is not registered to a detector kind.
+        NotImplementedError: If a config field carries a gradient its kind
+            does not declare attached.
     """
-    from optiland.nonsequential.detectors.configs import (  # noqa: PLC0415
-        FarFieldDetectorConfig,
-        HemisphereDetectorConfig,
-        IrradianceDetectorConfig,
-        RayDatabaseConfig,
-        SpectralDetectorConfig,
-    )
-    from optiland.nonsequential.detectors.far_field import (
-        FarFieldDetector,  # noqa: PLC0415
-    )
-    from optiland.nonsequential.detectors.hemisphere import (
-        HemisphereDetector,  # noqa: PLC0415
-    )
-    from optiland.nonsequential.detectors.irradiance import (
-        IrradianceDetector,  # noqa: PLC0415
-    )
-    from optiland.nonsequential.detectors.ray_database import (  # noqa: PLC0415
-        RayDatabaseDetector,
-    )
-    from optiland.nonsequential.detectors.spectral import (
-        SpectralDetector,  # noqa: PLC0415
-    )
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    if isinstance(config, IrradianceDetectorConfig):
-        return IrradianceDetector(
-            cs=cs,
-            width=config.width,
-            height=config.height,
-            num_pixels_x=config.num_pixels_x,
-            num_pixels_y=config.num_pixels_y,
-            splat=config.splat,
-            splat_sigma=config.splat_sigma,
-            absorb=config.absorb,
-            side=config.side,
-            reflection_bins=config.reflection_bins,
-        )
-    if isinstance(config, SpectralDetectorConfig):
-        wl_bins = be.linspace(config.wl_min, config.wl_max, config.num_bins + 1)
-        return SpectralDetector(
-            cs=cs,
-            width=config.width,
-            height=config.height,
-            num_pixels_x=config.num_pixels_x,
-            num_pixels_y=config.num_pixels_y,
-            wavelength_bins=wl_bins,
-            splat=config.splat,
-            splat_sigma=config.splat_sigma,
-            absorb=config.absorb,
-        )
-    if isinstance(config, FarFieldDetectorConfig):
-        return FarFieldDetector(
-            cs=cs,
-            theta_max_deg=90.0,
-            num_bins_theta=config.num_theta,
-            num_bins_phi=config.num_phi,
-            absorb=config.absorb,
-            side=config.side,
-            reflection_bins=config.reflection_bins,
-        )
-    if isinstance(config, HemisphereDetectorConfig):
-        return HemisphereDetector(
-            cs=cs,
-            radius=config.radius,
-            num_bins_theta=config.num_theta,
-            num_bins_phi=config.num_phi,
-            absorb=config.absorb,
-            reflection_bins=config.reflection_bins,
-        )
-    if isinstance(config, RayDatabaseConfig):
-        from optiland.nonsequential.components.geometry.analytic.plane import (  # noqa: PLC0415
-            FinitePlaneGeometry,
-        )
-
-        geometry = FinitePlaneGeometry(width=config.width, height=config.height)
-        return RayDatabaseDetector(
-            cs=cs,
-            geometry=geometry,
-            # 0 ("unlimited", the config default) maps to RayDatabaseDetector's
-            # own None-means-unlimited convention (this was
-            # previously accepted and silently dropped -- the circular-buffer
-            # limit never took effect).
-            max_rays=config.max_rays if config.max_rays > 0 else None,
-            absorb=config.absorb,
-        )
-    raise TypeError(f"Unrecognised detector config type: {type(config).__name__}.")
+    return kinds.DETECTORS.build(cs, config)

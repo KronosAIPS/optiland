@@ -34,6 +34,9 @@ prescription-pdf = ["reportlab>=4.0"]
 prescription = ["rich>=13.0", "reportlab>=4.0"]
 gui = ["PySide6", "qtconsole"]
 torch = ["torch"]
+# Non-sequential photometry: EULUMDAT files (eulumdat-py, MIT, pinned: an early
+# release) and CIE illuminants, CCT and CRI (colour-science, BSD-3-Clause).
+nsq-photometry = ["eulumdat-py==1.0.0", "colour-science>=0.4.7,<0.5"]
 
 [project.urls]
 Homepage = "https://github.com/optiland/optiland"

@@ -149,35 +149,41 @@ def _deserialize_cs(d: dict) -> CoordinateSystem:
 
 
 def _serialize_spectrum(spectrum: Spectrum) -> dict:
-    """Serialize a :class:`Spectrum` to a JSON-safe dict.
+    """Serialize a spectrum to a JSON-safe dict, through its spectrum kind.
+
+    A line spectrum (the original :class:`Spectrum`) is written exactly as
+    schema version 1 always wrote it -- ``wavelengths`` and ``weights`` and no
+    ``kind`` key -- so every file written before other spectrum kinds existed
+    reads back unchanged. Any other kind adds ``"kind": <name>``.
 
     Args:
-        spectrum: Spectrum object with ``wavelengths`` and ``weights`` arrays.
+        spectrum: A spectrum registered to a spectrum kind.
 
     Returns:
-        Dict with keys ``wavelengths`` and ``weights`` as plain float lists.
+        JSON-safe dict.
     """
-    return {
-        "wavelengths": _to_list(spectrum.wavelengths),
-        "weights": _to_list(spectrum.weights),
-    }
+    from optiland.nonsequential import kinds  # noqa: PLC0415
+
+    spec = kinds.SPECTRA.for_object(spectrum)
+    body = spec.to_dict(spectrum)
+    if spec.name == "lines":
+        return body
+    return {"kind": spec.name, **body}
 
 
 def _deserialize_spectrum(d: dict) -> Spectrum:
-    """Reconstruct a :class:`Spectrum` from a serialized dict.
+    """Reconstruct a spectrum from a serialized dict (a missing ``kind`` is a
+    line spectrum).
 
     Args:
         d: Dict previously produced by :func:`_serialize_spectrum`.
 
     Returns:
-        Reconstructed :class:`Spectrum`.
+        Reconstructed spectrum.
     """
-    from optiland.nonsequential.sources.base import Spectrum  # noqa: PLC0415
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    return Spectrum(
-        wavelengths=np.array(d["wavelengths"], dtype=np.float64),
-        weights=np.array(d["weights"], dtype=np.float64),
-    )
+    return kinds.SPECTRA.by_name(d.get("kind", "lines")).from_dict(d)
 
 
 def _serialize_material(mat: str | NSQMaterial | None) -> Any:
@@ -255,10 +261,9 @@ def _deserialize_material(d: Any) -> str | None:
 def _serialize_component(name: str, compound: Any) -> dict:
     """Serialize a named compound component to a JSON-safe dict.
 
-    Supports :class:`~optiland.nonsequential.components.lens.Lens`,
-    :class:`~optiland.nonsequential.components.mirror.Mirror`, and
-    :class:`~optiland.nonsequential.components.doublet.Doublet` by reading
-    the ``_config`` and ``_cs`` attributes stored on every compound.
+    The component's kind (:data:`optiland.nonsequential.kinds.COMPONENTS`)
+    writes its ``config`` block from the ``_config`` stored on every compound;
+    this function adds ``type``, ``name`` and ``cs``.
 
     Args:
         name: Registry name of the component.
@@ -268,120 +273,25 @@ def _serialize_component(name: str, compound: Any) -> dict:
         Dict describing the component type and configuration.
 
     Raises:
-        TypeError: If the component type cannot be serialized.
+        TypeError: If the component type is not registered to a component
+            kind.
     """
-    from optiland.nonsequential.components.doublet import Doublet  # noqa: PLC0415
-    from optiland.nonsequential.components.lens import Lens  # noqa: PLC0415
-    from optiland.nonsequential.components.mirror import Mirror  # noqa: PLC0415
-    from optiland.nonsequential.components.paraxial import (  # noqa: PLC0415
-        ParaxialLens,
-    )
-    from optiland.nonsequential.components.prism import Prism  # noqa: PLC0415
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    cs = compound._cs
-    config = compound._config
-
-    if isinstance(compound, Lens):
-        return {
-            "type": "lens",
-            "name": name,
-            "cs": _serialize_cs(cs),
-            "config": {
-                "r1": _to_float(config.r1),
-                "r2": _to_float(config.r2),
-                "thickness": _to_float(config.thickness),
-                "material": _serialize_material(config.material),
-                "front_aperture_radius": _to_float(config.front_aperture_radius),
-                "back_aperture_radius": (
-                    _to_float(config.back_aperture_radius)
-                    if config.back_aperture_radius is not None
-                    else None
-                ),
-                "conic1": _to_float(config.conic1),
-                "conic2": _to_float(config.conic2),
-            },
-        }
-
-    if isinstance(compound, Mirror):
-        if not isinstance(config.reflectance, int | float) and not hasattr(
-            config.reflectance, "numpy"
-        ):
-            raise TypeError(
-                f"Cannot serialize mirror '{name}': reflectance is "
-                f"{type(config.reflectance).__name__}, not a constant. "
-                "Only a scalar reflectance round-trips through JSON "
-                "serialization; a callable or coating reflectance must be "
-                "re-attached after loading."
-            )
-        return {
-            "type": "mirror",
-            "name": name,
-            "cs": _serialize_cs(cs),
-            "config": {
-                "radius": _to_float(config.radius),
-                "reflectance": _to_float(config.reflectance),
-                "conic": _to_float(config.conic),
-                "aperture_radius": _to_float(config.aperture_radius),
-            },
-        }
-
-    if isinstance(compound, Doublet):
-        return {
-            "type": "doublet",
-            "name": name,
-            "cs": _serialize_cs(cs),
-            "config": {
-                "r1": _to_float(config.r1),
-                "r2": _to_float(config.r2),
-                "r3": _to_float(config.r3),
-                "thickness1": _to_float(config.thickness1),
-                "thickness2": _to_float(config.thickness2),
-                "material1": _serialize_material(config.material1),
-                "material2": _serialize_material(config.material2),
-                "aperture_radius": _to_float(config.aperture_radius),
-                "conic1": _to_float(config.conic1),
-                "conic2": _to_float(config.conic2),
-                "conic3": _to_float(config.conic3),
-            },
-        }
-
-    if isinstance(compound, Prism):
-        # As for a lens, per-surface overrides (SurfaceConfig) are not part
-        # of the round trip.
-        return {
-            "type": "prism",
-            "name": name,
-            "cs": _serialize_cs(cs),
-            "config": {
-                "apex_angle_deg": _to_float(config.apex_angle_deg),
-                "face_length": _to_float(config.face_length),
-                "length": _to_float(config.length),
-                "material": _serialize_material(config.material),
-                "open_base": bool(config.open_base),
-            },
-        }
-
-    if isinstance(compound, ParaxialLens):
-        return {
-            "type": "paraxial_lens",
-            "name": name,
-            "cs": _serialize_cs(cs),
-            "config": {
-                "focal_length": _to_float(config.focal_length),
-                "aperture_radius": _to_float(config.aperture_radius),
-                "stop_radius": (
-                    _to_float(config.stop_radius)
-                    if config.stop_radius is not None
-                    else None
-                ),
-            },
-        }
-
-    raise TypeError(
-        f"Cannot serialize component '{name}' of type "
-        f"'{type(compound).__name__}'. Only Lens, Mirror, Doublet, Prism and "
-        "ParaxialLens are supported for round-trip serialization."
-    )
+    try:
+        spec = kinds.COMPONENTS.for_object(compound)
+    except TypeError:
+        raise TypeError(
+            f"Cannot serialize component '{name}' of type "
+            f"'{type(compound).__name__}'. Registered component kinds: "
+            f"{', '.join(kinds.COMPONENTS.names())}."
+        ) from None
+    return {
+        "type": spec.name,
+        "name": name,
+        "cs": _serialize_cs(compound._cs),
+        "config": spec.to_dict(compound),
+    }
 
 
 def _deserialize_component(d: dict, scene: NSQScene) -> None:
@@ -394,80 +304,12 @@ def _deserialize_component(d: dict, scene: NSQScene) -> None:
     Raises:
         ValueError: If the component type is unknown.
     """
-    from optiland.nonsequential.components.configs import (  # noqa: PLC0415
-        DoubletConfig,
-        LensConfig,
-        MirrorConfig,
-        ParaxialLensConfig,
-        PrismConfig,
-    )
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    ctype = d["type"]
-    name = d["name"]
-    cs = _deserialize_cs(d["cs"])
-    cfg_d = d["config"]
-
-    if ctype == "lens":
-        config = LensConfig(
-            r1=cfg_d["r1"],
-            r2=cfg_d["r2"],
-            thickness=cfg_d["thickness"],
-            material=_deserialize_material(cfg_d["material"]),
-            front_aperture_radius=cfg_d["front_aperture_radius"],
-            back_aperture_radius=cfg_d.get("back_aperture_radius"),
-            conic1=cfg_d.get("conic1", 0.0),
-            conic2=cfg_d.get("conic2", 0.0),
-        )
-        scene.add_lens(name, cs, config)
-
-    elif ctype == "mirror":
-        config = MirrorConfig(
-            radius=cfg_d["radius"],
-            reflectance=cfg_d["reflectance"],
-            conic=cfg_d.get("conic", 0.0),
-            aperture_radius=cfg_d["aperture_radius"],
-        )
-        scene.add_mirror(name, cs, config)
-
-    elif ctype == "doublet":
-        config = DoubletConfig(
-            r1=cfg_d["r1"],
-            r2=cfg_d["r2"],
-            r3=cfg_d["r3"],
-            thickness1=cfg_d["thickness1"],
-            thickness2=cfg_d["thickness2"],
-            material1=_deserialize_material(cfg_d["material1"]),
-            material2=_deserialize_material(cfg_d["material2"]),
-            aperture_radius=cfg_d["aperture_radius"],
-            conic1=cfg_d.get("conic1", 0.0),
-            conic2=cfg_d.get("conic2", 0.0),
-            conic3=cfg_d.get("conic3", 0.0),
-        )
-        scene.add_doublet(name, cs, config)
-
-    elif ctype == "prism":
-        config = PrismConfig(
-            apex_angle_deg=cfg_d["apex_angle_deg"],
-            face_length=cfg_d["face_length"],
-            length=cfg_d["length"],
-            material=_deserialize_material(cfg_d["material"]),
-            open_base=cfg_d.get("open_base", False),
-        )
-        scene.add_prism(name, cs, config)
-
-    elif ctype == "paraxial_lens":
-        config = ParaxialLensConfig(
-            focal_length=cfg_d["focal_length"],
-            aperture_radius=cfg_d["aperture_radius"],
-            stop_radius=cfg_d.get("stop_radius"),
-        )
-        scene.add_paraxial_lens(name, cs, config)
-
-    else:
-        raise ValueError(
-            f"Unknown component type '{ctype}' in NSQ JSON. "
-            "Expected 'lens', 'mirror', 'doublet', 'prism' or 'paraxial_lens'."
-        )
+    spec = kinds.COMPONENTS.by_name(d["type"])
+    config = spec.from_dict(d["config"])
+    kinds.COMPONENTS.check_gradients(spec, config)
+    spec.build(scene, d["name"], _deserialize_cs(d["cs"]), config)
 
 
 # ---------------------------------------------------------------------------
@@ -478,75 +320,38 @@ def _deserialize_component(d: dict, scene: NSQScene) -> None:
 def _serialize_source(name: str, source: Any) -> dict:
     """Serialize a named source to a JSON-safe dict.
 
+    The shared fields (``type``, ``name``, ``cs``, ``spectrum``,
+    ``total_flux``, ``medium``) are written here; the kind-specific ones by
+    the source's kind (:data:`optiland.nonsequential.kinds.SOURCES`).
+
     Args:
         name: Registry name of the source.
-        source: Source object (PointSource, CollimatedSource, or ExtendedSource).
+        source: A source registered to a source kind.
 
     Returns:
         Dict describing the source type and parameters.
 
     Raises:
-        TypeError: If the source type is not supported.
+        TypeError: If the source type is not registered to a source kind.
     """
-    from optiland.nonsequential.sources.collimated import (  # noqa: PLC0415
-        CollimatedSource,
-    )
-    from optiland.nonsequential.sources.extended import (  # noqa: PLC0415
-        ExtendedSource,
-    )
-    from optiland.nonsequential.sources.point import PointSource  # noqa: PLC0415
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    cs_d = _serialize_cs(source.cs)
-    spectrum_d = _serialize_spectrum(source.spectrum)
-    total_flux = _to_float(source.total_flux)
-    medium = _serialize_material(getattr(source, "medium", None))
-
-    if isinstance(source, PointSource):
-        return {
-            "type": "point",
-            "name": name,
-            "cs": cs_d,
-            "spectrum": spectrum_d,
-            "total_flux": total_flux,
-            "half_angle_deg": _to_float(source.half_angle_deg),
-            "medium": medium,
-        }
-
-    if isinstance(source, CollimatedSource):
-        return {
-            "type": "collimated",
-            "name": name,
-            "cs": cs_d,
-            "spectrum": spectrum_d,
-            "total_flux": total_flux,
-            "aperture_radius": _to_float(source.aperture_radius),
-            "profile": source.profile,
-            "gaussian_sigma": _to_float(source.gaussian_sigma),
-            "medium": medium,
-        }
-
-    if isinstance(source, ExtendedSource):
-        return {
-            "type": "extended",
-            "name": name,
-            "cs": cs_d,
-            "spectrum": spectrum_d,
-            "total_flux": total_flux,
-            "width": _to_float(source.width),
-            "height": _to_float(source.height),
-            "aperture_radius": (
-                _to_float(source.aperture_radius)
-                if source.aperture_radius is not None
-                else None
-            ),
-            "half_angle_deg": _to_float(source.half_angle_deg),
-            "medium": medium,
-        }
-
-    raise TypeError(
-        f"Cannot serialize source '{name}' of type '{type(source).__name__}'. "
-        "Only PointSource, CollimatedSource, and ExtendedSource are supported."
-    )
+    try:
+        spec = kinds.SOURCES.for_object(source)
+    except TypeError:
+        raise TypeError(
+            f"Cannot serialize source '{name}' of type '{type(source).__name__}'. "
+            f"Registered source kinds: {', '.join(kinds.SOURCES.names())}."
+        ) from None
+    return {
+        "type": spec.name,
+        "name": name,
+        "cs": _serialize_cs(source.cs),
+        "spectrum": _serialize_spectrum(source.spectrum),
+        "total_flux": _to_float(source.total_flux),
+        **spec.to_dict(source),
+        "medium": _serialize_material(getattr(source, "medium", None)),
+    }
 
 
 def _deserialize_source(d: dict, scene: NSQScene) -> None:
@@ -559,56 +364,16 @@ def _deserialize_source(d: dict, scene: NSQScene) -> None:
     Raises:
         ValueError: If the source type is unknown.
     """
-    from optiland.nonsequential.sources.configs import (  # noqa: PLC0415
-        CollimatedSourceConfig,
-        ExtendedSourceConfig,
-        PointSourceConfig,
+    from optiland.nonsequential import kinds  # noqa: PLC0415
+
+    spec = kinds.SOURCES.by_name(d["type"])
+    config = spec.from_dict(
+        d,
+        spectrum=_deserialize_spectrum(d["spectrum"]),
+        total_flux=d["total_flux"],
+        medium=_deserialize_material(d.get("medium")),
     )
-
-    stype = d["type"]
-    name = d["name"]
-    cs = _deserialize_cs(d["cs"])
-    spectrum = _deserialize_spectrum(d["spectrum"])
-    total_flux = d["total_flux"]
-    medium = _deserialize_material(d.get("medium"))
-
-    if stype == "point":
-        config = PointSourceConfig(
-            spectrum=spectrum,
-            total_flux=total_flux,
-            half_angle_deg=d.get("half_angle_deg", 90.0),
-            medium=medium,
-        )
-        scene.add_source(name, cs, config)
-
-    elif stype == "collimated":
-        config = CollimatedSourceConfig(
-            spectrum=spectrum,
-            total_flux=total_flux,
-            aperture_radius=d.get("aperture_radius", 1.0),
-            profile=d.get("profile", "tophat"),
-            gaussian_sigma=d.get("gaussian_sigma"),
-            medium=medium,
-        )
-        scene.add_source(name, cs, config)
-
-    elif stype == "extended":
-        config = ExtendedSourceConfig(
-            spectrum=spectrum,
-            total_flux=total_flux,
-            width=d.get("width", 1.0),
-            height=d.get("height", 1.0),
-            aperture_radius=d.get("aperture_radius"),
-            half_angle_deg=d.get("half_angle_deg", 90.0),
-            medium=medium,
-        )
-        scene.add_source(name, cs, config)
-
-    else:
-        raise ValueError(
-            f"Unknown source type '{stype}' in NSQ JSON. "
-            "Expected 'point', 'collimated', or 'extended'."
-        )
+    scene.add_source(d["name"], _deserialize_cs(d["cs"]), config)
 
 
 # ---------------------------------------------------------------------------
@@ -619,112 +384,37 @@ def _deserialize_source(d: dict, scene: NSQScene) -> None:
 def _serialize_detector(name: str, detector: Any) -> dict:
     """Serialize a named detector to a JSON-safe dict.
 
+    ``type``, ``name`` and ``cs`` are written here; the rest by the detector's
+    kind (:data:`optiland.nonsequential.kinds.DETECTORS`). The lookup is by
+    exact class, so the hemispherical collector (a subclass of the far-field
+    detector) is never written as a flat far-field detector.
+
     Args:
         name: Registry name of the detector.
-        detector: Detector object.
+        detector: A detector registered to a detector kind.
 
     Returns:
         Dict describing the detector type and parameters.
 
     Raises:
-        TypeError: If the detector type is not supported.
+        TypeError: If the detector type is not registered to a detector kind.
     """
-    from optiland.nonsequential.detectors.far_field import (  # noqa: PLC0415
-        FarFieldDetector,
-    )
-    from optiland.nonsequential.detectors.hemisphere import (  # noqa: PLC0415
-        HemisphereDetector,
-    )
-    from optiland.nonsequential.detectors.irradiance import (  # noqa: PLC0415
-        IrradianceDetector,
-    )
-    from optiland.nonsequential.detectors.ray_database import (  # noqa: PLC0415
-        RayDatabaseDetector,
-    )
-    from optiland.nonsequential.detectors.spectral import (  # noqa: PLC0415
-        SpectralDetector,
-    )
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    cs_d = _serialize_cs(detector.cs)
-
-    if isinstance(detector, IrradianceDetector):
-        return {
-            "type": "irradiance",
-            "name": name,
-            "cs": cs_d,
-            "width": _to_float(detector.width),
-            "height": _to_float(detector.height),
-            "num_pixels_x": int(detector.num_pixels_x),
-            "num_pixels_y": int(detector.num_pixels_y),
-            "splat": detector.splat,
-            "splat_sigma": _to_float(detector.splat_sigma),
-            "absorb": bool(detector.absorb),
-            "side": detector.side,
-            "reflection_bins": int(detector.reflection_bins),
-        }
-
-    if isinstance(detector, SpectralDetector):
-        wl_bins = np.asarray(detector.wavelength_bins, dtype=float)
-        return {
-            "type": "spectral",
-            "name": name,
-            "cs": cs_d,
-            "width": _to_float(detector.width),
-            "height": _to_float(detector.height),
-            "num_pixels_x": int(detector.num_pixels_x),
-            "num_pixels_y": int(detector.num_pixels_y),
-            "wl_min": float(wl_bins[0]),
-            "wl_max": float(wl_bins[-1]),
-            "num_bins": int(len(wl_bins) - 1),
-            "splat": detector.splat,
-            "splat_sigma": _to_float(detector.splat_sigma),
-            "absorb": bool(detector.absorb),
-        }
-
-    # Before FarFieldDetector: the hemispherical collector is a subclass of
-    # it, and would otherwise serialize as a flat far-field detector and
-    # come back as one, silently losing the shell.
-    if isinstance(detector, HemisphereDetector):
-        return {
-            "type": "hemisphere",
-            "name": name,
-            "cs": cs_d,
-            "radius": _to_float(detector.radius),
-            "num_bins_theta": int(detector.num_bins_theta),
-            "num_bins_phi": int(detector.num_bins_phi),
-            "absorb": bool(detector.absorb),
-            "reflection_bins": int(detector.reflection_bins),
-        }
-
-    if isinstance(detector, FarFieldDetector):
-        return {
-            "type": "far_field",
-            "name": name,
-            "cs": cs_d,
-            "num_bins_theta": int(detector.num_bins_theta),
-            "num_bins_phi": int(detector.num_bins_phi),
-            "absorb": bool(detector.absorb),
-            "side": detector.side,
-            "reflection_bins": int(detector.reflection_bins),
-        }
-
-    if isinstance(detector, RayDatabaseDetector):
-        # RayDatabaseDetector holds a geometry object; extract width/height.
-        geom = detector.geometry
-        return {
-            "type": "ray_database",
-            "name": name,
-            "cs": cs_d,
-            "width": float(getattr(geom, "width", 10.0)),
-            "height": float(getattr(geom, "height", 10.0)),
-            "absorb": bool(detector.absorb),
-        }
-
-    raise TypeError(
-        f"Cannot serialize detector '{name}' of type '{type(detector).__name__}'. "
-        "Only IrradianceDetector, SpectralDetector, FarFieldDetector, "
-        "HemisphereDetector, and RayDatabaseDetector are supported."
-    )
+    try:
+        spec = kinds.DETECTORS.for_object(detector)
+    except TypeError:
+        raise TypeError(
+            f"Cannot serialize detector '{name}' of type "
+            f"'{type(detector).__name__}'. Registered detector kinds: "
+            f"{', '.join(kinds.DETECTORS.names())}."
+        ) from None
+    return {
+        "type": spec.name,
+        "name": name,
+        "cs": _serialize_cs(detector.cs),
+        **spec.to_dict(detector),
+    }
 
 
 def _deserialize_detector(d: dict, scene: NSQScene) -> None:
@@ -737,81 +427,10 @@ def _deserialize_detector(d: dict, scene: NSQScene) -> None:
     Raises:
         ValueError: If the detector type is unknown.
     """
-    from optiland.nonsequential.detectors.configs import (  # noqa: PLC0415
-        FarFieldDetectorConfig,
-        HemisphereDetectorConfig,
-        IrradianceDetectorConfig,
-        RayDatabaseConfig,
-        SpectralDetectorConfig,
-    )
+    from optiland.nonsequential import kinds  # noqa: PLC0415
 
-    dtype = d["type"]
-    name = d["name"]
-    cs = _deserialize_cs(d["cs"])
-
-    if dtype == "irradiance":
-        config = IrradianceDetectorConfig(
-            width=d["width"],
-            height=d["height"],
-            num_pixels_x=d.get("num_pixels_x", 256),
-            num_pixels_y=d.get("num_pixels_y", 256),
-            splat=d.get("splat", "bilinear"),
-            splat_sigma=d.get("splat_sigma", 0.5),
-            absorb=d.get("absorb", True),
-            side=d.get("side", "both"),
-            reflection_bins=d.get("reflection_bins", 0),
-        )
-        scene.add_detector(name, cs, config)
-
-    elif dtype == "spectral":
-        config = SpectralDetectorConfig(
-            width=d["width"],
-            height=d["height"],
-            num_pixels_x=d.get("num_pixels_x", 256),
-            num_pixels_y=d.get("num_pixels_y", 256),
-            wl_min=d.get("wl_min", 0.4),
-            wl_max=d.get("wl_max", 0.7),
-            num_bins=d.get("num_bins", 100),
-            splat=d.get("splat", "bilinear"),
-            splat_sigma=d.get("splat_sigma", 0.5),
-            absorb=d.get("absorb", True),
-        )
-        scene.add_detector(name, cs, config)
-
-    elif dtype == "far_field":
-        config = FarFieldDetectorConfig(
-            num_theta=d.get("num_bins_theta", 90),
-            num_phi=d.get("num_bins_phi", 360),
-            absorb=d.get("absorb", True),
-            side=d.get("side", "both"),
-            reflection_bins=d.get("reflection_bins", 0),
-        )
-        scene.add_detector(name, cs, config)
-
-    elif dtype == "hemisphere":
-        config = HemisphereDetectorConfig(
-            radius=d["radius"],
-            num_theta=d.get("num_bins_theta", 18),
-            num_phi=d.get("num_bins_phi", 36),
-            absorb=d.get("absorb", True),
-            reflection_bins=d.get("reflection_bins", 0),
-        )
-        scene.add_detector(name, cs, config)
-
-    elif dtype == "ray_database":
-        config = RayDatabaseConfig(
-            width=d["width"],
-            height=d["height"],
-            absorb=d.get("absorb", True),
-        )
-        scene.add_detector(name, cs, config)
-
-    else:
-        raise ValueError(
-            f"Unknown detector type '{dtype}' in NSQ JSON. "
-            "Expected 'irradiance', 'spectral', 'far_field', 'hemisphere', "
-            "or 'ray_database'."
-        )
+    spec = kinds.DETECTORS.by_name(d["type"])
+    scene.add_detector(d["name"], _deserialize_cs(d["cs"]), spec.from_dict(d))
 
 
 # ---------------------------------------------------------------------------
