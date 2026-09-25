@@ -169,6 +169,43 @@ def build_irradiance_detector(cs: Any, config: Any) -> Any:
     )
 
 
+def build_colorimetric_detector(cs: Any, config: Any) -> Any:
+    """``ColorimetricDetectorConfig`` -> ``ColorimetricDetector``."""
+    from optiland.nonsequential.detectors.colorimetric import (  # noqa: PLC0415
+        ColorimetricDetector,
+    )
+
+    return ColorimetricDetector(
+        cs=cs,
+        width=config.width,
+        height=config.height,
+        num_pixels_x=config.num_pixels_x,
+        num_pixels_y=config.num_pixels_y,
+        splat=config.splat,
+        splat_sigma=config.splat_sigma,
+        absorb=config.absorb,
+        side=config.side,
+        reflection_bins=config.reflection_bins,
+    )
+
+
+def build_colorimetric_far_field_detector(cs: Any, config: Any) -> Any:
+    """``ColorimetricFarFieldDetectorConfig`` -> ``ColorimetricFarFieldDetector``."""
+    from optiland.nonsequential.detectors.colorimetric import (  # noqa: PLC0415
+        ColorimetricFarFieldDetector,
+    )
+
+    return ColorimetricFarFieldDetector(
+        cs=cs,
+        theta_max_deg=90.0,
+        num_bins_theta=config.num_theta,
+        num_bins_phi=config.num_phi,
+        absorb=config.absorb,
+        side=config.side,
+        reflection_bins=config.reflection_bins,
+    )
+
+
 def build_spectral_detector(cs: Any, config: Any) -> Any:
     """``SpectralDetectorConfig`` -> ``SpectralDetector``."""
     import optiland.backend as be  # noqa: PLC0415
@@ -629,6 +666,41 @@ def _register_detectors() -> None:
         },
         attached=("radius",),
         description="a closed hemispherical shell binning flux by direction",
+    )
+
+    # -- colorimetric: the irradiance and far-field kinds plus X, Y, Z ----------
+    from optiland.nonsequential.detectors.colorimetric import (  # noqa: PLC0415
+        ColorimetricDetector,
+        ColorimetricFarFieldDetector,
+    )
+    from optiland.nonsequential.detectors.configs import (  # noqa: PLC0415
+        ColorimetricDetectorConfig,
+        ColorimetricFarFieldDetectorConfig,
+    )
+
+    irr = kinds.DETECTORS.by_name("irradiance")
+    kinds.register_detector(
+        "colorimetric",
+        ColorimetricDetector,
+        ColorimetricDetectorConfig,
+        build=build_colorimetric_detector,
+        to_dict=irr.to_dict,
+        from_dict=lambda d: ColorimetricDetectorConfig(**vars(irr.from_dict(d))),
+        lower=irr.lower,
+        attached=("width", "height"),
+        description="an irradiance plane that also books CIE X, Y, Z per pixel",
+    )
+    ff = kinds.DETECTORS.by_name("far_field")
+    kinds.register_detector(
+        "colorimetric_far_field",
+        ColorimetricFarFieldDetector,
+        ColorimetricFarFieldDetectorConfig,
+        build=build_colorimetric_far_field_detector,
+        to_dict=ff.to_dict,
+        from_dict=lambda d: ColorimetricFarFieldDetectorConfig(**vars(ff.from_dict(d))),
+        lower=ff.lower,
+        attached=(),
+        description="a far-field plane that also books CIE X, Y, Z intensity per bin",
     )
 
     # -- ray database ---------------------------------------------------------

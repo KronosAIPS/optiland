@@ -289,6 +289,10 @@ from optiland.nonsequential.convert import ConversionError, sequential_to_nonseq
 # Detectors
 from optiland.nonsequential.detectors import (
     BaseDetector,
+    ColorimetricDetector,
+    ColorimetricDetectorConfig,
+    ColorimetricFarFieldDetector,
+    ColorimetricFarFieldDetectorConfig,
     DetectorRegistry,
     FarFieldDetector,
     FarFieldDetectorConfig,
@@ -416,6 +420,10 @@ __all__ = [
     # Detectors
     "BaseDetector",
     "DetectorRegistry",
+    "ColorimetricDetector",
+    "ColorimetricDetectorConfig",
+    "ColorimetricFarFieldDetector",
+    "ColorimetricFarFieldDetectorConfig",
     "FarFieldDetector",
     "FarFieldDetectorConfig",
     "HemisphereDetector",
