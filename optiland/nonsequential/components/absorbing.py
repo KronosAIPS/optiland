@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import optiland.backend as be
-from optiland.nonsequential._tally import masked_count, masked_sum
+from optiland.nonsequential._tally import accumulate, masked_count, masked_sum
 from optiland.nonsequential.components.base import BaseComponent
 from optiland.nonsequential.materials.nsq_material import VACUUM
 
@@ -90,10 +90,13 @@ class AbsorbingComponent(BaseComponent):
         # Count absorbed rays (must be alive when they hit). Both counters
         # are accumulated wherever the ray state lives and read back once,
         # at the end of the trace: a per-bounce ``int(...)``/``float(...)``
-        # on a device array is a synchronisation.
+        # on a device array is a synchronisation. On a device they add in
+        # place after the first term (``accumulate``).
         hit_alive = hit_mask & rays.alive
-        self._absorbed_count = self._absorbed_count + masked_count(hit_alive)
-        self._absorbed_flux = self._absorbed_flux + masked_sum(rays.flux, hit_alive)
+        self._absorbed_count = accumulate(self._absorbed_count, masked_count(hit_alive))
+        self._absorbed_flux = accumulate(
+            self._absorbed_flux, masked_sum(rays.flux, hit_alive)
+        )
 
         # Terminate rays
         rays.alive = rays.alive & ~hit_mask

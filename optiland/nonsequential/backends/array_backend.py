@@ -37,6 +37,7 @@ from optiland.nonsequential._utils import (
     distribute_ray_budget,
     estimate_bounding_scale,
     get_detector_names,
+    resident_scalar,
 )
 from optiland.nonsequential.backends.base import TracerBackend
 from optiland.nonsequential._tally import Tally
@@ -269,6 +270,50 @@ class ArrayBackend(TracerBackend):
         """
         return bool(self.supports_splitting)
 
+    def _check_graph_replay(self, scene, ir, record_paths) -> None:
+        """Refuse a replayed bounce where it cannot apply; no-op by default.
+
+        Args:
+            scene: The scene about to be traced.
+            ir: The scene's lowered IR.
+            record_paths: The trace's ``record_paths`` argument.
+        """
+        return
+
+    def _graph_handover_depth(self, rays: NSQRayBundle) -> int | None:
+        """The bounce at which this batch is handed to a replayed graph, if any.
+
+        The default backend replays nothing, and every bounce runs through
+        the loop below.
+
+        Args:
+            rays: The freshly prepared batch.
+
+        Returns:
+            ``None``.
+        """
+        return None
+
+    def _replay_bounces(
+        self, rays, bounce, depth, max_depth, scene, tallies
+    ) -> NSQRayBundle:
+        """Run bounces ``depth .. max_depth - 1`` as a replayed graph.
+
+        Only called for a batch :meth:`_graph_handover_depth` handed over.
+
+        Args:
+            rays: The batch after the eager bounces.
+            bounce: The loop's bounce body, ``bounce(rays, depth) -> rays``.
+            depth: Bounces already run.
+            max_depth: The depth cap.
+            scene: The scene being traced.
+            tallies: The trace's own tallies.
+
+        Returns:
+            The bundle after the last bounce.
+        """
+        raise NotImplementedError
+
     # ------------------------------------------------------------------
     # Shared per-bounce pieces
     # ------------------------------------------------------------------
@@ -418,6 +463,7 @@ class ArrayBackend(TracerBackend):
         for component in scene.surfaces:
             component.refresh_backend_transform()
         self._check_sampling_support(ir)
+        self._check_graph_replay(scene, ir, record_paths)
 
         t_start = time.perf_counter()
 
@@ -454,6 +500,18 @@ class ArrayBackend(TracerBackend):
         # per-surface hit counter of ch. 10 R-10-6).
         hit_counts = Tally.vector(len(scene.surfaces))
         split_budget_saturated = False
+        tallies = (
+            num_rays_escaped,
+            num_rays_flux_killed,
+            num_rays_depth_killed,
+            total_flux_escaped,
+            total_flux_bulk_absorbed,
+            total_flux_depth_killed,
+            total_flux_rr_killed,
+            total_flux_sampling_residual,
+            total_medium_stack_underflows,
+            hit_counts,
+        )
 
         # Hoisted out of the bounce loop: the scene's bounding box does not
         # change during a trace, and rebuilding it every bounce was O(S) of
@@ -512,15 +570,13 @@ class ArrayBackend(TracerBackend):
 
                 depth = 0
                 self._live_count_cache = None
-                while True:
-                    if not self._continue_bounce(rays, depth, max_depth):
-                        break
-                    # Whatever live count was read for this bounce's
-                    # early-exit check described the state *before* the
-                    # bounce body, which is about to change it. Compaction
-                    # at the end of the bounce reads it again, once, and
-                    # that read is the one the next bounce's check reuses.
-                    self._live_count_cache = None
+
+                # One bounce, as a function of the bundle and the bounce
+                # index. The loop below calls it once per bounce; a backend
+                # that replays a recorded bounce (TorchBackend(graph_replay=
+                # ...)) hands it to _replay_bounces, which records it once.
+                def _bounce(rays, depth):
+                    nonlocal split_budget_saturated
 
                     # --- traversal -------------------------------------
                     t_min, hit_normals, comp_idx, hit_n_geom = self.intersect_scene(
@@ -771,17 +827,40 @@ class ArrayBackend(TracerBackend):
                     # Flush this bounce's medium-stack inconsistency counts
                     # (see RefractiveComponent.interact) into the running
                     # total, then reset so they are counted exactly once
-                    # regardless of subsequent compaction/concat.
+                    # regardless of subsequent compaction/concat. The reset
+                    # writes an integer zero of the field's own dtype: the
+                    # working-float zero it used to write turned the counter
+                    # into floats after the first bounce, and the tally with
+                    # it (issue 60 of the research repository).
                     total_medium_stack_underflows.add(
                         be.sum(rays.medium_stack_underflows)
                     )
+                    underflows = rays.medium_stack_underflows
                     rays.medium_stack_underflows = be.where(
-                        rays.medium_stack_underflows > 0,
-                        be.zeros_like(rays.medium_stack_underflows),
-                        rays.medium_stack_underflows,
+                        underflows > 0,
+                        resident_scalar(self, "underflow_reset", 0, underflows),
+                        underflows,
                     )
 
                     rays = self._maybe_compact(rays, depth)
+                    return rays
+
+                handover = self._graph_handover_depth(rays)
+                while True:
+                    if not self._continue_bounce(rays, depth, max_depth):
+                        break
+                    # Whatever live count was read for this bounce's
+                    # early-exit check described the state *before* the
+                    # bounce body, which is about to change it. Compaction
+                    # at the end of the bounce reads it again, once, and
+                    # that read is the one the next bounce's check reuses.
+                    self._live_count_cache = None
+                    if handover is not None and depth == handover:
+                        rays = self._replay_bounces(
+                            rays, _bounce, depth, max_depth, scene, tallies
+                        )
+                        break
+                    rays = _bounce(rays, depth)
                     depth += 1
                     # A shape, not a value: free on every backend. With
                     # compaction on, a bundle whose last ray has died comes

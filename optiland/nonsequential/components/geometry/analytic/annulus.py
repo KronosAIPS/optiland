@@ -15,7 +15,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential import _tol
-from optiland.nonsequential._utils import as_float, as_param
+from optiland.nonsequential._utils import as_float, as_param, resident_scalar
 from optiland.nonsequential.components.geometry.base import AABB, AnalyticGeometry
 
 # Near-parallel-ray rejection multiple (docs/theory/08_precision.md sec 8.7,
@@ -104,8 +104,13 @@ class AnnularPlaneGeometry(AnalyticGeometry):
         t_out = be.where(hit_mask, t, inf_arr)
 
         n_geom = be.stack([be.zeros(N), be.zeros(N), be.ones(N)], axis=1)
-        # Normal is (0, 0, +/-1) -- flip to face incoming ray
-        nz_sign = be.where(dz > 0, -1.0, 1.0)
+        # Normal is (0, 0, +/-1) -- flip to face incoming ray; the signs are
+        # device constants (resident_scalar), not uploads every bounce.
+        nz_sign = be.where(
+            dz > 0,
+            resident_scalar(self, "flip", -1.0, dz),
+            resident_scalar(self, "flip", 1.0, dz),
+        )
         normals = be.stack([be.zeros(N), be.zeros(N), nz_sign * be.ones(N)], axis=1)
 
         return t_out, normals, hit_mask, n_geom

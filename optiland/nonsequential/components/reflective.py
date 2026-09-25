@@ -181,7 +181,8 @@ class ReflectiveComponent(BaseComponent, LedgerBooking):
             # Route only a scatter_fraction of the hit rays into the lobe; the
             # rest reflect specularly.
             scatters, sf_gate = scatter_branch(
-                self.scatter_fraction, hit_mask, rng, ray_id_key, bounce_key
+                self.scatter_fraction, hit_mask, rng, ray_id_key, bounce_key,
+                owner=self,
             )
             # The scatter branch is a detached decision with a compensating
             # weight: unbiased, but not weight-preserving per realisation.

@@ -21,6 +21,9 @@ to running it on torch tensors on a device:
   default, and in gradient mode always; ``TorchBackend(allow_splitting=True)``
   runs it in forward-only mode, at the cost of reading the split rows back
   to the host at every bounce that splits.
+- **replayed bounces** (opt-in): ``TorchBackend(graph_replay=True)`` records
+  one fixed-width bounce as a CUDA graph and replays it, on a CUDA device
+  only (:mod:`~optiland.nonsequential.backends.graph_replay`).
 
 Memory scaling: O(num_rays x max_depth) activations when gradient_mode is
 "autograd". The recommended envelope is ~1e5 rays at depth 16 on a single
@@ -38,10 +41,13 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.backend.utils import to_numpy
+from optiland.nonsequential.backends import graph_replay as _graph
 from optiland.nonsequential.backends.array_backend import (
+    BUCKET_MIN_WIDTH,
     ArrayBackend,
     bucketed_width,
 )
+from optiland.nonsequential.backends.graph_replay import GraphReplayUnavailable
 from optiland.nonsequential.ray_bundle import backend_live_permutation
 from optiland.nonsequential.rng import NSQRng
 
@@ -124,6 +130,32 @@ class TorchBackend(ArrayBackend):
             estimator a deterministic ghost series needs (every order to
             floating point, ``docs/theory/03_monte_carlo.md`` 3.6), so a
             device run that needs it can ask for it.
+        graph_replay: Replay one recorded bounce instead of dispatching its
+            kernels one by one (:mod:`~optiland.nonsequential.backends
+            .graph_replay`). Off by default, and with it off nothing in the
+            trace changes. With ``True``, each batch of at least
+            ``BUCKET_MIN_WIDTH`` rays runs two bounces eagerly, is recorded
+            as a CUDA graph for one bounce, and the graph is replayed to
+            ``max_depth``; the live count is still read between replays
+            every ``alive_check_every`` bounces (0: never), and compaction is
+            off, so every number is the eager fixed-width trace's
+            (``compact_every=0``), which differs from the default compacted
+            trace only in the summation order of its totals. It pays where
+            the loop is launch-bound: on the catalogue's integrating sphere
+            (r1_16, 1e6 rays, float64) an A100 measured 814.1 s eager and
+            189.9 s replayed, in the hybrid-engine study of 2026-09-24 (report
+            H4, a patched copy of this engine at 6e175a2f; issue 2 of the
+            research repository).
+
+            It needs a CUDA device: on the CPU and on Apple's ``mps`` torch
+            has no graph capture, and ``True`` is refused there with
+            :class:`GraphReplayUnavailable` rather than silently run
+            eagerly. It is refused the same way in gradient mode, when
+            splitting would run, with ``record_paths``, with a ray-database
+            detector, and when the capture's guard finds an accumulator
+            rebound inside the recorded bounce. ``"emulate"`` runs the same
+            bookkeeping eagerly on any device -- the check that a scene is
+            capture-safe, with the eager fixed-width numbers and no speed-up.
     """
 
     host_reads_free = False
@@ -137,6 +169,7 @@ class TorchBackend(ArrayBackend):
         alive_check_every: int | None = None,
         compact_every: int | None = None,
         allow_splitting: bool = False,
+        graph_replay: bool | Literal["emulate"] = False,
     ) -> None:
         """Initialize TorchBackend.
 
@@ -153,7 +186,27 @@ class TorchBackend(ArrayBackend):
                 forward-only mode (default False: warn and fall back to the
                 single-branch draw, as before). In gradient mode splitting
                 is refused whatever this says.
+            graph_replay: Replay a recorded bounce as a CUDA graph (default
+                False; see the class docstring). ``True`` needs a CUDA
+                device; ``"emulate"`` runs the same bookkeeping eagerly on
+                any device, as a check. Either keeps each batch at its full
+                width, so ``compact_every`` must be left unset or 0.
+
+        Raises:
+            ValueError: If ``graph_replay`` is not ``False``, ``True`` or
+                ``"emulate"``, or is combined with a non-zero
+                ``compact_every``.
         """
+        if graph_replay not in (False, True, "emulate"):
+            raise ValueError(
+                f"graph_replay must be False, True or 'emulate', got {graph_replay!r}"
+            )
+        if graph_replay and compact_every:
+            raise ValueError(
+                "graph_replay replays one bundle width per batch, so it cannot be "
+                f"combined with compaction (compact_every={compact_every}); leave "
+                "compact_every unset or 0"
+            )
         self.seed = seed
         self.gradient_mode = gradient_mode
         self.supports_splitting = bool(allow_splitting)
@@ -161,7 +214,10 @@ class TorchBackend(ArrayBackend):
         self.rng = NSQRng(seed)
         if alive_check_every is not None:
             self.alive_check_every = int(alive_check_every)
-        self.compact_every = compact_every
+        if graph_replay != "emulate":
+            graph_replay = bool(graph_replay)
+        self.graph_replay = graph_replay
+        self.compact_every = 0 if graph_replay else compact_every
 
     def _gradient_mode(self, rays: NSQRayBundle) -> bool:
         """True when any field of the bundle is on an autograd graph.
@@ -279,6 +335,125 @@ class TorchBackend(ArrayBackend):
                 "splitting.",
                 stacklevel=2,
             )
+
+    # ------------------------------------------------------------------
+    # Replayed bounces (graph_replay)
+    # ------------------------------------------------------------------
+
+    def _check_graph_replay(self, scene, ir, record_paths) -> None:
+        """Refuse ``graph_replay`` where a replayed bounce cannot be right.
+
+        Each refusal is a :class:`GraphReplayUnavailable` naming its reason;
+        none falls back silently.
+
+        Args:
+            scene: The scene about to be traced.
+            ir: The scene's lowered IR.
+            record_paths: The trace's ``record_paths`` argument.
+
+        Raises:
+            GraphReplayUnavailable: On a device without CUDA graphs (for
+                ``graph_replay=True``), in gradient mode, when splitting would
+                run, with path recording, or with a ray-database detector.
+        """
+        if not self.graph_replay:
+            return
+        import torch as _torch  # noqa: PLC0415
+
+        from optiland.nonsequential.detectors.ray_database import (  # noqa: PLC0415
+            RayDatabaseDetector,
+        )
+
+        if self.graph_replay is True:
+            device = str(be.get_device())
+            if not (device.startswith("cuda") and _torch.cuda.is_available()):
+                raise GraphReplayUnavailable(
+                    "graph_replay=True records a CUDA graph, and the active device "
+                    f"is {device!r}: torch has no graph capture on the CPU or on "
+                    "Apple's mps. Trace eagerly (graph_replay=False), or check a "
+                    "scene's capture safety with graph_replay='emulate'"
+                )
+        try:
+            grad_on = bool(be.grad_mode.requires_grad)
+        except Exception:  # noqa: BLE001 - a backend with no grad mode cannot be in it
+            grad_on = False
+        if grad_on:
+            raise GraphReplayUnavailable(
+                "graph_replay: gradient mode is on; a replayed bounce records no "
+                "autograd graph, so a gradient trace runs eagerly"
+            )
+        if ir.sampling.split_depth > 0 and self._splitting_enabled():
+            raise GraphReplayUnavailable(
+                "graph_replay: bounded splitting grows the bundle and chooses its "
+                "rows on the host, which a replayed bounce cannot do; trace with "
+                "graph_replay=False, or without allow_splitting"
+            )
+        if record_paths:
+            raise GraphReplayUnavailable(
+                "graph_replay: path recording copies ray state to the host at "
+                "every bounce; trace with record_paths=False"
+            )
+        databases = [
+            getattr(d, "name", "") or type(d).__name__
+            for d in scene.detectors
+            if isinstance(d, RayDatabaseDetector)
+        ]
+        if databases:
+            raise GraphReplayUnavailable(
+                "graph_replay: a ray database copies its hits to the host at every "
+                f"bounce ({', '.join(databases)})"
+            )
+
+    def _graph_handover_depth(self, rays: NSQRayBundle) -> int | None:
+        """Hand a batch to the replayed graph after the eager bounces.
+
+        A batch narrower than the compaction ladder's floor
+        (:data:`~optiland.nonsequential.backends.array_backend
+        .BUCKET_MIN_WIDTH`) runs eagerly at its fixed width instead: below it
+        the shared material cache keys on the wavelength array's contents,
+        a host read at every bounce that no graph can hold, and a graph buys
+        nothing at that width anyway. The values are the same either way.
+
+        Args:
+            rays: The freshly prepared batch.
+
+        Returns:
+            :data:`~optiland.nonsequential.backends.graph_replay.EAGER_BOUNCES`,
+            or ``None`` for an eager batch.
+        """
+        if not self.graph_replay or rays.num_rays < BUCKET_MIN_WIDTH:
+            return None
+        return _graph.EAGER_BOUNCES
+
+    def _replay_bounces(
+        self, rays, bounce, depth, max_depth, scene, tallies
+    ) -> NSQRayBundle:
+        """Record the bounce once and replay it to the depth cap.
+
+        See :func:`~optiland.nonsequential.backends.graph_replay
+        .replay_bounces`.
+
+        Args:
+            rays: The batch after the eager bounces.
+            bounce: The loop's bounce body.
+            depth: Bounces already run.
+            max_depth: The depth cap.
+            scene: The scene being traced.
+            tallies: The trace's own tallies.
+
+        Returns:
+            The bundle after the last bounce.
+        """
+        mode = "emulate" if self.graph_replay == "emulate" else "cuda"
+        return _graph.replay_bounces(
+            self,
+            rays,
+            bounce,
+            depth,
+            max_depth,
+            lambda: _graph.accumulator_identities(scene, tallies),
+            mode=mode,
+        )
 
     def _prepare_bundle(self, rays: NSQRayBundle) -> NSQRayBundle:
         """Promote a generated bundle onto this backend's device.
