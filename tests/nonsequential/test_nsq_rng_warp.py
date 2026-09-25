@@ -457,20 +457,65 @@ def _trace(
     )
 
 
-def _assert_same_trace(a, b) -> None:
+#: How far a float64 sum may move between two traces on CUDA, in units in the
+#: last place. The detectors and the ledger add per-ray terms into float64
+#: totals with a scatter-add whose order CUDA does not fix, so the last bits of a
+#: float64 sum change from run to run whatever drew the random numbers.
+#: Measured on an A100 (torch 2.14.0, 2026-09-25, the singlet and the scattering
+#: scene below, 3,000 rays, seed 11): four traces of the default backend at
+#: float64 differed from the first by up to 6 ulp in a detector pixel and 2 ulp in
+#: ``total_flux_detected``; two Warp-drawn traces by up to 4 ulp; under
+#: ``torch.use_deterministic_algorithms(True)`` two default traces were
+#: bit-identical, and every float32 trace was, both ways. The draws themselves
+#: are compared bit for bit on CUDA by the tests above.
+_CUDA_FLOAT64_MAX_ULP = 8
+
+
+def _same_float(va, vb, what: str, max_ulp: int, scale: float) -> None:
+    """Equal, or within ``max_ulp`` ulps (with a floor of ``max_ulp`` ulps of ``scale``)."""
+    a = np.asarray(va, dtype=np.float64)
+    b = np.asarray(vb, dtype=np.float64)
+    if max_ulp == 0 or a.shape != b.shape:
+        np.testing.assert_array_equal(a, b, err_msg=what)
+        return
+    both_nan = np.isnan(a) & np.isnan(b)
+    distance = np.abs(np.spacing(np.maximum(np.abs(a), np.abs(b))))
+    floor = max_ulp * np.spacing(np.float64(scale))
+    ok = both_nan | (np.abs(a - b) <= np.maximum(max_ulp * distance, floor))
+    assert bool(np.all(ok)), (
+        f"{what}: {int(np.count_nonzero(~ok))} values beyond {max_ulp} ulp"
+    )
+
+
+def _assert_same_trace(a, b, max_ulp: int = 0) -> None:
+    """Every ledger entry and detector field of two traces.
+
+    ``max_ulp=0`` (the CPU, and float32 everywhere) is bit equality. A float64
+    trace on CUDA is compared within ``max_ulp`` ulps per value, because its
+    sums are not reproducible there run to run (see ``_CUDA_FLOAT64_MAX_ULP``);
+    a residual near zero, such as ``flux_conservation_error``, is compared
+    within the same number of ulps of the launched flux. Counts are exact.
+    """
+    scale = float(a.total_flux_in) or 1.0
     for name in _LEDGER:
         va, vb = getattr(a, name), getattr(b, name)
-        assert va == vb or (va != va and vb != vb), f"{name}: {va!r} != {vb!r}"
+        if isinstance(va, float) or isinstance(vb, float):
+            _same_float(va, vb, name, max_ulp, scale)
+        else:
+            assert va == vb, f"{name}: {va!r} != {vb!r}"
     assert a.detectors.keys() == b.detectors.keys()
     for name in a.detectors:
         compared = 0
         for field in ("data", "irradiance", "intensity", "total_flux", "num_rays_hit"):
             if not hasattr(a.detectors[name], field):
                 continue
-            da = to_numpy(getattr(a.detectors[name], field))
-            db = to_numpy(getattr(b.detectors[name], field))
-            assert np.asarray(da).dtype == np.asarray(db).dtype, f"{name}.{field}"
-            np.testing.assert_array_equal(da, db, err_msg=f"{name}.{field}")
+            da = np.asarray(to_numpy(getattr(a.detectors[name], field)))
+            db = np.asarray(to_numpy(getattr(b.detectors[name], field)))
+            assert da.dtype == db.dtype, f"{name}.{field}"
+            if da.dtype.kind == "f":
+                _same_float(da, db, f"{name}.{field}", max_ulp, 0.0)
+            else:
+                np.testing.assert_array_equal(da, db, err_msg=f"{name}.{field}")
             compared += 1
         assert compared >= 2, f"{name}: nothing compared"
 
@@ -481,7 +526,14 @@ def _assert_same_trace(a, b) -> None:
 def test_a_trace_is_bit_identical_with_the_kernel(
     torch_backend_state, monkeypatch, device, precision, scene_name
 ):
-    """Every ledger entry and every pixel, with the kernel drawing and without."""
+    """Every ledger entry and every pixel, with the kernel drawing and without.
+
+    Bit equality on the CPU and at float32 on any device. At float64 on CUDA,
+    within ``_CUDA_FLOAT64_MAX_ULP`` ulps: there the detector and ledger sums
+    move by a few ulps from one run to the next with the same generator, so
+    bit equality of two traces would test CUDA's summation order, not the
+    kernel (the measured control is at ``_CUDA_FLOAT64_MAX_ULP``).
+    """
     rng_warp = _warp_module()
     _use_device(device)
     be.set_precision(precision)
@@ -516,7 +568,8 @@ def test_a_trace_is_bit_identical_with_the_kernel(
     assert "rng_kernel_note" not in fused.environment
     assert fused_backend.rng_kernel_in_use == "warp"
     assert isinstance(fused_backend.rng, rng_warp.WarpNSQRng)
-    _assert_same_trace(reference, fused)
+    cuda64 = device == "cuda" and precision == "float64"
+    _assert_same_trace(reference, fused, _CUDA_FLOAT64_MAX_ULP if cuda64 else 0)
 
 
 def test_the_kernels_are_loaded_before_the_first_bounce(
