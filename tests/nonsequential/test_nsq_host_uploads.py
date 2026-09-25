@@ -244,11 +244,91 @@ def _sphere_cavity() -> NSQScene:
     return scene
 
 
+def _quarter_wave_ar():
+    """The catalogue's single-layer coating (r1_13): an ideal quarter wave."""
+    from optiland.materials import IdealMaterial
+    from optiland.thin_film import ThinFilmStack
+
+    stack = ThinFilmStack(
+        incident_material=IdealMaterial(1.0),
+        substrate_material=IdealMaterial(1.5168),
+        reference_wl_um=0.5876,
+    )
+    stack.add_layer_qwot(IdealMaterial(1.2315843454672522), qwot_thickness=1.0)
+    return stack
+
+
+def _ten_layer_mirror():
+    """The catalogue's multilayer stack (r1_23): five high/low quarter-wave pairs."""
+    from optiland.materials import IdealMaterial
+    from optiland.thin_film import ThinFilmStack
+
+    stack = ThinFilmStack(
+        incident_material=IdealMaterial(1.0),
+        substrate_material=IdealMaterial(1.5),
+        reference_wl_um=0.55,
+    )
+    for _ in range(5):
+        stack.add_layer_qwot(IdealMaterial(2.32))
+        stack.add_layer_qwot(IdealMaterial(1.38))
+    return stack
+
+
+def _coated_window(stack_fn):
+    """A window whose front face carries a thin-film stack, evaluated every bounce."""
+
+    def build() -> NSQScene:
+        from optiland.materials import IdealMaterial
+        from optiland.nonsequential import PlaneGeometry
+        from optiland.nonsequential.components.coating_support import (
+            UnpolarizedThinFilmCoating,
+        )
+
+        stack = stack_fn()
+        substrate = NSQMaterial(optiland_material=stack.substrate_material)
+        scene = NSQScene()
+        _collimated(scene, z=-50.0, radius=2.5)
+        scene.add_component(
+            "front",
+            RefractiveComponent(
+                CoordinateSystem(z=0.0),
+                PlaneGeometry(),
+                VACUUM,
+                substrate,
+                coating=UnpolarizedThinFilmCoating(stack),
+                name="front",
+            ),
+        )
+        scene.add_component(
+            "back",
+            RefractiveComponent(
+                CoordinateSystem(z=10.0),
+                PlaneGeometry(),
+                NSQMaterial(optiland_material=IdealMaterial(1.5168)),
+                VACUUM,
+                name="back",
+            ),
+        )
+        for name, z in (("reflected", -100.0), ("transmitted", 50.0)):
+            scene.add_detector(
+                name,
+                CoordinateSystem(z=z),
+                IrradianceDetectorConfig(
+                    width=40, height=40, num_pixels_x=4, num_pixels_y=4
+                ),
+            )
+        return scene
+
+    return build
+
+
 _SCENES = {
     "singlet_with_stop": (_singlet_with_stop, 12),
     "ball_lens": (_ball_lens, 12),
     "scattering": (_scattering, 8),
     "sphere_cavity": (_sphere_cavity, 24),
+    "quarter_wave_coated_window": (_coated_window(_quarter_wave_ar), 12),
+    "ten_layer_coated_window": (_coated_window(_ten_layer_mirror), 12),
 }
 
 
@@ -321,3 +401,20 @@ class TestNoHostUploadPerBounce:
         import numpy as np
 
         assert resident_scalar(owner, "k", -1.0, np.zeros(3)) == -1.0
+
+    def test_the_thin_film_floor_is_the_value_where_built(self):
+        """The coating's denominator floor: the tensor ``be.where`` built, once."""
+        import numpy as np
+
+        from optiland.thin_film.core import _denominator_floor
+
+        for dtype in (torch.complex64, torch.complex128):
+            like = torch.zeros(3, dtype=dtype)
+            floor = _denominator_floor(like)
+            built = torch.tensor(1e-30 + 0j, dtype=dtype, device=like.device)
+            assert floor.dtype == dtype and floor.shape == ()
+            assert floor.device == like.device
+            assert torch.equal(torch.view_as_real(floor), torch.view_as_real(built))
+            assert _denominator_floor(like) is floor
+        # NumPy is handed the bare number, as before.
+        assert _denominator_floor(np.zeros(3, dtype=complex)) == 1e-30 + 0j

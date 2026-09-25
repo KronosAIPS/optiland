@@ -11,7 +11,8 @@ nothing here records a graph. What runs here:
   recording, a ray database, conflicting options, and a bounce that rebinds
   an accumulator (the guard the capture relies on);
 - ``graph_replay="emulate"``: the same static-buffer bookkeeping, eager
-  bounces, guard and trip count, with the bounce run instead of recorded. Its
+  bounces, guard and trip count, with the bounce run instead of recorded, and
+  that bounce checked for host transfers (the copies a capture refuses). Its
   every number must equal the eager fixed-width trace's, bit for bit; that is
   the data-flow half of the proof. The CUDA half (the graph itself, on a GPU)
   is a separate run and is not in this suite; ``TestOnCuda`` runs it where a
@@ -263,6 +264,88 @@ class TestEmulatedReplayIsTheEagerFixedWidthTrace:
         assert a == b
 
 
+def _coated_singlet(layers: str):
+    """The singlet with a thin-film stack on its front face (the catalogue's two).
+
+    ``"quarter_wave"`` is r1_13's single antireflection layer, ``"ten_layer"``
+    r1_23's five high/low pairs. The coating is evaluated at every bounce, and
+    the stack's characteristic denominator used to upload a complex scalar
+    each time -- a copy the emulated capture refused.
+    """
+
+    def build() -> NSQScene:
+        from optiland.materials import IdealMaterial
+        from optiland.nonsequential.components.coating_support import (
+            UnpolarizedThinFilmCoating,
+        )
+        from optiland.thin_film import ThinFilmStack
+
+        if layers == "quarter_wave":
+            stack = ThinFilmStack(
+                incident_material=IdealMaterial(1.0),
+                substrate_material=IdealMaterial(1.5168),
+                reference_wl_um=0.5876,
+            )
+            stack.add_layer_qwot(IdealMaterial(1.2315843454672522), qwot_thickness=1.0)
+        else:
+            stack = ThinFilmStack(
+                incident_material=IdealMaterial(1.0),
+                substrate_material=IdealMaterial(1.5),
+                reference_wl_um=0.55,
+            )
+            for _ in range(5):
+                stack.add_layer_qwot(IdealMaterial(2.32))
+                stack.add_layer_qwot(IdealMaterial(1.38))
+        scene = NSQScene()
+        _source(scene)
+        scene.add_lens(
+            "L1",
+            CoordinateSystem(z=50),
+            LensConfig(
+                r1=100.0,
+                r2=-100.0,
+                thickness=5.0,
+                material="N-BK7",
+                front_aperture_radius=12.5,
+                front=SurfaceConfig(coating=UnpolarizedThinFilmCoating(stack)),
+            ),
+        )
+        for name, z in (("D1", 150.0), ("back", -20.0)):
+            scene.add_detector(
+                name,
+                CoordinateSystem(z=z),
+                IrradianceDetectorConfig(
+                    width=40, height=40, num_pixels_x=16, num_pixels_y=16
+                ),
+            )
+        return scene
+
+    return build
+
+
+class TestACoatedSingletIsReplayed:
+    """Emulate accepts a singlet with a thin-film coating, and changes no number."""
+
+    @pytest.mark.parametrize("precision", ["float64", "float32"])
+    @pytest.mark.parametrize("layers", ["quarter_wave", "ten_layer"])
+    def test_accepted_and_identical(self, layers, precision, monkeypatch):
+        be.set_precision(precision)
+        calls = []
+        original = gr.replay_bounces
+        monkeypatch.setattr(
+            gr, "replay_bounces", lambda *a, **k: calls.append(1) or original(*a, **k)
+        )
+        build = _coated_singlet(layers)
+        eager = TorchBackend(seed=11, alive_check_every=0, compact_every=0)
+        emulated = TorchBackend(seed=11, alive_check_every=0, graph_replay="emulate")
+        a = _ledger(_trace(build, 12, eager, num_rays=4_096))
+        b = _ledger(_trace(build, 12, emulated, num_rays=4_096))
+        # The control: both batches were handed to the (emulated) replay, so the
+        # coating ran under the host-transfer check.
+        assert len(calls) == 2
+        assert a == b, sorted(k for k in a if a[k] != b.get(k))
+
+
 class TestTheGuard:
     """An accumulator rebound inside the recorded bounce refuses the replay."""
 
@@ -288,6 +371,92 @@ class TestTheGuard:
         labels = set(gr.accumulator_identities(scene, []))
         for suffix in ("._data", "._num_rays_hit", "._refl_flux", "._coating_loss"):
             assert any(label.endswith(suffix) for label in labels), (suffix, labels)
+
+
+class TestTheRecordedBounceHitsTheMaterialMemo:
+    """A glass's index is read from its memo in the recorded bounce, not from the glass.
+
+    ``NSQMaterial.n``/``k`` keep one memo keyed on the *identity* of the
+    wavelength tensor, and a miss evaluates the catalogue glass, whose cache
+    reads its coefficients to the host -- a copy a CUDA capture refuses (found
+    by the A100 check of the prototype: every scene with a catalogue glass was
+    refused). The replay's static buffers are therefore made before the eager
+    bounces, so the memo already holds the static wavelength tensor when the
+    bounce is recorded. On the CPU that order is asserted directly: the
+    recorded (emulated) bounce presents the same wavelength object as the
+    eager ones, and every glass lookup in it is a memo hit.
+    """
+
+    @staticmethod
+    def _observe(monkeypatch):
+        from optiland.nonsequential.backends.array_backend import ArrayBackend
+        from optiland.nonsequential.materials.nsq_material import NSQMaterial
+
+        state = {"batch": -1, "bounce": -1}
+        calls = []  # (batch, bounce, wavelength object, memo hit)
+
+        original_prepare = TorchBackend._prepare_bundle
+
+        def prepare(backend, rays):
+            state["batch"] += 1
+            state["bounce"] = -1
+            return original_prepare(backend, rays)
+
+        original_intersect = ArrayBackend.intersect_scene
+
+        def intersect(backend, rays, *a, **k):
+            state["bounce"] += 1
+            return original_intersect(backend, rays, *a, **k)
+
+        original_n = NSQMaterial.n
+
+        def n(material, wavelength_um):
+            if material.optiland_material is not None:
+                hit = wavelength_um is material._n_memo[0]
+                calls.append((state["batch"], state["bounce"], wavelength_um, hit))
+            return original_n(material, wavelength_um)
+
+        monkeypatch.setattr(TorchBackend, "_prepare_bundle", prepare)
+        monkeypatch.setattr(ArrayBackend, "intersect_scene", intersect)
+        monkeypatch.setattr(NSQMaterial, "n", n)
+        return calls
+
+    def test_the_recorded_bounce_sees_the_eager_wavelength_and_hits(self, monkeypatch):
+        calls = self._observe(monkeypatch)
+        backend = TorchBackend(seed=11, alive_check_every=0, graph_replay="emulate")
+        _trace(_singlet, 16, backend, num_rays=4_096, batch_size=2_048)
+
+        recorded = gr.EAGER_BOUNCES
+        for batch in (0, 1):
+            eager = [c for c in calls if c[0] == batch and c[1] < recorded]
+            replay = [c for c in calls if c[0] == batch and c[1] == recorded]
+            # The control: the glass is looked up in both phases.
+            assert eager and replay, (batch, len(eager), len(replay))
+            wavelength = eager[0][2]
+            assert all(c[2] is wavelength for c in eager + replay), (
+                "the recorded bounce presents another wavelength tensor than the "
+                "eager bounces, so the glass's identity memo misses there"
+            )
+            assert all(c[3] for c in replay), "a glass lookup missed the memo"
+
+    def test_a_host_read_in_the_recorded_bounce_is_refused(self, monkeypatch):
+        """The CPU stand-in for the CUDA refusal: emulate refuses a host transfer.
+
+        With the memo bypassed, every lookup evaluates the catalogue glass,
+        whose cache reads the glass's coefficients to the host.
+        """
+        from optiland.nonsequential.materials.nsq_material import NSQMaterial
+
+        def no_memo(material, wavelength_um):
+            if material.optiland_material is None:
+                return be.ones_like(wavelength_um)
+            return material.optiland_material.n(wavelength_um)
+
+        monkeypatch.setattr(NSQMaterial, "n", no_memo)
+        backend = TorchBackend(seed=11, alive_check_every=0, graph_replay="emulate")
+        with pytest.raises(GraphReplayUnavailable, match="host") as info:
+            _trace(_singlet, 16, backend, num_rays=4_096, batch_size=2_048)
+        assert "materials/" in str(info.value), str(info.value)
 
 
 class TestRefusals:
