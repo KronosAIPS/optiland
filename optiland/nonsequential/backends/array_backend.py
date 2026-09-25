@@ -37,6 +37,7 @@ from optiland.nonsequential._utils import (
     distribute_ray_budget,
     estimate_bounding_scale,
     get_detector_names,
+    resident_scalar,
 )
 from optiland.nonsequential.backends.base import TracerBackend
 from optiland.nonsequential._tally import Tally
@@ -771,14 +772,19 @@ class ArrayBackend(TracerBackend):
                     # Flush this bounce's medium-stack inconsistency counts
                     # (see RefractiveComponent.interact) into the running
                     # total, then reset so they are counted exactly once
-                    # regardless of subsequent compaction/concat.
+                    # regardless of subsequent compaction/concat. The reset
+                    # writes an integer zero of the field's own dtype: the
+                    # working-float zero it used to write turned the counter
+                    # into floats after the first bounce, and the tally with
+                    # it (issue 60 of the research repository).
                     total_medium_stack_underflows.add(
                         be.sum(rays.medium_stack_underflows)
                     )
+                    underflows = rays.medium_stack_underflows
                     rays.medium_stack_underflows = be.where(
-                        rays.medium_stack_underflows > 0,
-                        be.zeros_like(rays.medium_stack_underflows),
-                        rays.medium_stack_underflows,
+                        underflows > 0,
+                        resident_scalar(self, "underflow_reset", 0, underflows),
+                        underflows,
                     )
 
                     rays = self._maybe_compact(rays, depth)
