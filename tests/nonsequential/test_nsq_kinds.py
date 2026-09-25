@@ -122,7 +122,8 @@ def _ring_scene(radius=2.0, flux=3.0):
 
 def test_builtin_kinds_are_registered():
     reg = kinds.registered_kinds()
-    assert reg["source"] == ("point", "collimated", "extended")
+    assert reg["source"][:3] == ("point", "collimated", "extended")
+    assert "tabulated" in reg["source"]
     assert set(reg["detector"]) >= {
         "irradiance", "spectral", "far_field", "hemisphere", "ray_database"
     }
@@ -132,7 +133,7 @@ def test_builtin_kinds_are_registered():
     }
     assert set(reg["bsdf"]) >= {"lambertian", "harvey_shack", "tabulated", "specular"}
     assert set(reg["component"]) >= {"lens", "mirror", "doublet", "prism", "paraxial_lens"}
-    assert "lines" in reg["spectrum"]
+    assert set(reg["spectrum"]) >= {"lines", "piecewise_linear"}
 
 
 def test_line_spectrum_json_has_no_kind_key():

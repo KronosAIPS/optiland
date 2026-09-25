@@ -260,9 +260,14 @@ def lumens_to_watts(
             source has no photopic lumen equivalent worth reporting.
     """
     _, _, km = _table(weighting)
-    efficacy = luminous_efficacy_of_spectrum(
-        spectrum.wavelengths, spectrum.weights, weighting
-    )
+    if hasattr(spectrum, "luminous_efficacy"):
+        # A continuous spectrum integrates its density against V(lambda)
+        # exactly; a line spectrum is the weighted sum below.
+        efficacy = spectrum.luminous_efficacy(weighting)
+    else:
+        efficacy = luminous_efficacy_of_spectrum(
+            spectrum.wavelengths, spectrum.weights, weighting
+        )
     _require_in_band(efficacy, km, weighting, "this source's spectrum")
     return total_flux_lm / efficacy
 

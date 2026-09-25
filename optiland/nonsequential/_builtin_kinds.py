@@ -101,6 +101,54 @@ def build_extended_source(cs: Any, config: Any) -> Any:
     )
 
 
+def build_tabulated_source(cs: Any, config: Any) -> Any:
+    """``TabulatedSourceConfig`` -> ``TabulatedSource``, its flux resolved.
+
+    A relative table takes ``total_flux`` [W] or ``total_flux_lumens`` (not
+    both; 1 W when neither is given). A ``"W/sr"`` table's flux is its own
+    integral; a ``"cd"`` table's integral is lumens, converted with the
+    source's spectrum. An absolute table given a flux as well is refused.
+    """
+    from optiland.nonsequential.sources.tabulated import (  # noqa: PLC0415
+        TabulatedSource,
+    )
+    from optiland.nonsequential.units import lumens_to_watts  # noqa: PLC0415
+
+    units = config.intensity_units
+    given = [f for f in ("total_flux", "total_flux_lumens") if getattr(config, f) is not None]
+    if units != "relative" and given:
+        raise ValueError(
+            f"TabulatedSourceConfig: a table in {units!r} fixes its own flux; "
+            f"{' and '.join(given)} cannot be given as well."
+        )
+    if len(given) == 2:
+        raise ValueError(
+            "TabulatedSourceConfig: give total_flux or total_flux_lumens, not both."
+        )
+    source = TabulatedSource(
+        cs=cs,
+        spectrum=config.spectrum,
+        total_flux=1.0,
+        polar_angles_deg=config.polar_angles_deg,
+        intensity=config.intensity,
+        azimuth_angles_deg=config.azimuth_angles_deg,
+        intensity_units=units,
+        width=config.width,
+        height=config.height,
+        aperture_radius=config.aperture_radius,
+        medium=getattr(config, "medium", None),
+    )
+    if units == "W/sr":
+        source.total_flux = source.table_flux
+    elif units == "cd":
+        source.total_flux = lumens_to_watts(source.table_flux, config.spectrum)
+    elif config.total_flux_lumens is not None:
+        source.total_flux = lumens_to_watts(config.total_flux_lumens, config.spectrum)
+    elif config.total_flux is not None:
+        source.total_flux = config.total_flux
+    return source
+
+
 def build_irradiance_detector(cs: Any, config: Any) -> Any:
     """``IrradianceDetectorConfig`` -> ``IrradianceDetector``."""
     from optiland.nonsequential.detectors.irradiance import (  # noqa: PLC0415
@@ -228,6 +276,30 @@ def _register_spectra() -> None:
         description="discrete lines: wavelengths and relative weights",
     )
 
+    from optiland.nonsequential.sources.spectra import (  # noqa: PLC0415
+        PiecewiseLinearSpectrum,
+    )
+
+    def pl_to_dict(spectrum: PiecewiseLinearSpectrum) -> dict:
+        return {
+            "wavelengths": [float(v) for v in spectrum.nodes],
+            "values": [float(v) for v in spectrum.values],
+            "label": spectrum.label,
+        }
+
+    kinds.register_spectrum(
+        "piecewise_linear",
+        PiecewiseLinearSpectrum,
+        pl_to_dict,
+        lambda d: PiecewiseLinearSpectrum(
+            np.asarray(d["wavelengths"], dtype=np.float64),
+            np.asarray(d["values"], dtype=np.float64),
+            label=d.get("label", ""),
+        ),
+        pl_to_dict,
+        description="a continuous density, linear between nodes (blackbody, CIE)",
+    )
+
 
 # ---------------------------------------------------------------------------
 # Sources
@@ -327,6 +399,58 @@ def _register_sources() -> None:
         },
         attached=_SOURCE_ATTACHED,
         description="a rectangle or disc emitting into a cone or Lambertian",
+    )
+
+    # -- tabulated angular intensity -------------------------------------------
+    from optiland.nonsequential.sources.configs import (  # noqa: PLC0415
+        TabulatedSourceConfig,
+    )
+    from optiland.nonsequential.sources.tabulated import (  # noqa: PLC0415
+        TabulatedSource,
+    )
+
+    def tab_to_dict(s) -> dict:
+        return {
+            "polar_angles_deg": [float(v) for v in s.polar_angles_deg],
+            "azimuth_angles_deg": (
+                None
+                if s.azimuth_angles_deg is None
+                else [float(v) for v in s.azimuth_angles_deg]
+            ),
+            "intensity": np.asarray(s.intensity, dtype=np.float64).tolist(),
+            "intensity_units": s.intensity_units,
+            "width": s.width,
+            "height": s.height,
+            "aperture_radius": s.aperture_radius,
+        }
+
+    def tab_from_dict(d, spectrum, total_flux, medium):
+        # An absolute table fixes its own flux; the stored total_flux is the
+        # value it resolved to and is recomputed, not re-imposed.
+        relative = d.get("intensity_units", "relative") == "relative"
+        return TabulatedSourceConfig(
+            spectrum=spectrum,
+            polar_angles_deg=d["polar_angles_deg"],
+            intensity=d["intensity"],
+            azimuth_angles_deg=d.get("azimuth_angles_deg"),
+            intensity_units=d.get("intensity_units", "relative"),
+            total_flux=total_flux if relative else None,
+            width=d.get("width"),
+            height=d.get("height"),
+            aperture_radius=d.get("aperture_radius"),
+            medium=medium,
+        )
+
+    kinds.register_source(
+        "tabulated",
+        TabulatedSource,
+        TabulatedSourceConfig,
+        build=build_tabulated_source,
+        to_dict=tab_to_dict,
+        from_dict=tab_from_dict,
+        lower=tab_to_dict,
+        attached=_SOURCE_ATTACHED,
+        description="a point or area with a tabulated angular intensity I(theta[, phi])",
     )
 
 

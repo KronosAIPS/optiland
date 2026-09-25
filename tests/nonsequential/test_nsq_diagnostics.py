@@ -44,6 +44,7 @@ from optiland.nonsequential.scene import _resolve_total_flux
 from optiland.nonsequential.sources.configs import (
     ExtendedSourceConfig,
     PointSourceConfig,
+    TabulatedSourceConfig,
 )
 
 # ---------------------------------------------------------------------------
@@ -78,6 +79,7 @@ _CONFIG_CONSUMERS: list[tuple[type, list[object]]] = [
         [_kind_builder(CollimatedSourceConfig), _resolve_total_flux],
     ),
     (ExtendedSourceConfig, [_kind_builder(ExtendedSourceConfig), _resolve_total_flux]),
+    (TabulatedSourceConfig, [_kind_builder(TabulatedSourceConfig)]),
     (
         IrradianceDetectorConfig,
         [_kind_builder(IrradianceDetectorConfig), IrradianceDetector.record],

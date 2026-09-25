@@ -327,10 +327,13 @@ from optiland.nonsequential.sources import (
     CollimatedSourceConfig,
     ExtendedSource,
     ExtendedSourceConfig,
+    PiecewiseLinearSpectrum,
     PointSource,
     PointSourceConfig,
     SourceRegistry,
     Spectrum,
+    TabulatedSource,
+    TabulatedSourceConfig,
 )
 from optiland.nonsequential.tracer import NSQTracer, SimulationResult
 
@@ -357,10 +360,13 @@ __all__ = [
     "CollimatedSourceConfig",
     "ExtendedSource",
     "ExtendedSourceConfig",
+    "PiecewiseLinearSpectrum",
     "PointSource",
     "PointSourceConfig",
     "SourceRegistry",
     "Spectrum",
+    "TabulatedSource",
+    "TabulatedSourceConfig",
     # Components -- raw
     "AbsorbingComponent",
     "ParaxialLensComponent",
