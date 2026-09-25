@@ -226,10 +226,17 @@ def _init() -> None:
 
 
 def _keys(initstate: int, slot_mix: int) -> Any:
-    """The kernel's constant struct for one (seed, slot), built once."""
+    """The kernel's constant struct for one (seed, slot), built once.
+
+    A trace uses one seed and at most a dozen slots, so the cache holds a
+    few entries per trace; it is emptied when a long campaign of seeds has
+    filled it, rather than grown without bound.
+    """
     key = (initstate, slot_mix)
     k = _keys_cache.get(key)
     if k is None:
+        if len(_keys_cache) >= 4096:
+            _keys_cache.clear()
         k = _Keys()
         k.mult = _rng._MULT_INT
         k.gamma = _rng._GAMMA_INT
