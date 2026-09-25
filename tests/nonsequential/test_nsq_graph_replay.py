@@ -165,6 +165,8 @@ _SKIP = (
     "detectors",
     "diagnostics",
     "reflection_histograms",
+    # The test compares numbers; the environment records how the trace ran.
+    "environment",
 )
 
 
