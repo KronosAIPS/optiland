@@ -10,8 +10,6 @@ only, take a route whose Python state is the same for every trace -- device
 data instead of a constant, or a call run eagerly outside the compiled program
 (:func:`run_eagerly`). Outside a compiled region nothing here changes what the
 engine does.
-
-Kramer Harrison, 2026
 """
 
 from __future__ import annotations
