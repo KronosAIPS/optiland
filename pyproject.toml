@@ -34,6 +34,9 @@ prescription-pdf = ["reportlab>=4.0"]
 prescription = ["rich>=13.0", "reportlab>=4.0"]
 gui = ["PySide6", "qtconsole"]
 torch = ["torch"]
+# The non-sequential engine's keyed generator as one Warp kernel on CUDA
+# (TorchBackend(rng_kernel="warp"), optiland/nonsequential/rng_warp.py).
+warp = ["torch", "warp-lang>=1.17"]
 
 [project.urls]
 Homepage = "https://github.com/optiland/optiland"

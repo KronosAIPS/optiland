@@ -50,6 +50,12 @@ is the same double as the host implementation returns, bit for bit; at
 float32 it is that same value rounded to float32, which is the price of
 running the conversion where the rays live.
 
+On CUDA the same draw can run as one Warp kernel instead of the limb
+arithmetic (:mod:`optiland.nonsequential.rng_warp`, opted into with
+``TorchBackend(rng_kernel="warp")``). It is an implementation of this
+module's definition, not a second generator: same state, same bits, same
+uniform at either precision.
+
 Honest scope of the guarantee: the *random-number stream* per
 ``(ray_id, bounce, event_slot)`` is bit-identical everywhere this module is
 used. Final float *results* are not guaranteed bit-identical across
