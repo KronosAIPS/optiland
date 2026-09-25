@@ -5,12 +5,14 @@
 operations. It is an implementation change only, so everything here is an
 equality, never a tolerance:
 
-* the 32 output bits, on 48 configurations of 200,000 draws (four seeds, four
+* the 32 output bits and the uniforms at float64 and at float32 (compared as
+  bit patterns), on 48 configurations of 200,000 draws (four seeds, four
   event slots, three offsets; random ray ids below 2**40 and bounces below
-  1,100), against the torch limb path and against the host reference;
-* the uniform at float64 and at float32, compared as bit patterns, for every
-  form a call site passes the bounce in (per-ray int32 or int64 tensor, a
-  NumPy array, one integer, a zero-dimensional tensor);
+  1,100), against the torch limb path, and the bits against the host
+  reference;
+* the uniform at both precisions for every form a call site passes the
+  bounce in (per-ray int32 or int64 tensor, a NumPy array, one integer, a
+  zero-dimensional tensor);
 * the LCG state after the jump-ahead, against the host reference's doubling
   loop, for step counts in every 16-bit chunk of the counter;
 * whole traces through ``TorchBackend(rng_kernel="warp")``: every ledger
@@ -125,7 +127,11 @@ _DRAWS = 200_000
 @pytest.mark.parametrize("seed", _SEEDS)
 @pytest.mark.parametrize("slot", _SLOTS)
 def test_bits_are_the_limb_path_bits(torch_backend_state, device, seed, slot):
-    """48 configurations of 200,000 draws: zero differing outputs."""
+    """48 configurations of 200,000 draws: zero differing outputs or uniforms.
+
+    Each configuration compares the 32-bit outputs, and the uniforms at
+    float64 and at float32 as bit patterns.
+    """
     rng_warp = _warp_module()
     _use_device(device)
     gen = np.random.default_rng(1000 * slot + seed % 997)
@@ -149,6 +155,15 @@ def test_bits_are_the_limb_path_bits(torch_backend_state, device, seed, slot):
             seed, to_numpy(ray_id[:20_000]), to_numpy(bounce[:20_000]), slot, offset
         ).astype(np.int64)
         np.testing.assert_array_equal(to_numpy(got[:20_000]), host)
+
+        for precision, view in (("float64", torch.int64), ("float32", torch.int32)):
+            be.set_precision(precision)
+            u_ref = limb.pcg32_uniform(seed, ray_id, bounce, slot, offset)
+            u_got = rng_warp.draw_uniform(seed, ray_id, bounce, slot, offset)
+            assert u_got.dtype == u_ref.dtype
+            differing = int((u_got.view(view) != u_ref.view(view)).sum())
+            assert differing == 0, f"offset {offset}, {precision}: {differing} differ"
+        be.set_precision("float64")
 
 
 @pytest.mark.parametrize("device", _DEVICES)
