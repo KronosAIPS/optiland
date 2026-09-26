@@ -4,8 +4,8 @@ The eager torch bounce intersects every component through
 :meth:`~optiland.nonsequential.components.base.BaseComponent.intersect`: a
 frame transform, the origin advance, the per-ray accept threshold, the
 geometry's own root solve and root selection, and the transform of the two
-normals back to the global frame -- about 160 torch operations for the
-integrating sphere's ported cavity and about 200 for a conic face, each one a
+normals back to the global frame -- about 160 dispatched torch operations
+for the integrating sphere's ported cavity and about 185 for a conic face, each one a
 kernel launch on a device. This module computes the same stage in one Warp
 kernel launch per component, for the two analytic kinds it covers
 (:class:`~optiland.nonsequential.components.geometry.analytic.spherical_cavity
@@ -29,13 +29,21 @@ kernels are loaded before the first bounce (:func:`prepare`), so a recorded
 bounce records the launch.
 
 **Same numbers.** The kernels are compiled with floating-point contraction
-off (Warp's ``fuse_fp`` module option), so no multiply-add is fused, and every
-expression is evaluated in the order the torch stage evaluates it; the scalars
-a torch expression takes from Python floats are cast to the working dtype on
-the host as torch casts them. The transform is written as a sum of products
-in row order; torch's CPU matrix product may order that sum differently, which
-is exact for the axis-aligned placements of the catalogue's fast scenes and
-may differ by an ulp for a rotated component (measured by the tests).
+off (Warp's ``fuse_fp`` module option), so no multiply-add is fused that the
+torch stage does not fuse, and every expression is evaluated in the order the
+torch stage evaluates it; the scalars a torch expression takes from Python
+floats are cast to the working dtype on the host as torch casts them. Three
+orders are torch's own and are reproduced from measurement rather than from
+the source text: the matrix product of the frame transform is a chain of
+fused multiply-adds (written with an explicit ``fma``); a sum over the last
+axis of an (N, 3) array is ordered by the device's vector reduction (probed
+at load, :func:`sum_order`); and a division by a Python number may be a
+product with the rounded reciprocal (probed at load, :func:`scalar_division`).
+On the Apple silicon CPU the stage is bit-identical to ``BaseComponent
+.intersect`` at float64 and float32, rotated placements included. On CUDA
+the first A100 run found one-ulp differences in the cavity's normals and
+larger ones for a rotated placement (cuBLAS orders the transform otherwise);
+see the tests.
 
 **Gradients.** In gradient mode the launch is recorded on a Warp tape inside
 a ``torch.autograd.Function``, and the backward pass replays the tape's
