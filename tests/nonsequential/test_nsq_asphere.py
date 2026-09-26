@@ -584,3 +584,79 @@ class TestRegistration:
         assert isinstance(c, EvenAsphereGeometry)
         assert c.coefficient_values() == THEORY_COEFFS
         assert c.radius == 25.0
+
+
+class TestCompounds:
+    """Lens and mirror faces as aspheres: builder, volume, JSON form."""
+
+    @staticmethod
+    def _scene(lens_cfg, mirror_cfg):
+        from optiland.nonsequential import LensConfig, MirrorConfig  # noqa: PLC0415, F401
+
+        scene = NSQScene()
+        scene.add_source(
+            "S",
+            CoordinateSystem(z=-20.0),
+            CollimatedSourceConfig(
+                spectrum=Spectrum.monochromatic(0.55), total_flux=1.0, aperture_radius=5.0
+            ),
+        )
+        scene.add_lens("L", CoordinateSystem(), lens_cfg)
+        scene.add_mirror("M", CoordinateSystem(z=60.0), mirror_cfg)
+        scene.add_detector(
+            "D",
+            CoordinateSystem(z=30.0),
+            IrradianceDetectorConfig(width=30, height=30, num_pixels_x=10, num_pixels_y=10),
+        )
+        return scene
+
+    def _configs(self, c1=(0.0, -2e-6, 1e-9), cm=(0.0, 1e-7)):
+        from optiland.nonsequential import LensConfig, MirrorConfig  # noqa: PLC0415
+
+        lens = LensConfig(
+            r1=40.0, r2=0.0, thickness=4.0, material="N-BK7",
+            front_aperture_radius=10.0, conic1=-0.8, coefficients1=c1,
+        )
+        mirror = MirrorConfig(
+            radius=-100.0, reflectance=0.9, aperture_radius=15.0, coefficients=cm
+        )
+        return lens, mirror
+
+    def test_faces_are_aspheres_and_the_lens_closes(self):
+        scene = self._scene(*self._configs())
+        front = scene.component_registry._registry["L"].surfaces[0].geometry
+        edge = scene.component_registry._registry["L"].surfaces[2].geometry
+        assert isinstance(front, EvenAsphereGeometry)
+        # The barrel meets the asphere at its full rim sag, not the conic's.
+        assert as_float_edge(edge) == pytest.approx(front.rim_sag(), abs=1e-12)
+        assert isinstance(scene.component_registry._registry["M"].surfaces[0].geometry, EvenAsphereGeometry)
+        res = scene.trace(num_rays=2000, seed=1, max_depth=10)
+        assert res.flux_conservation_error < 1e-12
+
+    def test_json_round_trip(self):
+        from optiland.nonsequential.serialization import (  # noqa: PLC0415
+            scene_from_dict,
+            scene_to_dict,
+        )
+
+        d = scene_to_dict(self._scene(*self._configs()))
+        lens = next(c for c in d["components"] if c["name"] == "L")["config"]
+        mirror = next(c for c in d["components"] if c["name"] == "M")["config"]
+        assert lens["coefficients1"] == [0.0, -2e-6, 1e-9] and lens["odd1"] is False
+        assert "coefficients2" not in lens
+        assert mirror["coefficients"] == [0.0, 1e-7]
+        assert scene_to_dict(scene_from_dict(d)) == d
+
+    def test_conic_json_is_unchanged(self):
+        from optiland.nonsequential.serialization import scene_to_dict  # noqa: PLC0415
+
+        d = scene_to_dict(self._scene(*self._configs(c1=(), cm=())))
+        for comp in d["components"]:
+            assert not any(k.startswith(("coefficients", "odd")) for k in comp["config"])
+        scene = self._scene(*self._configs(c1=(), cm=()))
+        assert type(scene.component_registry._registry["L"].surfaces[0].geometry) is ConicGeometry
+
+
+def as_float_edge(edge) -> float:
+    """The barrel's front z (the rim of the front face)."""
+    return float(edge.z_front)

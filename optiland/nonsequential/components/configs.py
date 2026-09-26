@@ -107,6 +107,14 @@ class LensConfig:
         edge: Per-surface overrides for the edge (barrel) surface.
         rim: Per-surface overrides for the rim annulus (only used when
             apertures differ).
+        coefficients1: Polynomial coefficients of the front face; empty for
+            a conic face. Non-empty makes the face an asphere (the geometry
+            kinds ``even_asphere``/``odd_asphere``, KronosNSRT issue 30):
+            entry ``i`` multiplies ``r^(2 (i + 1))``, or ``r^(i + 1)`` when
+            ``odd1`` is set.
+        coefficients2: The same for the back face.
+        odd1: The front face's polynomial is odd.
+        odd2: The back face's polynomial is odd.
     """
 
     r1: float
@@ -121,6 +129,10 @@ class LensConfig:
     back: SurfaceConfig | None = None
     edge: SurfaceConfig | None = None
     rim: SurfaceConfig | None = None
+    coefficients1: tuple = ()
+    coefficients2: tuple = ()
+    odd1: bool = False
+    odd2: bool = False
 
 
 @dataclass
@@ -182,6 +194,11 @@ class MirrorConfig:
         conic: Conic constant (0 = sphere, -1 = paraboloid, etc.).
         aperture_radius: Semi-diameter [mm].
         surface: Per-surface overrides (e.g. to attach a scatter BSDF).
+        coefficients: Polynomial coefficients; empty for a conic mirror.
+            Non-empty makes the surface an asphere (KronosNSRT issue 30):
+            entry ``i`` multiplies ``r^(2 (i + 1))``, or ``r^(i + 1)`` when
+            ``odd`` is set.
+        odd: The polynomial is odd.
     """
 
     radius: float
@@ -189,6 +206,8 @@ class MirrorConfig:
     conic: float = 0.0
     aperture_radius: float = 25.0
     surface: SurfaceConfig | None = None
+    coefficients: tuple = ()
+    odd: bool = False
 
 
 @dataclass
