@@ -7,10 +7,17 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING
 
 import optiland.backend as be
-from optiland.nonsequential._tally import accumulate, masked_count, masked_sum
+from optiland.backend.utils import to_numpy
+from optiland.nonsequential._tally import (
+    accumulate,
+    accumulate_compensated,
+    masked_count,
+    masked_sum,
+)
 from optiland.nonsequential.components.base import BaseComponent
 from optiland.nonsequential.materials.nsq_material import VACUUM
 
@@ -94,8 +101,14 @@ class AbsorbingComponent(BaseComponent):
         # place after the first term (``accumulate``).
         hit_alive = hit_mask & rays.alive
         self._absorbed_count = accumulate(self._absorbed_count, masked_count(hit_alive))
-        self._absorbed_flux = accumulate(
-            self._absorbed_flux, masked_sum(rays.flux, hit_alive)
+        # The flux total is compensated (issue 25 of the research
+        # repository): _absorbed_flux is the plain running sum it always
+        # was, _absorbed_flux_comp the rounding error of its additions, and
+        # absorbed_flux() their sum.
+        self._absorbed_flux, self._absorbed_flux_comp = accumulate_compensated(
+            self._absorbed_flux,
+            getattr(self, "_absorbed_flux_comp", 0.0),
+            masked_sum(rays.flux, hit_alive),
         )
 
         # Terminate rays
@@ -107,3 +120,17 @@ class AbsorbingComponent(BaseComponent):
         """Reset per-simulation absorbed ray and flux counters."""
         self._absorbed_count = 0
         self._absorbed_flux = 0.0
+        self._absorbed_flux_comp = 0.0
+
+    def absorbed_flux(self) -> float:
+        """The flux absorbed this trace [W]: the running sum plus its compensation.
+
+        Returns:
+            A Python float, read back once.
+        """
+        return math.fsum(
+            (
+                float(to_numpy(self._absorbed_flux)),
+                float(to_numpy(getattr(self, "_absorbed_flux_comp", 0.0))),
+            )
+        )

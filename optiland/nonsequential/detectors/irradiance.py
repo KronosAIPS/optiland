@@ -28,7 +28,8 @@ from optiland.nonsequential._tally import accumulate, masked_count
 from optiland.nonsequential.detectors.base import (
     BaseDetector,
     _accumulate_into,
-    _new_flat_accumulator,
+    _new_bin_accumulator,
+    bin_values,
 )
 from optiland.nonsequential.results.irradiance_map import IrradianceMap
 
@@ -114,7 +115,7 @@ class IrradianceDetector(BaseDetector):
         # -- and mutated in place by
         # every record() call (see _accumulate_into in detectors/base.py),
         # so a bounce never reallocates the pixel buffer.
-        self._data = _new_flat_accumulator(num_pixels_y * num_pixels_x)
+        self._data = _new_bin_accumulator(num_pixels_y * num_pixels_x)
         self._num_rays_hit: int = 0
 
         # Pixel bin edges (NumPy, used for index arithmetic -- always detached)
@@ -169,12 +170,13 @@ class IrradianceDetector(BaseDetector):
         # needs an early exit on an empty mask -- which is what lets a
         # device backend call record() for every detector every bounce
         # without asking whether any ray hit it.
+        key = getattr(rays, "ray_id", None)
         if self.splat == "bilinear":
-            self._record_bilinear(hx_l, hy_l, flux_masked, nx, ny, dx, dy)
+            self._record_bilinear(hx_l, hy_l, flux_masked, nx, ny, dx, dy, key=key)
         elif self.splat == "gaussian":
-            self._record_gaussian(hx_l, hy_l, flux_masked, nx, ny, dx, dy)
+            self._record_gaussian(hx_l, hy_l, flux_masked, nx, ny, dx, dy, key=key)
         else:
-            self._record_hard(hx_l, hy_l, flux_masked, nx, ny)
+            self._record_hard(hx_l, hy_l, flux_masked, nx, ny, key=key)
 
         self._num_rays_hit = accumulate(self._num_rays_hit, masked_count(hit_mask))
 
@@ -185,6 +187,7 @@ class IrradianceDetector(BaseDetector):
         flux_masked,
         nx: int,
         ny: int,
+        key=None,
     ) -> None:
         """Hard-bin accumulation: each ray's whole flux into one pixel.
 
@@ -207,7 +210,7 @@ class IrradianceDetector(BaseDetector):
         y_edges = self.table("y_edges", self._y_edges)
         ix = clamp_int(be.searchsorted(x_edges, hx_l, side="right") - 1, 0, nx - 1)
         iy = clamp_int(be.searchsorted(y_edges, hy_l, side="right") - 1, 0, ny - 1)
-        _accumulate_into(self._data, iy * nx + ix, flux_masked)
+        _accumulate_into(self._data, iy * nx + ix, flux_masked, key=key)
 
     def _record_bilinear(
         self,
@@ -218,6 +221,7 @@ class IrradianceDetector(BaseDetector):
         ny: int,
         dx: float,
         dy: float,
+        key=None,
     ) -> None:
         """Bilinear splat — differentiable w.r.t. landing position and flux.
 
@@ -263,7 +267,7 @@ class IrradianceDetector(BaseDetector):
             flat = iy * nx + ix
 
             contrib = flux_masked * wx * wy  # attached
-            _accumulate_into(self._data, flat, contrib)
+            _accumulate_into(self._data, flat, contrib, key=key)
 
     def _record_gaussian(
         self,
@@ -274,6 +278,7 @@ class IrradianceDetector(BaseDetector):
         ny: int,
         dx: float,
         dy: float,
+        key=None,
     ) -> None:
         """Gaussian splat — differentiable, energy-conserving.
 
@@ -298,7 +303,7 @@ class IrradianceDetector(BaseDetector):
         """
         sigma = self.splat_sigma
         if sigma <= 0.0:
-            self._record_hard(hx_l, hy_l, flux_masked, nx, ny)
+            self._record_hard(hx_l, hy_l, flux_masked, nx, ny, key=key)
             return
 
         radius = max(1, int(np.ceil(3.0 * sigma)))
@@ -333,7 +338,7 @@ class IrradianceDetector(BaseDetector):
                 iy = clamp_int(iy0 + diy, 0, ny - 1)
                 weight = (gx[dix] * gy[diy]) / norm
                 contrib = flux_masked * weight
-                _accumulate_into(self._data, iy * nx + ix, contrib)
+                _accumulate_into(self._data, iy * nx + ix, contrib, key=key)
 
     def get_result(self) -> IrradianceMap:
         """Return the accumulated irradiance map.
@@ -346,20 +351,21 @@ class IrradianceDetector(BaseDetector):
         nx = self.num_pixels_x
         ny = self.num_pixels_y
         pixel_area = (self.width / nx) * (self.height / ny)
-        data_2d = self._data.reshape(ny, nx) / pixel_area
+        data = bin_values(self._data)
+        data_2d = data.reshape(ny, nx) / pixel_area
 
         x_centres = 0.5 * (self._x_edges[:-1] + self._x_edges[1:])
         y_centres = 0.5 * (self._y_edges[:-1] + self._y_edges[1:])
 
         return IrradianceMap(
-            data=self._data,
+            data=data,
             irradiance=to_numpy(data_2d),
             x_coords=x_centres,
             y_coords=y_centres,
             # Attached: be.sum keeps this on the autograd graph, so
             # `result.detectors["D1"].total_flux.backward()` carries a
             # gradient. Use `.total_flux_float` for printing/formatting.
-            total_flux=be.sum(self._data),
+            total_flux=be.sum(data),
             num_rays_hit=int(to_numpy(self._num_rays_hit)),
         )
 
@@ -369,7 +375,7 @@ class IrradianceDetector(BaseDetector):
         Re-initialises the internal buffer to a fresh accumulator,
         disconnecting it from the previous trace's computation graph.
         """
-        self._data = _new_flat_accumulator(self.num_pixels_y * self.num_pixels_x)
+        self._data = _new_bin_accumulator(self.num_pixels_y * self.num_pixels_x)
         self._num_rays_hit = 0
         self.reset_reflection_tally()
         self.invalidate_frame()
