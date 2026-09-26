@@ -128,11 +128,24 @@ def _rim_points(
     )
     from optiland.nonsequential.components.lens import _sag_at_rim  # noqa: PLC0415
 
+    from optiland.nonsequential.components.geometry.analytic.asphere import (  # noqa: PLC0415
+        _AsphereGeometry,
+    )
+
     geom = component.geometry
     theta = np.linspace(0.0, 2.0 * np.pi, n_samples, endpoint=False)
     loops: list[np.ndarray] = []
 
-    if isinstance(geom, ConicGeometry):
+    if isinstance(geom, _AsphereGeometry):
+        # The rim of an asphere sits at its full sag (conic plus polynomial).
+        r = as_float(geom.aperture_radius)
+        z = geom.rim_sag()
+        loops.append(
+            np.stack(
+                [r * np.cos(theta), r * np.sin(theta), np.full(n_samples, z)], axis=1
+            )
+        )
+    elif isinstance(geom, ConicGeometry):
         r = as_float(geom.aperture_radius)
         z = _sag_at_rim(as_float(geom.radius), as_float(geom.conic), r)
         loops.append(
@@ -313,6 +326,12 @@ def _detached_geometry(geometry: object) -> object:
         SphereGeometry,
     )
 
+    from optiland.nonsequential.components.geometry.analytic.asphere import (  # noqa: PLC0415
+        _AsphereGeometry,
+    )
+
+    if isinstance(geometry, _AsphereGeometry):
+        return geometry.detached_copy()
     if isinstance(geometry, ConicGeometry):
         return ConicGeometry(
             as_float(geometry.radius),
@@ -441,10 +460,15 @@ def _vertex_axis_candidate(boundary: list[BaseComponent]) -> np.ndarray | None:
         ConicGeometry,
     )
 
+    from optiland.nonsequential.components.geometry.analytic.asphere import (  # noqa: PLC0415
+        _AsphereGeometry,
+    )
+
+    # An asphere's vertex is its local origin too.
     vertices = [
         np.asarray(_get_transform(comp.cs)[0], dtype=float)
         for comp in boundary
-        if isinstance(comp.geometry, ConicGeometry)
+        if isinstance(comp.geometry, (ConicGeometry, _AsphereGeometry))
     ]
     if len(vertices) < 2:
         return None

@@ -738,6 +738,10 @@ def _register_geometries() -> None:
     from optiland.nonsequential.components.geometry.analytic.annulus import (  # noqa: PLC0415
         AnnularPlaneGeometry,
     )
+    from optiland.nonsequential.components.geometry.analytic.asphere import (  # noqa: PLC0415
+        EvenAsphereGeometry,
+        OddAsphereGeometry,
+    )
     from optiland.nonsequential.components.geometry.analytic.conic import (  # noqa: PLC0415
         ConicGeometry,
         ParaboloidGeometry,
@@ -837,6 +841,33 @@ def _register_geometries() -> None:
             "vertices": np.asarray(g.mesh.vertices, dtype=np.float64).tolist(),
             "faces": np.asarray(g.mesh.faces, dtype=np.int64).tolist(),
         },
+    )
+    # Aspheres (KronosNSRT issue 30): the base conic's parameters, the
+    # polynomial coefficients as a list (tensors stay tensors in the IR, as
+    # the conic's radius does), and the refinement's three settings.
+    def asphere_params(g) -> dict:
+        coeffs = g.coefficients
+        return {
+            "radius": g.radius,
+            "conic": g.conic,
+            "aperture_radius": g.aperture_radius,
+            "coefficients": coeffs if hasattr(coeffs, "shape") else list(coeffs),
+            "max_iterations": g.max_iterations,
+            "guard_eta": g.guard_eta,
+            "residual_k": g.residual_k,
+        }
+
+    kinds.register_geometry(
+        "even_asphere",
+        EvenAsphereGeometry,
+        asphere_params,
+        description="conic base plus even radial polynomial, Newton-refined",
+    )
+    kinds.register_geometry(
+        "odd_asphere",
+        OddAsphereGeometry,
+        asphere_params,
+        description="conic base plus odd radial polynomial, Newton-refined",
     )
     kinds.register_geometry(
         "lenslet_array",
