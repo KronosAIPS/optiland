@@ -751,6 +751,155 @@ def thin_film_sp(stack, wavelength_um, cos_theta_i) -> SPCoefficients:
 
 
 # ---------------------------------------------------------------------------
+# The Stokes event at a refractive interface (build item 5)
+# ---------------------------------------------------------------------------
+
+
+def _pick(mask, a: InterfaceMueller, b: InterfaceMueller) -> InterfaceMueller:
+    return InterfaceMueller(*(be.where(mask, x, y) for x, y in zip(a, b, strict=True)))
+
+
+class FresnelStokes:
+    """One Fresnel event in Stokes mode, split around the engine's branch draw.
+
+    Built by :func:`fresnel_stokes` before the branch is drawn, it gives the
+    engine the polarization-aware reflectance and transmittance
+    ``R_eff = M_r00 + M_r01 q'`` and ``T_eff = M_t00 + M_t01 q'`` (``q'`` the
+    state in the plane-of-incidence frame), which replace the scalar ``R`` and
+    ``T`` in the branch probability, the weights and the ledger. With an
+    unpolarized state ``q' = 0`` and they *are* the scalar values, bit for bit,
+    so the branch decisions and every flux are unchanged (chapter 06 section
+    6.9, conditions 1 and 2). :meth:`finish` then sets the outgoing state from
+    the matrix of the branch taken and the outgoing reference axis
+    ``e = s x k_out`` (R-06-3).
+    """
+
+    def __init__(self, s, q, u, v, m_r: InterfaceMueller, m_t: InterfaceMueller):
+        self.s = s
+        self.q, self.u, self.v = q, u, v
+        self.m_r, self.m_t = m_r, m_t
+        self.R_eff = m_r.m00 + m_r.m01 * q
+        self.T_eff = m_t.m00 + m_t.m01 * q
+
+    def finish(self, rays, do_reflect, hit_mask) -> None:
+        """Write the outgoing state of the hit rays; the others keep theirs.
+
+        Called after the engine has set the new direction on ``rays``.
+        """
+        m = _pick(do_reflect, self.m_r, self.m_t)
+        _, q, u, v = apply_interface(self.q, self.u, self.v, m)
+        e = _cross(*self.s, rays.L, rays.M, rays.N)
+        rays.pol_q = be.where(hit_mask, q, rays.pol_q)
+        rays.pol_u = be.where(hit_mask, u, rays.pol_u)
+        rays.pol_v = be.where(hit_mask, v, rays.pol_v)
+        rays.pol_ex = be.where(hit_mask, e[0], rays.pol_ex)
+        rays.pol_ey = be.where(hit_mask, e[1], rays.pol_ey)
+        rays.pol_ez = be.where(hit_mask, e[2], rays.pol_ez)
+
+    @staticmethod
+    def scatter(rays, scattered) -> None:
+        """A ray routed through a scatter lobe leaves depolarized (R-06-8's default, kappa = 0).
+
+        Its reference axis is carried to the lobe's direction. A lobe that
+        keeps polarization is build item 6.
+        """
+        zero = _detached_zeros_like(rays.pol_q)
+        rays.pol_q = be.where(scattered, zero, rays.pol_q)
+        rays.pol_u = be.where(scattered, zero, rays.pol_u)
+        rays.pol_v = be.where(scattered, zero, rays.pol_v)
+        e = transport_axis((rays.pol_ex, rays.pol_ey, rays.pol_ez), (rays.L, rays.M, rays.N))
+        rays.pol_ex = be.where(scattered, e[0], rays.pol_ex)
+        rays.pol_ey = be.where(scattered, e[1], rays.pol_ey)
+        rays.pol_ez = be.where(scattered, e[2], rays.pol_ez)
+
+
+def fresnel_stokes(
+    rays, dirs, normals, n1, n2, cos_i, sin2_t, tir, rs, rp, R_used, T_used,
+    coating=None, wavelength=None,
+) -> FresnelStokes:
+    """The Stokes half of a refractive interface, before the branch is drawn.
+
+    1. The incoming reference axis is re-projected perpendicular to ``k`` (a
+       kind that does not yet transport it leaves it slightly off).
+    2. The plane of incidence: ``s = k x n / |k x n|``; where
+       ``|k x n| < sqrt(eps)`` the interface is degenerate (normal incidence,
+       R-06-4), ``s = k x e`` and the rotation is skipped exactly.
+    3. The rotation from ``e`` to ``p_in = s x k`` (no trigonometric call).
+    4. The interface elements. A bare interface: the Fresnel reflection with
+       the TIR phase, and the transmission ``sqrt(T_s T_p)`` with
+       ``T_s = 1 - r_s^2``, ``T_p = 1 - r_p^2`` and ``M_t01 = -M_r01``. A
+       thin-film coating: :func:`thin_film_sp`. A coating with scalar ``R`` and
+       ``T`` only: a non-polarizing element, ``R diag(1, 1, -1, -1)`` and
+       ``T diag(1, 1, 1, 1)`` (an ideal reflection flips the handedness). In
+       every case ``M_00`` is the scalar ``R`` or ``T`` the engine already
+       uses, exactly (R-06-6).
+
+    Args:
+        rays: The bundle (reads its state and reference axis).
+        dirs, normals: ``(N, 3)`` incident directions and surface normals.
+        n1, n2, cos_i, sin2_t, tir, rs, rp: The engine's own Fresnel
+            quantities for these rays.
+        R_used, T_used: The scalar reflectance and transmittance the engine
+            uses (bare, or the coating's), after its TIR override.
+        coating: The surface's coating, or ``None``.
+        wavelength: Per-ray wavelength [um] (for a thin-film coating).
+
+    Returns:
+        A :class:`FresnelStokes`.
+    """
+    k = (dirs[:, 0], dirs[:, 1], dirs[:, 2])
+    nrm = (normals[:, 0], normals[:, 1], normals[:, 2])
+    e = transport_axis((rays.pol_ex, rays.pol_ey, rays.pol_ez), k)
+
+    s_raw = _cross(*k, *nrm)
+    ls2 = _dot(*s_raw, *s_raw)
+    tol = degeneracy_tolerance(ls2)
+    deg = ls2 < tol * tol
+    inv = 1.0 / be.where(deg, be.ones_like(ls2), ls2) ** 0.5
+    s_frame = _cross(*k, *e)
+    s = tuple(be.where(deg, sf, sr * inv) for sf, sr in zip(s_frame, s_raw, strict=True))
+    p_in = _cross(*s, *k)
+    c2, s2 = rotation_2psi(e, p_in, k)
+    c2 = be.where(deg, be.ones_like(c2), c2)
+    s2 = be.where(deg, be.zeros_like(s2), s2)
+    q, u = rotate(rays.pol_q, rays.pol_u, c2, s2)
+    v = rays.pol_v
+
+    zero = be.zeros_like(R_used)
+    if coating is None:
+        phase = tir_relative_phase(n1, n2, cos_i, sin2_t, tir)
+        m_r = reflection_mueller(rs, rp, tir, phase)
+        m_r = InterfaceMueller(R_used, m_r.m01, m_r.m22, m_r.m23)
+        m_t = transmission_mueller(1.0 - rs**2, 1.0 - rp**2, m00=T_used)
+        m_t = InterfaceMueller(
+            T_used,
+            be.where(tir, zero, -m_r.m01),
+            be.where(tir, zero, m_t.m22),
+            zero,
+        )
+    elif hasattr(coating, "stack"):
+        sp = thin_film_sp(coating.stack, wavelength, cos_i)
+        m_r = InterfaceMueller(
+            R_used,
+            be.where(tir, zero, 0.5 * (sp.Rp - sp.Rs)),
+            sp.xr_re,
+            sp.xr_im,
+        )
+        t = sp.transmission()
+        m_t = InterfaceMueller(
+            T_used, be.where(tir, zero, t.m01), be.where(tir, zero, t.m22),
+            be.where(tir, zero, t.m23),
+        )
+    else:
+        phase = tir_relative_phase(n1, n2, cos_i, sin2_t, tir)
+        m_r = InterfaceMueller(
+            R_used, zero, be.where(tir, phase[0], -R_used), be.where(tir, phase[1], zero)
+        )
+        m_t = InterfaceMueller(T_used, zero, T_used, zero)
+    return FresnelStokes(s, q, u, v, m_r, m_t)
+
+
+# ---------------------------------------------------------------------------
 # Full 4x4 matrices, for tests and reports (NumPy, float64)
 # ---------------------------------------------------------------------------
 
