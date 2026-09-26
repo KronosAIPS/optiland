@@ -44,7 +44,16 @@ U64 = 2.0**-53
 
 @pytest.fixture(autouse=True)
 def _restore_backend():
+    # Start from forward mode whatever an earlier test left behind: the
+    # replay refuses a gradient trace, and these tests trace forward only.
+    be.set_backend("torch")
+    was_on = bool(be.grad_mode.requires_grad)
+    be.grad_mode.disable()
+    be.set_backend("numpy")
     yield
+    be.set_backend("torch")
+    if was_on:
+        be.grad_mode.enable()
     be.set_backend("numpy")
     be.set_precision("float64")
 
