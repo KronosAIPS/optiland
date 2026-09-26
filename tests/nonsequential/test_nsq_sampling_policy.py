@@ -23,6 +23,7 @@ from optiland.nonsequential import (
 from optiland.nonsequential.backends.numpy_backend import NumpyBackend
 from optiland.nonsequential.backends.torch_backend import TorchBackend
 from optiland.nonsequential.ir.scene_ir import SamplingPolicy
+from optiland.nonsequential.ray_bundle import NSQRayBundle
 from optiland.nonsequential.rng import NSQRng
 from optiland.nonsequential.sampling import resolve_reflect_prob, russian_roulette
 
@@ -335,6 +336,61 @@ class TestBoundedSplitting:
         scene = _lens_scene()
         ir = lower(scene, strict=False)
         assert ir.sampling.split_depth == 0
+
+
+class TestSplitBudgetCullLedger:
+    """Issue 28 of the research repository: a saturated split budget books the
+    boost it hands the survivors, so the ledger (ch. 10, eq. 10.1) closes on a
+    saturating trace to the chapter's working threshold of 1e-11 relative
+    (sec 10.3 invariant 1, sec 10.4 ledger closure)."""
+
+    @staticmethod
+    def _saturating_scene():
+        scene = _lens_scene()
+        scene.sampling_policy = SamplingPolicy(split_depth=3, split_budget=1.05)
+        return scene
+
+    def test_cull_returns_the_survivors_boost(self):
+        from optiland.nonsequential.backends.array_backend import _cull_to_budget
+
+        n = 1000
+        rays = NSQRayBundle(
+            x=np.zeros(n), y=np.zeros(n), z=np.zeros(n),
+            L=np.zeros(n), M=np.zeros(n), N=np.ones(n),
+            flux=np.linspace(0.5, 1.5, n) * 1e-3,
+            wavelength=np.full(n, 0.55), n_current=np.ones(n),
+            bounce=np.ones(n, dtype=np.int32), alive=np.ones(n, dtype=bool),
+            ray_id=np.arange(n, dtype=np.int64),
+        )
+        before = np.asarray(be.to_numpy(rays.flux)).copy()
+        kept, culled_flux, culled_np, boost = _cull_to_budget(rays, 300, NSQRng(5))
+        after = np.asarray(be.to_numpy(kept.flux))
+        assert 0 < culled_np.sum() < n
+        np.testing.assert_allclose(boost, np.sum(before[~culled_np] - after), rtol=1e-14)
+        assert boost < 0.0
+        # The event residual of the whole batch: what left minus what came back.
+        residual = culled_flux.sum() + boost
+        assert residual == pytest.approx(before.sum() - after.sum(), rel=1e-12, abs=1e-15)
+
+    @pytest.mark.parametrize("backend_name", ["numpy", "torch"])
+    def test_saturating_trace_closes_the_ledger(self, backend_name):
+        if backend_name == "torch":
+            pytest.importorskip("torch")
+            be.set_backend("torch")
+            be.set_precision("float64")
+        try:
+            scene = self._saturating_scene()
+            backend = (
+                NumpyBackend(seed=1)
+                if backend_name == "numpy"
+                else TorchBackend(seed=1, allow_splitting=True)
+            )
+            result = scene.trace(num_rays=20_000, seed=1, backend=backend)
+            assert result.diagnostics.split_budget_saturated is True
+            assert result.num_rays_flux_killed > 0
+            assert result.flux_conservation_error < 1e-11, result.flux_conservation_error
+        finally:
+            be.set_backend("numpy")
 
 
 # ---------------------------------------------------------------------------

@@ -131,10 +131,14 @@ def _cull_to_budget(
         rng: Keyed PCG32 RNG.
 
     Returns:
-        ``(kept, culled_flux, culled_mask)``: the surviving (boosted-flux)
-        subset as a new bundle, the pre-cull flux of the rays that were
-        killed (for ``total_flux_lost`` bookkeeping), and the NumPy bool
-        mask of which input rows were culled.
+        ``(kept, culled_flux, culled_mask, boost_residual)``: the surviving
+        (boosted-flux) subset as a new bundle, the pre-cull flux of the rays
+        that were killed (for ``total_flux_lost`` bookkeeping), the NumPy
+        bool mask of which input rows were culled, and the sum over the
+        survivors of (flux before minus flux after), a negative number: the
+        weight the boost hands them, which ch. 10 sec 10.2 books in the
+        sampling residual beside the culled flux, exactly as the roulette
+        block does (issue 28 of the research repository).
     """
     n = spawned.num_rays
     keep_prob = max(headroom / n, _BUDGET_CULL_SURVIVE_FLOOR) if n > 0 else 1.0
@@ -150,7 +154,10 @@ def _cull_to_budget(
     idx = np.where(keep_np)[0]
     kept = spawned.select(idx)
     kept.flux = kept.flux / keep_prob  # unbiased boost
-    return kept, culled_flux, culled_np
+    # Per ray, then summed: the difference of the two totals would carry the
+    # rounding of both, which is larger than the residual itself can be.
+    boost_residual = float(np.sum(flux_np[keep_np] - to_numpy(kept.flux)))
+    return kept, culled_flux, culled_np, boost_residual
 
 
 
@@ -1005,15 +1012,23 @@ class ArrayBackend(TracerBackend):
                         headroom = max(0, budget - rays.num_rays_alive)
                         if spawned.num_rays > headroom:
                             split_budget_saturated = True
-                            spawned, culled_flux_np, culled_np = _cull_to_budget(
-                                spawned, headroom, self.rng
-                            )
+                            (
+                                spawned,
+                                culled_flux_np,
+                                culled_np,
+                                boost_residual,
+                            ) = _cull_to_budget(spawned, headroom, self.rng)
                             if culled_np.any():
                                 num_rays_flux_killed.add(int(culled_np.sum()))
                                 total_flux_rr_killed.add(float(culled_flux_np.sum()))
                                 total_flux_sampling_residual.add(
                                     float(culled_flux_np.sum())
                                 )
+                            # Ch. 10 (10.2): the survivors' boost is the
+                            # other half of the cull's event residual; booking
+                            # only the culled flux left (10.1) open by it on
+                            # every saturated trace (issue 28).
+                            total_flux_sampling_residual.add(boost_residual)
                         if spawned.num_rays > 0:
                             rays = NSQRayBundle.concat([rays, spawned])
 
