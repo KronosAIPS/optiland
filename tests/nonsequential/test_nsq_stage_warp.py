@@ -524,3 +524,27 @@ def test_a_replayed_bounce_records_the_kernels(torch_backend_state, precision):
     assert fused.environment["graph_replay"] == "cuda"
     assert stage.availability("cuda") is None
     _assert_same_trace(reference, fused, _CUDA_FLOAT64_MAX_ULP if precision == "float64" else 0)
+
+
+@pytest.mark.parametrize("precision", ["float64", "float32"])
+def test_the_kernels_pass_the_capture_safety_check(torch_backend_state, monkeypatch, precision):
+    """``graph_replay="emulate"`` refuses any host transfer inside the recorded bounce.
+
+    The stage's per-call inputs are cached or built without a torch operation, so
+    the emulated replay runs with the kernels and gives the eager fixed-width trace.
+    """
+    stage = _stage()
+    be.set_precision(precision)
+    monkeypatch.setattr(stage, "SUPPORTED_DEVICE_TYPES", ("cuda", "cpu"))
+
+    def trace(**kw):
+        backend = TorchBackend(seed=5, graph_replay="emulate", alive_check_every=0, **kw)
+        result = _sphere().trace(num_rays=2048, seed=5, max_depth=40, batch_size=2048, backend=backend)
+        assert backend.graph_replay_batches == 1
+        return result
+
+    reference = trace()
+    fused = trace(intersect_kernel="warp")
+    assert fused.environment["intersect_kernel"] == "warp"
+    assert fused.environment["graph_replay"] == "emulate"
+    _assert_same_trace(reference, fused)

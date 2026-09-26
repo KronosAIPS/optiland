@@ -59,6 +59,8 @@ CUDA, and the result's ``environment`` says what ran.
 import math
 from typing import Any
 
+import numpy as np
+
 import torch
 import warp as wp
 
@@ -599,9 +601,11 @@ def _floor_and_tiny(like: torch.Tensor) -> tuple[float, float]:
 def _cavity_scalars(geometry, like):
     floor, _ = _floor_and_tiny(like)
     radius = geometry.radius
-    inv = 1.0 if _is_tensor(radius) else float(
-        torch.tensor(1.0, dtype=like.dtype) / torch.tensor(float(radius), dtype=like.dtype)
-    )
+    # 1 / radius rounded once in the working dtype, as torch forms the
+    # reciprocal of a Python number; numpy's IEEE division, no torch
+    # operation, so nothing here touches a device inside a recorded bounce.
+    np_dtype = np.float64 if like.dtype == torch.float64 else np.float32
+    inv = 1.0 if _is_tensor(radius) else float(np_dtype(1.0) / np_dtype(radius))
     return [radius, radius**2, floor, math.inf, inv]
 
 
