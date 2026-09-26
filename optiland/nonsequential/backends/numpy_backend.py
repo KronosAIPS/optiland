@@ -36,7 +36,9 @@ class NumpyBackend(ArrayBackend):
     host_reads_free = True
     supports_splitting = True
 
-    def __init__(self, seed: int | None = None, polarization: str | bool | None = None) -> None:
+    def __init__(
+        self, seed: int | None = None, polarization: str | bool | None = None
+    ) -> None:
         """Initialize NumpyBackend.
 
         Args:

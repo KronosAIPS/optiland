@@ -195,7 +195,7 @@ def rotation_2psi(e, a, k):
 
 
 def rotate(q, u, c2, s2):
-    """Apply ``M_rot(psi)`` to the reduced state: returns ``(q', u')``; ``v`` is unchanged."""
+    """Apply ``M_rot(psi)`` to the reduced state; ``(q', u')``, ``v`` unchanged."""
     return c2 * q + s2 * u, c2 * u - s2 * q
 
 
@@ -342,7 +342,7 @@ def transmission_mueller(Ts, Tp, m00=None, phase=None) -> InterfaceMueller:
 
 
 def diattenuator_mueller(tx, ty) -> InterfaceMueller:
-    """Linear diattenuator with power transmittances ``tx`` on ``p`` and ``ty`` on ``s``.
+    """Linear diattenuator: power transmittance ``tx`` on ``p``, ``ty`` on ``s``.
 
     Jones ``diag(sqrt(tx), sqrt(ty))``: ``m00 = (tx + ty) / 2``,
     ``m01 = (tx - ty) / 2``, ``m22 = sqrt(tx ty)``, ``m23 = 0``. An ideal
@@ -407,7 +407,7 @@ def realizability_excess(q, u, v):
 
 
 def birth_axis(kx, ky, kz):
-    """The reference axis a newly born ray gets: lab ``x`` projected perpendicular to ``k``.
+    """The reference axis a newborn ray gets: lab ``x`` made perpendicular to ``k``.
 
     ``e = normalize(a - (a . k) k)`` with ``a = x``; where ``k`` is within
     :func:`degeneracy_tolerance` of ``x`` the lab ``y`` axis is used instead.
@@ -526,10 +526,15 @@ class SourcePolarization:
         )
 
     def __repr__(self) -> str:
-        return f"SourcePolarization(stokes={self.stokes}, reference_axis={self.reference_axis})"
+        return (
+            f"SourcePolarization(stokes={self.stokes}, "
+            f"reference_axis={self.reference_axis})"
+        )
 
 
-def set_source_polarization(scene, name: str, stokes=(1.0, 0.0, 0.0, 0.0), reference_axis=None):
+def set_source_polarization(
+    scene, name: str, stokes=(1.0, 0.0, 0.0, 0.0), reference_axis=None
+):
     """Give the scene's source ``name`` a polarization (read only in Stokes mode).
 
     A scalar trace ignores it: the scalar engine traces the flux the source
@@ -661,7 +666,7 @@ class SPCoefficients(NamedTuple):
         )
 
     def transmission(self) -> InterfaceMueller:
-        """The transmission element: ``m00 = (T_s + T_p) / 2`` and ``sqrt(T_s T_p) e^{i Delta}``."""
+        """The transmission element: ``(T_s + T_p) / 2``, ``sqrt(T_s T_p) e^{iD}``."""
         return transmission_mueller(self.Ts, self.Tp, phase=(self.xt_cos, self.xt_sin))
 
 
@@ -798,7 +803,7 @@ class FresnelStokes:
 
     @staticmethod
     def scatter(rays, scattered) -> None:
-        """A ray routed through a scatter lobe leaves depolarized (R-06-8's default, kappa = 0).
+        """A ray routed through a scatter lobe leaves depolarized (R-06-8, kappa = 0).
 
         Its reference axis is carried to the lobe's direction. A lobe that
         keeps polarization is build item 6.
@@ -807,7 +812,9 @@ class FresnelStokes:
         rays.pol_q = be.where(scattered, zero, rays.pol_q)
         rays.pol_u = be.where(scattered, zero, rays.pol_u)
         rays.pol_v = be.where(scattered, zero, rays.pol_v)
-        e = transport_axis((rays.pol_ex, rays.pol_ey, rays.pol_ez), (rays.L, rays.M, rays.N))
+        e = transport_axis(
+            (rays.pol_ex, rays.pol_ey, rays.pol_ez), (rays.L, rays.M, rays.N)
+        )
         rays.pol_ex = be.where(scattered, e[0], rays.pol_ex)
         rays.pol_ey = be.where(scattered, e[1], rays.pol_ey)
         rays.pol_ez = be.where(scattered, e[2], rays.pol_ez)
@@ -857,7 +864,9 @@ def fresnel_stokes(
     deg = ls2 < tol * tol
     inv = 1.0 / be.where(deg, be.ones_like(ls2), ls2) ** 0.5
     s_frame = _cross(*k, *e)
-    s = tuple(be.where(deg, sf, sr * inv) for sf, sr in zip(s_frame, s_raw, strict=True))
+    s = tuple(
+        be.where(deg, sf, sr * inv) for sf, sr in zip(s_frame, s_raw, strict=True)
+    )
     p_in = _cross(*s, *k)
     c2, s2 = rotation_2psi(e, p_in, k)
     c2 = be.where(deg, be.ones_like(c2), c2)
@@ -893,7 +902,10 @@ def fresnel_stokes(
     else:
         phase = tir_relative_phase(n1, n2, cos_i, sin2_t, tir)
         m_r = InterfaceMueller(
-            R_used, zero, be.where(tir, phase[0], -R_used), be.where(tir, phase[1], zero)
+            R_used,
+            zero,
+            be.where(tir, phase[0], -R_used),
+            be.where(tir, phase[1], zero),
         )
         m_t = InterfaceMueller(T_used, zero, T_used, zero)
     return FresnelStokes(s, q, u, v, m_r, m_t)
@@ -921,5 +933,10 @@ def rotation_matrix(psi_rad: float) -> np.ndarray:
     """``M_rot(psi)`` of chapter 06 section 6.5, as a NumPy array."""
     c, s = np.cos(2.0 * psi_rad), np.sin(2.0 * psi_rad)
     return np.array(
-        [[1.0, 0.0, 0.0, 0.0], [0.0, c, s, 0.0], [0.0, -s, c, 0.0], [0.0, 0.0, 0.0, 1.0]]
+        [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, c, s, 0.0],
+            [0.0, -s, c, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
     )
