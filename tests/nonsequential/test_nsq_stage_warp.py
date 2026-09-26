@@ -506,7 +506,7 @@ def test_without_warp_the_request_falls_back_silently(torch_backend_state, monke
 
 @pytest.mark.skipif(not _cuda_with_warp(), reason="CUDA with Warp not available")
 @pytest.mark.parametrize("precision", ["float64", "float32"])
-def test_a_replayed_bounce_records_the_kernels(torch_backend_state, precision):
+def test_a_replayed_bounce_on_cuda_records_the_kernels(torch_backend_state, precision):
     """The CUDA-graph replay with the kernels equals the replay without them."""
     stage = _stage()
     be.set_device("cuda")
