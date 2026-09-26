@@ -124,8 +124,18 @@ class CylindricalFrustumGeometry(AnalyticGeometry):
 
         disc = b * b - 4.0 * a * c
         # Zero as a device constant (resident_scalar), not an upload.
-        disc_safe = be.maximum(disc, resident_scalar(self, "zero", 0.0, disc))
-        sqrt_disc = be.sqrt(disc_safe)
+        # The input is masked, not clamped (docs/theory/08_precision.md sec
+        # 8.8): a clamp to zero hands sqrt'(0) = inf to the backward pass,
+        # which the discarded branch of the root selection below turns into
+        # 0 * inf = NaN for every ray whose discriminant is not positive --
+        # a ray parallel to the axis of a constant-radius edge has disc = 0
+        # exactly. The value is the clamp's to the bit (sqrt of the positive
+        # discriminant, and zero elsewhere); only the derivative changes, from
+        # NaN to zero where the discriminant is not positive.
+        zero = resident_scalar(self, "zero", 0.0, disc)
+        disc_pos = disc > zero
+        disc_safe = be.where(disc_pos, disc, be.ones_like(disc))
+        sqrt_disc = be.where(disc_pos, be.sqrt(disc_safe), zero)
 
         if eps is None:
             eps = _tol.accept_t_min(be.abs(origins).max())

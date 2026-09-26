@@ -46,6 +46,12 @@ from optiland.nonsequential.detectors.dispatch import intersect_detectors
 from optiland.nonsequential.diagnostics import build_diagnostics
 from optiland.nonsequential.ir.interpreter import apply_primitive_interactions
 from optiland.nonsequential.ir.lower import lower
+from optiland.nonsequential.parameter_register import (
+    ParameterRegister,
+    attach_source_placement,
+    check_after_trace,
+    refuse_without_autograd,
+)
 from optiland.nonsequential.path_recording import (  # noqa: F401
     _EVENT_DTYPE,
     PathRecorder,
@@ -771,6 +777,14 @@ class ArrayBackend(TracerBackend):
 
         self.rng = self._trace_rng(seed)
 
+        # The parameter register (docs/theory/09_differentiation.md R-09-2):
+        # every tensor of the scene that requires a gradient, filled here,
+        # before the scene is uploaded, and checked after the loop. Empty --
+        # and every step below exactly what it was -- when nothing requires
+        # one. A backend without autograd refuses a non-empty one (R-09-3).
+        register = ParameterRegister.from_scene(scene)
+        refuse_without_autograd(register)
+
         # Reset detectors and absorber stats
         for det in scene.detectors:
             det.reset()
@@ -930,6 +944,10 @@ class ArrayBackend(TracerBackend):
                     rays.flux = rays.flux * (batch / source_num_rays)
 
                 rays = self._prepare_bundle(rays)
+                if register:
+                    # A source placement that carries a gradient, attached on
+                    # the device (values unchanged to the bit).
+                    rays = attach_source_placement(rays, source)
                 path_recorder.log_birth(rays, source_name)
 
                 depth = 0
@@ -1137,7 +1155,7 @@ class ArrayBackend(TracerBackend):
             sampling_residual=sampling_residual,
         )
 
-        return SimulationResult(
+        result = SimulationResult(
             detectors=detector_results,
             num_rays_total=num_rays_total,
             num_rays_absorbed=num_rays_absorbed,
@@ -1160,6 +1178,17 @@ class ArrayBackend(TracerBackend):
             reflection_histograms=reflection_histograms,
             environment=self._environment(),
         )
+        if register:
+            # R-09-7: a gradient result says the boundary term is not in it;
+            # the register is the per-parameter statement (its rows carry
+            # each parameter's class). R-09-5: a registered parameter no
+            # output depends on raises, the result carried on the error.
+            result.parameter_register = register
+            result.environment["gradient_boundary_term"] = "absent"
+            check_after_trace(
+                register, scene, detector_results, hit_counts.values(), result
+            )
+        return result
 
     def _continue_bounce(
         self, rays: NSQRayBundle, depth: int, max_depth: int

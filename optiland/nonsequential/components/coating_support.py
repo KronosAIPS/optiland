@@ -184,4 +184,13 @@ def resolve_reflectance(
         return be.ones_like(wavelength) * float(reflectance.reflectance)
     if callable(reflectance):
         return be.ones_like(wavelength) * be.array(reflectance(wavelength))
+    if getattr(reflectance, "requires_grad", False):
+        # A constant that carries a gradient stays attached (docs/theory/
+        # 09_differentiation.md R-09-2: a coating reflectance is attached);
+        # float() here detached it silently, which the dead-parameter raise
+        # of the parameter register found. A plain number takes the line
+        # below, unchanged.
+        return be.ones_like(wavelength) * reflectance.to(
+            dtype=wavelength.dtype, device=wavelength.device
+        )
     return be.ones_like(wavelength) * float(reflectance)
