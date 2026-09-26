@@ -106,6 +106,12 @@ def _make_kernels(FT, fma):
         return (x + y) + z
 
     @wp.func
+    def _div_scalar(x: FT, s: FT, inv_s: FT, recip: int):
+        if recip == 1:
+            return x * inv_s
+        return x / s
+
+    @wp.func
     def _mm(a0: FT, a1: FT, a2: FT, r0: FT, r1: FT, r2: FT):
         return fma(a2, r2, fma(a1, r1, a0 * r0))
 
@@ -146,6 +152,8 @@ def _make_kernels(FT, fma):
         eps: FT,
         ox: FT, oy: FT, oz: FT, dx: FT, dy: FT, dz: FT,
         radius: FT,
+        inv_radius: FT,
+        recip: int,
         ports: wp.array(dtype=FT),
         nports: int,
     ):
@@ -158,7 +166,10 @@ def _make_kernels(FT, fma):
         hz = oz + safe_t * dz
         in_port = int(0)
         for p in range(nports):
-            cos_angle = ((hx * ports[4 * p] + hy * ports[4 * p + 1]) + hz * ports[4 * p + 2]) / radius
+            cos_angle = _div_scalar(
+                (hx * ports[4 * p] + hy * ports[4 * p + 1]) + hz * ports[4 * p + 2],
+                radius, inv_radius, recip,
+            )
             if cos_angle >= ports[4 * p + 3]:
                 in_port = 1
         return forward and (in_port == 0)
@@ -174,6 +185,7 @@ def _make_kernels(FT, fma):
         ports: wp.array(dtype=FT),
         nports: int,
         sum_order: int,
+        recip: int,
         t_hit: wp.array(dtype=FT),
         normals: wp.array2d(dtype=FT),
         hit: wp.array(dtype=wp.bool),
@@ -181,9 +193,10 @@ def _make_kernels(FT, fma):
         t_adv_out: wp.array(dtype=FT),
         t_local_out: wp.array(dtype=FT),
     ):
-        # gp: radius, radius**2, radicand floor, inf
+        # gp: radius, radius**2, radicand floor, inf, 1 / radius
         i = wp.tid()
         radius = gp[0]
+        inv_radius = gp[4]
         r2 = gp[1]
         floor = gp[2]
         inf = gp[3]
@@ -204,8 +217,8 @@ def _make_kernels(FT, fma):
             sqrt_disc = wp.sqrt(wp.max(disc, floor))
         t_near = (-b - sqrt_disc) / FT(2.0)
         t_far = (-b + sqrt_disc) / FT(2.0)
-        use_near = _cavity_root_valid(t_near, disc_ok, eps, ox, oy, oz, dx, dy, dz, radius, ports, nports)
-        use_far = _cavity_root_valid(t_far, disc_ok, eps, ox, oy, oz, dx, dy, dz, radius, ports, nports)
+        use_near = _cavity_root_valid(t_near, disc_ok, eps, ox, oy, oz, dx, dy, dz, radius, inv_radius, recip, ports, nports)
+        use_far = _cavity_root_valid(t_far, disc_ok, eps, ox, oy, oz, dx, dy, dz, radius, inv_radius, recip, ports, nports)
         use_far = use_far and (not use_near)
         hit_l = use_near or use_far
         t = inf
@@ -223,9 +236,9 @@ def _make_kernels(FT, fma):
         ny = FT(0.0)
         nz = FT(0.0)
         if hit_l:
-            nx = hx / radius
-            ny = hy / radius
-            nz = hz / radius
+            nx = _div_scalar(hx, radius, inv_radius, recip)
+            ny = _div_scalar(hy, radius, inv_radius, recip)
+            nz = _div_scalar(hz, radius, inv_radius, recip)
         dot = (dx * nx + dy * ny) + dz * nz
         flip = FT(1.0)
         if dot > FT(0.0):
@@ -415,6 +428,42 @@ def sum_order(dtype: torch.dtype, device: Any) -> int:
         order = 0 if float(probe.sum(dim=1)[0]) == 1.0 else 1
         _SUM_ORDER[key] = order
     return order
+
+
+_SCALAR_DIVISION: dict = {}
+
+
+def scalar_division(dtype: torch.dtype, device: Any) -> int:
+    """How torch divides a tensor by a Python number on this device and dtype.
+
+    0 for a true division ``x / s``, 1 for a product with the reciprocal
+    ``x * (1 / s)`` (the reciprocal rounded once in the working dtype). The
+    cavity's two divisions by its radius are written against a Python float,
+    so the kernel follows whichever the device does. Probed once on 4,096
+    values divided by 3, many of which round differently under the two, and
+    cached; a device that matches neither keeps the true division.
+
+    Args:
+        dtype: The working float dtype.
+        device: The torch device.
+
+    Returns:
+        The flag the cavity kernel takes.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    key = (dtype, str(device))
+    mode = _SCALAR_DIVISION.get(key)
+    if mode is None:
+        np_dtype = np.float64 if dtype == torch.float64 else np.float32
+        x = (np.arange(1, 4097, dtype=np.float64) * 0.7310585786300049).astype(np_dtype)
+        divisor = 3.0
+        got = (torch.as_tensor(x, device=device) / divisor).cpu().numpy()
+        true = x / np_dtype(divisor)
+        recip = x * (np_dtype(1.0) / np_dtype(divisor))
+        mode = 1 if (np.array_equal(got, recip) and not np.array_equal(got, true)) else 0
+        _SCALAR_DIVISION[key] = mode
+    return mode
 _WP_FLOAT = {torch.float64: wp.float64, torch.float32: wp.float32}
 
 _prepared: set = set()
@@ -445,6 +494,7 @@ def prepare(device: Any) -> None:
     # bounce, never inside a recorded one.
     for dtype in (torch.float64, torch.float32):
         sum_order(dtype, tdev)
+        scalar_division(dtype, tdev)
     _prepared.add(name)
 
 
@@ -541,7 +591,10 @@ def _floor_and_tiny(like: torch.Tensor) -> tuple[float, float]:
 def _cavity_scalars(geometry, like):
     floor, _ = _floor_and_tiny(like)
     radius = geometry.radius
-    return [radius, radius**2, floor, math.inf]
+    inv = 1.0 if _is_tensor(radius) else float(
+        torch.tensor(1.0, dtype=like.dtype) / torch.tensor(float(radius), dtype=like.dtype)
+    )
+    return [radius, radius**2, floor, math.inf, inv]
 
 
 def _cavity_ports(geometry, like):
@@ -629,7 +682,7 @@ def _outputs(n: int, like: torch.Tensor):
     )
 
 
-def _launch(kind, inputs_t, outputs_t, nports, *, requires_grad=False, tape=None):
+def _launch(kind, inputs_t, outputs_t, nports, *, recip=0, requires_grad=False, tape=None):
     """Wrap the torch tensors as Warp arrays and launch on torch's stream.
 
     Returns the Warp arrays (inputs, outputs) so a tape can find their
@@ -653,6 +706,8 @@ def _launch(kind, inputs_t, outputs_t, nports, *, requires_grad=False, tape=None
     if kind == "cavity":
         args.append(int(nports))
     args.append(sum_order(like.dtype, like.device))
+    if kind == "cavity":
+        args.append(int(recip))
     n = int(like.shape[0])
     kwargs = {"dim": n, "inputs": args, "outputs": wp_out}
     if tdev.type == "cuda":
@@ -683,15 +738,16 @@ def _op_intersect(
     gp: torch.Tensor,
     ports: torch.Tensor,
     nports: int,
+    recip: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     outs = _outputs(x.shape[0], x)
     ins = [x, y, z, L, M, N, alive, t_min, xf, gp] + ([ports] if kind == "cavity" else [])
-    _launch(kind, ins, outs, nports)
+    _launch(kind, ins, outs, nports, recip=recip)
     return outs
 
 
 @_op_intersect.register_fake
-def _(kind, x, y, z, L, M, N, alive, t_min, xf, gp, ports, nports):
+def _(kind, x, y, z, L, M, N, alive, t_min, xf, gp, ports, nports, recip):
     return _outputs(x.shape[0], x)
 
 
@@ -699,14 +755,14 @@ class _IntersectFunction(torch.autograd.Function):
     """The kernel with its adjoint: the forward launch recorded on a Warp tape."""
 
     @staticmethod
-    def forward(ctx, kind, nports, x, y, z, L, M, N, alive, t_min, xf, gp, ports):
+    def forward(ctx, kind, nports, recip, x, y, z, L, M, N, alive, t_min, xf, gp, ports):
         ins = [t.detach().contiguous() for t in (x, y, z, L, M, N)]
         ins += [alive, t_min.detach(), xf.detach().contiguous(), gp.detach().contiguous()]
         if kind == "cavity":
             ins.append(ports)
         outs = _outputs(x.shape[0], x)
         tape = wp.Tape()
-        wp_in, wp_out = _launch(kind, ins, outs, nports, requires_grad=True, tape=tape)
+        wp_in, wp_out = _launch(kind, ins, outs, nports, recip=recip, requires_grad=True, tape=tape)
         ctx.tape = tape
         ctx.wp_in = wp_in
         ctx.wp_out = wp_out
@@ -724,7 +780,7 @@ class _IntersectFunction(torch.autograd.Function):
             ctx.tape.backward(grads=grads)
         wp_in = ctx.wp_in
         # wp_in: x y z L M N alive t_min xf gp [ports]
-        out = [None, None]
+        out = [None, None, None]
         for k in range(6):
             out.append(wp.to_torch(wp_in[k].grad).clone() if wp_in[k].requires_grad else None)
         out += [None, None]
@@ -758,16 +814,19 @@ def intersect_component(component, kind: str, rays, t_min):
     needs_grad = torch.is_grad_enabled() and (
         any(f.requires_grad for f in fields) or xf.requires_grad or gp.requires_grad
     )
+    recip = 0
+    if kind == "cavity" and not _is_tensor(component.geometry.radius):
+        recip = scalar_division(like.dtype, like.device)
     if needs_grad:
         t, normals, hit, n_geom, t_adv, t_local = _IntersectFunction.apply(
-            kind, nports, *fields, rays.alive, t_min, xf, gp, ports
+            kind, nports, recip, *fields, rays.alive, t_min, xf, gp, ports
         )
     else:
         # Strided fields are passed as they are (a Warp array carries its
         # strides): the ray state is often a column of an (N, 3) product, and
         # a copy per field would be three more launches per component.
         t, normals, hit, n_geom, t_adv, t_local = torch.ops.optiland_nsq.intersect_component(
-            kind, *fields, rays.alive, t_min, xf, gp, ports, nports,
+            kind, *fields, rays.alive, t_min, xf, gp, ports, nports, recip,
         )
     component._local_root = (t_adv, t_local)
     return t, normals, hit, n_geom
