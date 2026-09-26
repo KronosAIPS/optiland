@@ -429,6 +429,132 @@ def transport_axis(e, k):
 
 
 # ---------------------------------------------------------------------------
+# The thin-film adapter: s and p coefficients in this module's convention
+# ---------------------------------------------------------------------------
+
+
+class SPCoefficients(NamedTuple):
+    """What a coated (or bare, or metallic) interface gives a Mueller matrix.
+
+    Attributes:
+        Rs, Rp, Ts, Tp: Power reflectances and transmittances, per ray.
+        xr_re, xr_im: ``Re`` and ``Im`` of ``r_p r_s*`` in this module's
+            convention (the reflection's ``m22`` and ``m23``).
+        xt_cos, xt_sin: ``cos`` and ``sin`` of ``Delta = arg(t_p t_s*)``
+            (``(1, 0)`` where either transmittance is zero).
+        phase_valid: Per-ray mask, False where the thin-film module's phases
+            are not in either time convention (a coated interface beyond the
+            critical angle; see :func:`thin_film_sp`). The power terms are
+            right everywhere.
+    """
+
+    Rs: object
+    Rp: object
+    Ts: object
+    Tp: object
+    xr_re: object
+    xr_im: object
+    xt_cos: object
+    xt_sin: object
+    phase_valid: object
+
+    def reflection(self) -> InterfaceMueller:
+        """The reflection element: ``m00 = (R_s + R_p) / 2`` and the phase terms."""
+        return InterfaceMueller(
+            0.5 * (self.Rs + self.Rp), 0.5 * (self.Rp - self.Rs), self.xr_re, self.xr_im
+        )
+
+    def transmission(self) -> InterfaceMueller:
+        """The transmission element: ``m00 = (T_s + T_p) / 2`` and ``sqrt(T_s T_p) e^{i Delta}``."""
+        return transmission_mueller(self.Ts, self.Tp, phase=(self.xt_cos, self.xt_sin))
+
+
+def _material_nk(material, wavelength_um):
+    """Real ``n`` and ``k`` of a thin-film stack's material at the rays' wavelengths."""
+    if be.get_backend() == "torch" and hasattr(wavelength_um, "detach"):
+        n = material._calculate_n(wavelength_um)
+        k = material._calculate_k(wavelength_um)
+    else:
+        n = material.n(wavelength_um)
+        k = material.k(wavelength_um)
+    return be.atleast_1d(n), be.atleast_1d(k)
+
+
+def thin_film_sp(stack, wavelength_um, cos_theta_i) -> SPCoefficients:
+    """The fork's thin-film module's s and p results, in this module's convention.
+
+    ``ThinFilmStack.compute_rtRTA_elementwise(..., "s" | "p")`` gives ``R`` and
+    ``T`` right to about 1e-15 at float64 on bare, totally reflecting,
+    metallic and coated interfaces. Its complex reflection amplitudes need two
+    corrections before they are Mueller phase terms, each pinned by a test
+    (``tests/nonsequential/test_nsq_polarization_thin_film.py``):
+
+    1. **The sign of ``r_p``.** The module's ``p`` admittance is
+       ``eta_p = n / cos theta``, which gives ``r_p`` with the opposite sign to
+       the Fresnel convention of the catalogue's analytic reference; ``r_p`` is
+       negated.
+    2. **The time convention.** The module's layer matrices and its complex
+       index (entered through ``n - i k``) are in the ``exp(+i omega t)``
+       convention, so for a stack with at least one layer, and for an
+       absorbing substrate or incident medium, its reflection phase is the
+       complex conjugate of this module's; it is conjugated. For a bare,
+       lossless interface below the critical angle both amplitudes are real
+       and nothing changes; beyond it the module's evanescent root is this
+       module's (``cos_t = +i kappa``) and nothing is conjugated.
+
+    Its transmission amplitudes carry a conjugation of their own, and their
+    relative phase ``arg(t_p t_s*)`` agrees with an independent
+    ``exp(-i omega t)`` characteristic-matrix calculation as it is.
+
+    One case is outside both conventions: a stack **with layers** met beyond
+    the critical angle of its substrate (a coated face used in total internal
+    reflection). There the module mixes the ``exp(+i omega t)`` layers with
+    the ``exp(-i omega t)`` evanescent root, and its relative phase matches
+    neither convention (measured: -34.00 degrees against -29.22 degrees at
+    60 degrees for one quarter-wave layer of 1.38 between 1.5 and 1.0). Those
+    lanes are flagged in ``phase_valid``; the power terms stay right.
+
+    Args:
+        stack: A configured ``optiland.thin_film.ThinFilmStack``.
+        wavelength_um: Per-ray wavelength [um].
+        cos_theta_i: Per-ray ``|cos theta_i|`` in the incident medium.
+
+    Returns:
+        :class:`SPCoefficients`, per ray, real arrays in the working dtype.
+    """
+    cos_theta_i = be.clip(cos_theta_i, -1.0, 1.0)
+    aoi = be.arccos(cos_theta_i)
+    s = stack.compute_rtRTA_elementwise(wavelength_um, aoi, polarization="s")
+    p = stack.compute_rtRTA_elementwise(wavelength_um, aoi, polarization="p")
+    rs, rp = s["r"], -p["r"]
+    x_r = rp * be.conj(rs)
+
+    n0, k0 = _material_nk(stack.incident_material, wavelength_um)
+    ns, ks = _material_nk(stack.substrate_material, wavelength_um)
+    absorbing = (k0 > 0) | (ks > 0)
+    everywhere = be.ones_like(ks) > 0
+    if stack.layers:
+        conjugate = everywhere
+        sin2_t = (n0 / ns) ** 2 * (1.0 - cos_theta_i**2)
+        phase_valid = ~((sin2_t >= 1.0) & ~absorbing)
+    else:
+        conjugate = absorbing
+        phase_valid = everywhere
+    re = be.real(x_r)
+    im = be.where(conjugate, -be.imag(x_r), be.imag(x_r))
+
+    x_t = p["t"] * be.conj(s["t"])
+    mag = be.abs(x_t)
+    nonzero = mag > 0
+    safe = be.where(nonzero, mag, be.ones_like(mag))
+    xt_cos = be.where(nonzero, be.real(x_t) / safe, be.ones_like(mag))
+    xt_sin = be.where(nonzero, be.imag(x_t) / safe, be.zeros_like(mag))
+    return SPCoefficients(
+        s["R"], p["R"], s["T"], p["T"], re, im, xt_cos, xt_sin, phase_valid
+    )
+
+
+# ---------------------------------------------------------------------------
 # Full 4x4 matrices, for tests and reports (NumPy, float64)
 # ---------------------------------------------------------------------------
 
