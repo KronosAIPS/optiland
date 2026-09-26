@@ -110,6 +110,38 @@ def bucketed_width(n_live: int, n_now: int, min_width: int = BUCKET_MIN_WIDTH) -
     return width if width < n_now else n_now
 
 
+def birth_flux_like(flux, per_ray):
+    """A bundle's birth weights, every ray given ``per_ray``.
+
+    The weight a source hands each of the ``N`` rays of its budget is
+    ``total_flux / N``, computed once. A batch of ``b < N`` rays used to be
+    rescaled from the source's own ``total_flux / b`` by ``b / N``, and
+    ``(total_flux / b) * (b / N)`` rounds differently from ``total_flux / N``
+    for some ``b``: a ray born in a remainder batch carried a weight one unit
+    in the last place off its siblings (KronosNSRT issue 24; section 10.3 of
+    the theory requires per-ray weights bit-identical across batch sizes).
+
+    The array is built the way the sources build theirs (``ones * w`` for a
+    tensor, a filled array otherwise), so a ray of a partial batch carries
+    exactly the bytes a ray of a full batch carries, and a ``per_ray`` that
+    is a tensor keeps its autograd graph.
+
+    Args:
+        flux: The bundle's flux as ``source.generate`` built it, shape (b,).
+        per_ray: ``total_flux / N``: a Python float or a 0-dim tensor.
+
+    Returns:
+        An array or tensor like ``flux``, every entry ``per_ray``.
+    """
+    if be.is_torch_tensor(flux):
+        import torch  # noqa: PLC0415
+
+        return torch.ones_like(flux) * per_ray
+    if be.is_torch_tensor(per_ray):
+        return be.ones(np.shape(flux)[0]) * per_ray
+    return np.full(np.shape(flux), per_ray, dtype=np.asarray(flux).dtype)
+
+
 def _cull_to_budget(
     spawned: NSQRayBundle, headroom: int, rng
 ) -> tuple[NSQRayBundle, np.ndarray, np.ndarray]:
@@ -924,10 +956,13 @@ class ArrayBackend(TracerBackend):
                 rays = source.generate(ray_id, self.rng)
                 # source.generate() spreads the source's whole total_flux over
                 # the rays it is asked for, so a batched source would re-emit
-                # the full flux once per batch. Rescale to this batch's share
-                # of the source's ray budget. A no-op when batch == the budget.
+                # the full flux once per batch. Every ray of the source carries
+                # the one weight total_flux / source_num_rays, whatever batch it
+                # is born in. A no-op when batch == the budget.
                 if batch != source_num_rays:
-                    rays.flux = rays.flux * (batch / source_num_rays)
+                    rays.flux = birth_flux_like(
+                        rays.flux, source.total_flux / source_num_rays
+                    )
 
                 rays = self._prepare_bundle(rays)
                 path_recorder.log_birth(rays, source_name)
