@@ -87,9 +87,19 @@ class BaseComponent(ABC):
         The trace loop calls it after lowering the scene, so a component moved between two traces is
         re-read; inside the loop the transform is then a resident pair of arrays and no host round trip
         is made per bounce (the earlier per-call read and re-upload was the last synchronisation left).
+
+        A placement that carries a gradient is attached here, once per trace
+        (:func:`~optiland.nonsequential.parameter_register.attach_placement`):
+        the value stays the host build's, the derivative flows to the tensors.
         """
+        from optiland.nonsequential.parameter_register import (  # noqa: PLC0415
+            attach_placement,
+        )
+
         translation, rot = _get_transform(self.cs)
-        self._be_transform = (be.array(translation), be.array(rot))
+        self._be_transform = attach_placement(
+            self.cs, be.array(translation), be.array(rot)
+        )
         self._be_transform_key = _backend_key()
 
     def backend_transform(self):

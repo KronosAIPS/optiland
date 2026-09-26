@@ -354,8 +354,16 @@ class BaseDetector(ABC):
             ``(translation, rotation)`` as arrays of the active backend.
         """
         if self._frame is None:
+            from optiland.nonsequential.parameter_register import (  # noqa: PLC0415
+                attach_placement,
+            )
+
             translation, rot = _get_transform(self.cs)
-            self._frame = (be.array(translation), be.array(rot))
+            # Attached when the placement carries a gradient: the value is
+            # the host build's, the derivative flows to the tensors.
+            self._frame = attach_placement(
+                self.cs, be.array(translation), be.array(rot)
+            )
         return self._frame
 
     def invalidate_frame(self) -> None:
