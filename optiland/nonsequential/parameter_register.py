@@ -72,6 +72,12 @@ Gradient classes (chapter 09 sections 9.2, 9.3 and 9.7):
     refuse a gradient-carrying value today, so the class is listed in
     :data:`CONTRACT` and seldom meets a live tensor.
 
+Forward mode: a dual tensor of ``torch.autograd.forward_ad`` counts as a
+parameter to attach, so its tangent reaches the outputs (the cross-check of
+R-09-9); the dead-parameter check covers reverse-mode entries only. The
+functional transforms of ``torch.func`` (``jvp``, ``grad``) are not supported:
+the host build reads the placement's value, which their wrapped tensors refuse.
+
 Nothing in this module runs when no tensor in the scene requires a gradient:
 the register is empty, :func:`attach_placement` returns the host transform it
 is given, and every number of the trace is the one it always was.
