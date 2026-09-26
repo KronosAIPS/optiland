@@ -154,6 +154,32 @@ def _cull_to_budget(
 
 
 
+def detector_labels(scene, detectors) -> list[str]:
+    """The name each detector is known by, in the scene's detector order.
+
+    The registry name the detector was added under (the key of
+    ``SimulationResult.detectors``), else the detector's own ``name``, else
+    ``detector_<i>``. A detector built from a config carries an empty
+    ``name`` of its own, so the path record and the result must both read
+    the registry, or a detector hit is logged with an empty surface name
+    (issue 27 of the research repository).
+
+    Args:
+        scene: The scene being traced.
+        detectors: ``scene.detectors``, read once by the caller.
+
+    Returns:
+        One label per detector.
+    """
+    registry_names = get_detector_names(scene)
+    return [
+        registry_names[i]
+        if i < len(registry_names)
+        else (getattr(det, "name", "") or f"detector_{i}")
+        for i, det in enumerate(detectors)
+    ]
+
+
 class _BounceContext:
     """What one bounce of a trace reads and books, fixed for the whole trace.
 
@@ -194,6 +220,7 @@ class _BounceContext:
     ) -> None:
         self.surfaces = scene.surfaces
         self.detectors = scene.detectors
+        self.detector_labels = detector_labels(scene, self.detectors)
         self.ir = ir
         self.path_recorder = path_recorder
         self.allocator = allocator
@@ -292,9 +319,8 @@ def bounce_body(backend, ctx: _BounceContext, rays: NSQRayBundle):
         mask_di = det_first & (det_idx == di)
         if backend._empty(mask_di):
             continue
-        det_name = getattr(det, "name", f"detector_{di}")
         ctx.path_recorder.log_hits(
-            rays, mask_di, det_name, t_offset=det_t_safe
+            rays, mask_di, ctx.detector_labels[di], t_offset=det_t_safe
         )
         det.record(rays, det_t_safe, mask_di)
         # Arriving flux by ghost order; a no-op unless the
@@ -1067,9 +1093,9 @@ class ArrayBackend(TracerBackend):
         reflection_histograms: dict[str, object] = {}
         total_flux_detected = 0.0
         total_flux_tapped = 0.0
-        det_names = get_detector_names(scene)
+        det_names = detector_labels(scene, scene.detectors)
         for i, det in enumerate(scene.detectors):
-            name = det_names[i] if i < len(det_names) else (det.name or f"detector_{i}")
+            name = det_names[i]
             result = det.get_result()
             detector_results[name] = result
             histogram = det.reflection_histogram()
