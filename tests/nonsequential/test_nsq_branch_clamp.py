@@ -145,7 +145,14 @@ class TestTheDrawThatRoundsToOne:
 
     def test_float32_transmit_weight_is_bounded(self, torch_backend):
         u, transmitted, weight, grad = self._interact("float32")
-        assert u == 1.0  # the draw this test is about
+        # The draw this test is about. Until the float32 uniform was formed
+        # from the top 24 bits of the 32-bit draw (the research repository's
+        # issue 62, the maintainer's ruling of 2026-09-25), this draw rounded
+        # to exactly 1.0; it is now the largest float32 uniform, 1 - 2**-24,
+        # which still lies above the clamp's upper bound 1 - 2**-22 and so
+        # still takes the transmit branch at the clamp. No keyed float32 draw
+        # is 1.0 any more (test_nsq_uniform24.py pins that).
+        assert u == 1.0 - U32
         assert transmitted
         # T / (1 - p) with 1 - p = 4 u32: 2**-26 / 2**-22. Before the bound
         # moved, p was 1.0 and this read T / tiny_for, about 1.4e11.
