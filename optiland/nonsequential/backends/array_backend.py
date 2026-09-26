@@ -777,6 +777,14 @@ class ArrayBackend(TracerBackend):
 
         self.rng = self._trace_rng(seed)
 
+        # The parameter register (docs/theory/09_differentiation.md R-09-2):
+        # every tensor of the scene that requires a gradient, filled here,
+        # before the scene is uploaded, and checked after the loop. Empty --
+        # and every step below exactly what it was -- when nothing requires
+        # one. A backend without autograd refuses a non-empty one (R-09-3).
+        register = ParameterRegister.from_scene(scene)
+        refuse_without_autograd(register)
+
         # Reset detectors and absorber stats
         for det in scene.detectors:
             det.reset()
@@ -804,12 +812,6 @@ class ArrayBackend(TracerBackend):
         # The per-bounce interaction loop below is driven by this IR, not by
         # iterating scene.surfaces and branching on Python class identity.
         ir = lower(scene, strict=False)
-        # The parameter register (docs/theory/09_differentiation.md R-09-2):
-        # every tensor of the scene that requires a gradient, filled here, at
-        # upload, and checked after the loop. Empty -- and every step below
-        # exactly what it was -- when nothing requires one.
-        register = ParameterRegister.from_scene(scene)
-        refuse_without_autograd(register)
         for component in scene.surfaces:
             component.refresh_backend_transform()
         self._check_sampling_support(ir)

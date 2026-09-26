@@ -39,11 +39,14 @@ issue 31):
   :meth:`ParameterRegister.check` walks the autograd graph of every output of
   the trace (detector buffers and results, surface ledgers) and raises
   :class:`DeadParameterError` for every registered parameter the graph does
-  not reach, naming its owner, its name, the stage at which its path ends and
-  the reason the register knows: *detached by contract* (a parameter whose
-  only effect is a boundary term, or one chapter 09 detaches), or *cannot
-  influence the tallies in this scene* (no ray reached its owner, or none of
-  the reached paths depends on it). A silent zero is what R-09-5 forbids.
+  not reach, and for every one whose owners no ray reached (it can sit on the
+  graph through the discarded branch of a nearest-hit ``where`` and still have
+  a derivative that is zero by structure), naming its owner, its name, the
+  stage at which its path ends and the reason the register knows: *detached
+  by contract* (a parameter whose only effect is a boundary term, or one
+  chapter 09 detaches), or *cannot influence the tallies in this scene* (no
+  ray reached its owner, or no output depends on it). A silent zero is what
+  R-09-5 forbids.
 
 Gradient classes (chapter 09 sections 9.2, 9.3 and 9.7):
 
@@ -173,7 +176,7 @@ _MAX_DEPTH = 3
 
 
 class DeadParameterError(RuntimeError):
-    """A registered parameter reached no output of the trace (R-09-5).
+    """A registered parameter has no live derivative path to the trace's outputs (R-09-5).
 
     Attributes:
         dead: The dead parameters, each ``(owner, name, stage, reason)``.
@@ -189,9 +192,10 @@ class DeadParameterError(RuntimeError):
             for owner, name, stage, reason in dead
         ]
         super().__init__(
-            "parameters requested for differentiation reach no output of the "
-            "trace (a gradient of None, not a zero; docs/theory/"
-            "09_differentiation.md R-09-5):\n  " + "\n  ".join(lines)
+            "parameters requested for differentiation have no derivative path "
+            "to any output of the trace, or only one that is zero by "
+            "structure; a gradient here would be a silent zero or None "
+            "(docs/theory/09_differentiation.md R-09-5):\n  " + "\n  ".join(lines)
         )
 
 
@@ -247,7 +251,22 @@ class RegisteredParameter:
 
 
 def _requires_grad(value: Any) -> bool:
-    return bool(getattr(value, "requires_grad", False)) and hasattr(value, "grad_fn")
+    """True for a tensor that carries a derivative: reverse mode, or a forward-mode tangent."""
+    if not hasattr(value, "grad_fn"):
+        return False
+    if bool(getattr(value, "requires_grad", False)):
+        return True
+    return _has_tangent(value)
+
+
+def _has_tangent(value: Any) -> bool:
+    """True for a forward-mode dual tensor (``torch.autograd.forward_ad``) with a tangent."""
+    try:
+        from torch.autograd import forward_ad  # noqa: PLC0415
+
+        return forward_ad.unpack_dual(value).tangent is not None
+    except Exception:  # noqa: BLE001 - outside a dual level, or not a torch tensor
+        return False
 
 
 def _is_engine_object(value: Any) -> bool:
@@ -433,7 +452,7 @@ def _classify(kind: str, path: str) -> tuple[str, str]:
     leaf = path.rsplit(".", 1)[-1]
     if kind == "source" and leaf in _SOURCE_CONTRACT:
         return _SOURCE_CONTRACT[leaf]
-    if kind == "detector" and "." not in path and leaf in _DETECTOR_CONTRACT:
+    if kind == "detector" and leaf in _DETECTOR_CONTRACT:
         return _DETECTOR_CONTRACT[leaf]
     if leaf in _GEOMETRY_EXTENT and path.startswith("geometry."):
         return BOUNDARY_ONLY, "the finite-extent test (a boolean)"
@@ -450,14 +469,19 @@ def _walk(obj: Any, prefix: str, depth: int, seen: set[int]) -> Iterator[tuple[s
     attrs = getattr(obj, "__dict__", None)
     if not attrs:
         return
-    for key, value in list(attrs.items()):
-        if key.startswith("_") or key in _SKIP_ATTRS:
-            continue
-        path = f"{prefix}{key}"
+    items = [
+        (key, value)
+        for key, value in list(attrs.items())
+        if not key.startswith("_") and key not in _SKIP_ATTRS
+    ]
+    # The object's own parameters first, so a tensor it shares with a nested
+    # object (a detector's width is also its plane's) is named by the owner.
+    for key, value in items:
         if _requires_grad(value):
-            yield path, value
-        elif _is_engine_object(value):
-            yield from _walk(value, path + ".", depth + 1, seen)
+            yield f"{prefix}{key}", value
+    for key, value in items:
+        if not _requires_grad(value) and _is_engine_object(value):
+            yield from _walk(value, f"{prefix}{key}.", depth + 1, seen)
 
 
 class ParameterRegister:
@@ -582,14 +606,33 @@ class ParameterRegister:
             DeadParameterError: If any entry is dead, listing each with the
                 stage its path ends at and the reason.
         """
+        reached = reached or {}
         live = self.live(list(roots))
         dead: list[tuple[str, str, str, str]] = []
         for i, e in enumerate(self.entries):
-            if live[i]:
+            if not getattr(e.tensor, "requires_grad", False):
+                # A forward-mode tangent only: there is no recorded graph to
+                # walk. Forward mode is the cross-check of chapter 09 (R-09-9),
+                # run against a reverse-mode gradient, not a user mode yet.
                 continue
-            dead.append((e.owner, e.name, e.stage, self._reason(e, reached or {})))
+            if live[i] and not self._unreached(e, reached):
+                continue
+            dead.append((e.owner, e.name, e.stage, self._reason(e, reached)))
         if dead:
             raise DeadParameterError(dead, result=result)
+
+    @staticmethod
+    def _unreached(e: RegisteredParameter, reached: dict[str, int]) -> bool:
+        """True when every owner of ``e`` whose reach is known was reached by no ray.
+
+        Such a parameter can be on the recorded graph -- a surface's
+        intersection is evaluated for every ray and discarded by a ``where``
+        for the rays that hit something nearer -- and still have a derivative
+        that is zero by structure: only the discarded branch depends on it.
+        R-09-5 forbids returning that zero silently, so it counts as dead.
+        """
+        counts = [reached[o] for o in (e.owner, *e.also_owned_by) if o in reached]
+        return bool(counts) and not any(counts)
 
     @staticmethod
     def _reason(e: RegisteredParameter, reached: dict[str, int]) -> str:
@@ -608,6 +651,7 @@ class ParameterRegister:
             return (
                 "in this scene it cannot influence the tallies: no ray reached "
                 + ", ".join(owners)
+                + " (a derivative that is zero by structure, not a measured zero)"
             )
         return (
             "in this scene it cannot influence the tallies: no output of the "
@@ -692,9 +736,14 @@ def check_after_trace(register: ParameterRegister, scene, detector_results, hit_
     if blanket:
         return
     reached: dict[str, int] = {}
-    names = [owner for owner, kind, _ in _scene_objects(scene) if kind == "surface"]
+    objects = list(_scene_objects(scene))
+    names = [owner for owner, kind, _ in objects if kind == "surface"]
     for name, count in zip(names, hit_counts, strict=False):
         reached[name] = reached.get(name, 0) + int(count)
+    for owner, kind, _ in objects:
+        hits = getattr(detector_results.get(owner), "num_rays_hit", None)
+        if kind == "detector" and hits is not None:
+            reached[owner] = int(hits)
     register.check(trace_outputs(scene, detector_results), reached=reached, result=result)
 
 
