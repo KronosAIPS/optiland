@@ -18,12 +18,25 @@ engines with the same numbers.
 
 The intersection
 ----------------
-1. **Seeds.** Both roots of the base conic's quadratic, from
-   :meth:`ConicGeometry._quadratic_roots` (the stable root form of section
-   7.4). A seed is usable where the quadratic was well posed, the root is
-   finite, and the point lies on the sheet the sag function describes -- the
-   conic kind's own sheet test. A ray whose base conic has no usable root is a
-   miss with reason ``no_seed``.
+1. **Three candidates per ray.**
+
+   a. *The base conic's two roots*, from
+      :meth:`ConicGeometry._quadratic_roots` (the stable root form of section
+      7.4). A seed is usable where the quadratic was well posed, the root is
+      finite, and the point lies on the sheet the sag function describes --
+      the conic kind's own sheet test.
+   b. *A first-crossing scan.* The ray's segment inside the region that
+      holds every crossing inside the aperture -- the aperture cylinder cut
+      by the slab ``z_lo <= z <= z_hi`` containing the sag over the aperture
+      (:meth:`sag_range`) -- is sampled at ``scan_samples + 1`` points
+      (default 33); the first sign change of ``f`` gives a bracket and a
+      regula-falsi seed. It finds the roots the conic seeds cannot: a ray
+      the base conic misses, and a nearer crossing of a strongly aspheric
+      (non-monotone) surface where a conic seed converges to a farther one.
+      Two crossings closer together than one sample interval are left to the
+      conic seeds.
+
+   A candidate without a seed is a miss with reason ``no_seed``.
 2. **Newton on** ``f(t) = z(t) - sag(r(t))``, ``f'(t) = d_z - sigma (x d_x +
    y d_y)`` with ``sigma = (d sag / d r) / r``, run from each seed for a fixed
    number of masked iterations (``max_iterations``, default 16). No lane is
@@ -31,17 +44,20 @@ The intersection
    ``where`` and rides along, so the iteration count is a constant a CUDA
    graph can record (the graph-replay contract of
    ``backends/graph_replay.py``).
-3. **The residual at the seed is the polynomial alone.** The seed solves the
-   base conic exactly in exact arithmetic, so the first residual is taken as
-   ``-P(r)``; the conic part's rounding residual is not re-evaluated there.
-   With every coefficient zero the first residual is exactly zero, the lane is
-   converged before any step, and the kind returns the conic kind's numbers
-   bit for bit (tested).
+3. **The residual at a base-conic seed is the polynomial alone.** The seed
+   solves the base conic exactly in exact arithmetic, so the first residual is
+   taken as ``-P(r)``; the conic part's rounding residual is not re-evaluated
+   there. With every coefficient zero the first residual is exactly zero, the
+   lane is converged before any step, and the kind returns the conic kind's
+   numbers bit for bit (tested).
 4. **Convergence:** ``|f| <= k_res ulp(max(|x|, |y|, |z|, 1)) |grad G|``,
    ``G = z - sag``: ``k_res`` (default 32) ulps of the working dtype at the
    point's coordinate scale, times the gradient norm that converts a position
    rounding into a residual (``docs/theory/08_precision.md`` section 8.7; the
-   same 32-ulp rule as the NURBS prototype of the CAD study).
+   same 32-ulp rule as the NURBS prototype of the CAD study). A lane that
+   converges takes one more Newton step (a polish: quadratic convergence
+   takes it from the tolerance to the rounding floor) and freezes; a residual
+   of exactly zero makes that step zero.
 5. **The guard and the fallbacks** (R-07-7), in this order, every iteration:
 
    - *Domain test before any sag evaluation.* ``1 - (1 + K) c^2 r^2`` must
@@ -49,26 +65,31 @@ The intersection
      square-rooted (the radicand is replaced by 1 on that lane before the
      root, so no NaN reaches either pass).
    - *Bracket.* Every evaluated iterate with ``f < 0`` or ``f > 0`` becomes
-     the corresponding end of a bracket. Once both ends exist, a Newton
-     iterate outside the open bracket is replaced by the bracket's midpoint
-     (bisection, one bit per step, unconditional).
-   - *Tangent guard.* ``|f'| >= eta |grad G|`` with ``eta = 1e-3`` by
-     default: ``f'`` is ``cos(theta_i) |grad G|`` up to sign, so this is a
-     test on the cosine of incidence. A step that fails it bisects when a
-     bracket exists and ends the lane as ``grazing`` when none does.
+     the corresponding end of a bracket (the scan candidate starts with one).
+     Once both ends exist, a Newton iterate strictly inside the bracket is
+     taken whatever the slope, and one outside is replaced by the bracket's
+     midpoint (bisection, one bit per step, unconditional).
+   - *Tangent guard*, without a bracket: ``|f'| >= eta |grad G|`` with ``eta =
+     1e-3`` by default. ``f'`` is ``cos(theta_i) |grad G|`` up to sign, so
+     this is a test on the cosine of incidence; a step that fails it ends the
+     lane as ``grazing``.
    - *Domain damping.* An iterate that left the domain is pulled halfway back
      to the last iterate inside it when no bracket exists (the domain is an
      interval along the ray, ``r^2(t)`` being convex, so a bracket's midpoint
      is always inside); a seed outside the domain ends as ``domain``.
    - *Hard cap.* A lane still unconverged after ``max_iterations`` steps is a
-     miss with reason ``not_converged``: its last iterate is never returned.
+     miss with reason ``not_converged`` (``aperture`` when its last iterate
+     lies outside the aperture): its last iterate is never returned.
 
 6. **Acceptance** of a converged root: finite, ``t > eps`` (the caller's
    self-intersection threshold), inside the circular aperture, and -- when the
    refinement took at least one step -- the tangent guard holding at the root
    itself (a root found at ``cos(theta_i) < eta`` is a ``grazing`` miss, the
-   status test T-07-6 asks for). The nearer accepted candidate wins, as in the
-   conic kind.
+   status test T-07-6 asks for). The two conic candidates are picked exactly
+   as the conic kind picks its roots; the scan candidate replaces the pick
+   only where it is a distinct nearer root (nearer by more than the two
+   roots' own uncertainties along the ray) or where the conic candidates found
+   none.
 
 Every miss carries its reason in :attr:`last_status` (see
 :data:`MISS_REASONS`), a device array of the last call, read to the host only
@@ -111,25 +132,26 @@ from optiland.nonsequential.components.geometry.analytic.conic import ConicGeome
 from optiland.nonsequential.components.geometry.base import AABB, AnalyticGeometry
 
 #: Per-ray status codes of :attr:`_AsphereGeometry.last_status`. A missed
-#: ray's code is the largest of its two candidates' codes: the ordering runs
-#: from "never started" to "converged, then rejected", so a miss is reported by
-#: the candidate that got furthest.
+#: ray's code is the largest of its three candidates' codes. The geometric
+#: misses (no seed, behind the ray, outside the aperture) come first and the
+#: refinement's own give-ups (domain, grazing, not converged) last, so a miss
+#: that could have been a lost hit is always reported as one.
 HIT = 0
 NO_SEED = 1
-DOMAIN = 2
-GRAZING = 3
-NOT_CONVERGED = 4
-BEHIND = 5
-APERTURE = 6
+BEHIND = 2
+APERTURE = 3
+DOMAIN = 4
+GRAZING = 5
+NOT_CONVERGED = 6
 
 MISS_REASONS = {
     HIT: "hit",
     NO_SEED: "no_seed",
+    BEHIND: "behind",
+    APERTURE: "aperture",
     DOMAIN: "domain",
     GRAZING: "grazing",
     NOT_CONVERGED: "not_converged",
-    BEHIND: "behind",
-    APERTURE: "aperture",
 }
 
 #: Fixed Newton iteration count (the hard cap of R-07-7). The theory's measured
@@ -422,7 +444,16 @@ class _AsphereGeometry(AnalyticGeometry):
             fp_last = be.where(active, fp, fp_last)
             gn_last = be.where(active, gn, gn_last)
             tol_last = be.where(active, tol, tol_last)
+            guard = be.abs(fp) >= eta * gn
+            safe_fp = be.where(guard, fp, ones)
+            t_newton = t - f / safe_fp
             done = active & conv
+            # Polish: a lane that has just converged takes one more Newton
+            # step (quadratic convergence puts it at the rounding floor), then
+            # freezes. With a residual of exactly zero -- a base-conic seed
+            # and zero coefficients -- the step is zero and t is unchanged.
+            polish = done & guard & be.isfinite(t_newton)
+            t = be.where(polish, t_newton, t)
             status = be.where(done, self._code(HIT, t0), status)
             active = active & ~conv
             if it == self.max_iterations:
@@ -439,11 +470,15 @@ class _AsphereGeometry(AnalyticGeometry):
             lo = be.minimum(t_neg, t_pos)
             hi = be.maximum(t_neg, t_pos)
 
-            guard = be.abs(fp) >= eta * gn
-            safe_fp = be.where(guard, fp, ones)
-            t_newton = t - f / safe_fp
+            # Inside a bracket a Newton step is safe whatever the slope: it is
+            # taken when it lands strictly inside, and bisection replaces it
+            # otherwise. Without a bracket the tangent guard decides.
             inside = (t_newton > lo) & (t_newton < hi)
-            newton_ok = dom & guard & (~bracket | inside) & be.isfinite(t_newton)
+            newton_ok = (
+                dom
+                & be.isfinite(t_newton)
+                & ((bracket & inside) | (~bracket & guard))
+            )
             t_mid = 0.5 * (t_neg + t_pos)
             t_back = 0.5 * (t_prev + t)
 
