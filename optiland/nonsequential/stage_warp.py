@@ -525,9 +525,17 @@ def _scalar_vector(values, like: torch.Tensor) -> torch.Tensor:
     return torch.cat(parts)
 
 
+_FLOOR_TINY: dict = {}
+
+
 def _floor_and_tiny(like: torch.Tensor) -> tuple[float, float]:
-    ones = torch.ones((), dtype=like.dtype)
-    return float(_tol.radicand_floor(ones)), float(_tol.tiny_for(like))
+    """The radicand floor and the division guard of the working dtype, once per dtype."""
+    cached = _FLOOR_TINY.get(like.dtype)
+    if cached is None:
+        ones = torch.ones((), dtype=like.dtype)
+        cached = (float(_tol.radicand_floor(ones)), float(_tol.tiny_for(like)))
+        _FLOOR_TINY[like.dtype] = cached
+    return cached
 
 
 def _cavity_scalars(geometry, like):
@@ -755,9 +763,11 @@ def intersect_component(component, kind: str, rays, t_min):
             kind, nports, *fields, rays.alive, t_min, xf, gp, ports
         )
     else:
+        # Strided fields are passed as they are (a Warp array carries its
+        # strides): the ray state is often a column of an (N, 3) product, and
+        # a copy per field would be three more launches per component.
         t, normals, hit, n_geom, t_adv, t_local = torch.ops.optiland_nsq.intersect_component(
-            kind, *[f.contiguous() for f in fields], rays.alive.contiguous(),
-            t_min.contiguous(), xf, gp, ports, nports,
+            kind, *fields, rays.alive, t_min, xf, gp, ports, nports,
         )
     component._local_root = (t_adv, t_local)
     return t, normals, hit, n_geom
