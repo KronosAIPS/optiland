@@ -23,11 +23,52 @@ from optiland.nonsequential.rng import EventSlot
 if TYPE_CHECKING:
     from optiland.nonsequential.rng import NSQRng
 
-# Largest reachable direction-cosine offset: both the specular and the
-# scattered direction lie in the unit disk, so |beta - beta0| <= 2.
+# Largest reachable direction-cosine offset: both the reference and the
+# scattered direction lie in the unit disk, so |beta - beta0| <= 2. The radial
+# table runs to here because an oblique reference reaches offsets up to
+# 1 + |beta0|; which of them a given reference reaches is decided per sample
+# (``sample``), never by the table.
 _BETA_MAX = 2.0
-# Resolution of the tabulated radial inverse CDF.
-_TABLE_SIZE = 4096
+# Nodes of the tabulated radial CDF: geometric from a small fraction of the
+# break point to _BETA_MAX, so the knee of every lobe is resolved to a fixed
+# relative step (0.2 percent at 8192 nodes), plus the nodes 0, 1 and 2.
+_TABLE_SIZE = 8192
+# Gauss-Legendre points per table cell for the radial integral.
+_GAUSS_POINTS = 8
+# Incidence grid of the hemispherical-TIS table: |beta0| = sin(theta_i) at
+# theta_i uniform in [0, 90] degrees, which is denser in |beta0| towards
+# grazing, where the table varies fastest. The linear interpolation between
+# rows is the table's error; measured against a direct 40 000-point azimuth
+# quadrature at 300 incidences, it is 2.4e-7 relative at worst (80 degrees,
+# l0 = 0.01, s = 2) at this size, 1.5e-5 at 513 rows.
+_INCIDENCE_SIZE = 4097
+# Midpoints over the half period of the azimuth for that table (the
+# integrand is even in the azimuth measured from beta0); raising it to
+# 16 384 changes the table by less than 1e-9 relative.
+_AZIMUTH_SIZE = 2048
+
+
+def _lerp(x_grid, y_grid, x, size: int):
+    """Piecewise-linear lookup ``y(x)`` on an increasing grid, in the backend.
+
+    One ``searchsorted`` and one interpolation between the bracketing nodes,
+    on tables uploaded beside the ray state. A query equal to a node returns
+    that node's value exactly (the fraction is exactly zero there).
+
+    Args:
+        x_grid: Increasing abscissae, a resident backend array.
+        y_grid: Ordinates, a resident backend array of the same size.
+        x: Query points, shape (N,).
+        size: Number of nodes.
+
+    Returns:
+        ``y`` at ``x``, shape (N,).
+    """
+    j = clamp_int(be.searchsorted(x_grid, x, side="right") - 1, 0, size - 2)
+    x0 = x_grid[j]
+    span = x_grid[j + 1] - x0
+    y0 = y_grid[j]
+    return y0 + (x - x0) / span * (y_grid[j + 1] - y0)
 
 
 class HarveyShackBSDF(BaseBSDF):
@@ -50,6 +91,16 @@ class HarveyShackBSDF(BaseBSDF):
             transmissive lobe, e.g. a diffuser sheet) instead of the
             specular reflection. Defaults to 0.0: a purely reflective
             blur, identical to this class's behaviour before D-5.
+        weight_is_albedo: Left at the base class's True. The lobe is
+            normalised over the directions reachable from each incidence
+            (see :meth:`sample`), so its weight has expectation one; at
+            normal incidence every weight is exactly one and nothing is
+            booked. Off normal incidence a single ray's weight is a sampling
+            weight, and with the flag True the surface books its zero-mean
+            ``1 - weight`` in the coating bin rather than in the sampling
+            residual; the identity (10.1) closes either way. Setting the
+            flag False, which describes this weight, changes an assertion of
+            the fork's suite and waits for the maintainer's ruling.
     """
 
     def __init__(
@@ -72,6 +123,9 @@ class HarveyShackBSDF(BaseBSDF):
         self._beta_grid: np.ndarray | None = None
         self._cdf_grid: np.ndarray | None = None
         self._tis: float | None = None
+        self._tis_disk: float | None = None
+        self._incidence_grid: np.ndarray | None = None
+        self._hemi_grid: np.ndarray | None = None
 
     def _abg(self, beta: np.ndarray) -> np.ndarray:
         """Evaluate the ABg BSDF at a direction-cosine offset.
@@ -84,31 +138,89 @@ class HarveyShackBSDF(BaseBSDF):
         """
         return self.b0 / (1.0 + (beta / self.l0) ** self.s)
 
+    def _radial_nodes(self) -> np.ndarray:
+        """Nodes of the radial table: 0, a geometric ladder to 2, and 1.
+
+        The ladder starts at ``1e-4 * min(l0, 1)``, well inside the lobe's
+        plateau, so every cell spans the same small ratio of offsets and the
+        knee at ``l0`` is resolved whatever its value. The node 1 is exact,
+        so the normal-incidence reach ``|beta - beta0| = 1`` is read off the
+        table without interpolation.
+        """
+        lo = 1e-4 * min(self.l0, 1.0)
+        ladder = np.geomspace(lo, _BETA_MAX, _TABLE_SIZE - 2)
+        nodes = np.unique(np.concatenate([[0.0, 1.0, _BETA_MAX], ladder]))
+        return nodes
+
     def _build_tables(self) -> None:
-        """Build the radial inverse-CDF table and the total integrated scatter.
+        """Build the radial CDF, its inverse, and the hemispherical TIS table.
 
         In direction-cosine space the projected solid angle is
-        ``cos(theta) dOmega = d(beta_x) d(beta_y)``, so the radial measure is
-        ``2 * pi * beta d(beta)`` and
+        ``cos(theta) dOmega = d(beta_x) d(beta_y)``, so about the reference
+        direction ``beta0`` the radial measure is ``2 * pi * delta d(delta)``
+        for the offset ``delta = |beta - beta0|`` and
 
-            TIS = integral of BSDF(beta) * 2 * pi * beta d(beta)
+            C(delta) = integral_0^delta BSDF(t) * 2 * pi * t dt
 
-        over the reachable range ``beta <= _BETA_MAX``. TIS is the fraction of
-        incident power the surface scatters, and it is what each scattered ray
-        carries as its weight.
+        is the lobe's integral over the offsets up to ``delta``, tabulated to
+        ``_BETA_MAX`` by Gauss-Legendre quadrature on every cell.
+
+        A scattered direction exists only where ``|beta| < 1``: the unit disk
+        about the origin, which about ``beta0`` is the offsets with
+        ``delta < delta_max(psi) = -beta0.e + sqrt(1 - (beta0 x e)^2)`` along
+        the azimuth ``e = (cos psi, sin psi)``. The lobe's hemispherical
+        integral at that incidence -- the fraction a lossless surface with
+        this BSDF scatters, chapter 04 section 4.5 -- is therefore
+
+            TIS(beta0) = (1 / 2 pi) integral_0^{2 pi} C(delta_max(psi)) dpsi,
+
+        which at normal incidence (``delta_max = 1`` for every azimuth) is
+        ``C(1)``: chapter 11 section 11.4.24's ``pi b0 l^2 ln(1 + 1/l^2)``
+        for the slope-2 lobe. It depends on ``|beta0|`` only and is
+        tabulated over the incidence angle. Integrating to ``_BETA_MAX``
+        instead counts offsets no propagating direction reaches (issue 18 of
+        the research repository: 15 percent too much at ``l0 = 0.01``).
+
+        ``_cdf_grid`` is ``C / C(_BETA_MAX)`` at the nodes ``_beta_grid``
+        (the inverse CDF the sampler reads), ``_hemi_grid`` is
+        ``TIS(beta0) / C(_BETA_MAX)`` at ``|beta0| = _incidence_grid``,
+        ``_tis`` is the normal-incidence TIS and ``_tis_disk`` is
+        ``C(_BETA_MAX)``.
         """
-        beta = np.linspace(0.0, _BETA_MAX, _TABLE_SIZE)
-        radial = self._abg(beta) * 2.0 * np.pi * beta
+        beta = self._radial_nodes()
+        x_gl, w_gl = np.polynomial.legendre.leggauss(_GAUSS_POINTS)
+        a = beta[:-1, None]
+        h = np.diff(beta)[:, None]
+        t = a + 0.5 * h * (x_gl[None, :] + 1.0)
+        cell = 0.5 * h[:, 0] * ((self._abg(t) * 2.0 * np.pi * t) @ w_gl)
+        cdf = np.concatenate([[0.0], np.cumsum(cell)])
 
-        # Cumulative trapezoidal integral.
-        cdf = np.concatenate(
-            [[0.0], np.cumsum(0.5 * (radial[1:] + radial[:-1]) * np.diff(beta))]
-        )
-        self._tis = float(cdf[-1])
-        # Normalise to a proper CDF. A degenerate (all-zero) integrand would
-        # leave the table flat, so fall back to a uniform CDF in that case.
-        self._cdf_grid = cdf / cdf[-1] if cdf[-1] > 0.0 else np.linspace(0, 1, cdf.size)
+        total = float(cdf[-1])
+        self._tis_disk = total
         self._beta_grid = beta
+        # A degenerate (all-zero) integrand would leave the table flat, so
+        # fall back to a uniform CDF in that case.
+        self._cdf_grid = cdf / total if total > 0.0 else np.linspace(0, 1, cdf.size)
+        i_one = int(np.flatnonzero(beta == 1.0)[0])
+        self._tis = float(cdf[i_one])
+
+        # The hemispherical table, from the same piecewise-linear C the
+        # sampler reads, so the weight it divides by is the mean of the
+        # numerator over the azimuth to the quadrature's accuracy.
+        theta = np.linspace(0.0, 0.5 * np.pi, _INCIDENCE_SIZE)
+        g = np.sin(theta)
+        g[-1] = 1.0
+        psi = (np.arange(_AZIMUTH_SIZE) + 0.5) * (np.pi / _AZIMUTH_SIZE)
+        proj = g[:, None] * np.cos(psi)[None, :]
+        perp = g[:, None] * np.sin(psi)[None, :]
+        dmax = -proj + np.sqrt(np.maximum(1.0 - perp * perp, 0.0))
+        hemi = np.interp(dmax, beta, self._cdf_grid).mean(axis=1)
+        # Normal incidence: delta_max is 1 on every azimuth, so the mean is
+        # the node value itself; set it as such rather than as a sum of
+        # 2048 equal terms, so the sampler's weight there is exactly one.
+        hemi[0] = self._cdf_grid[i_one]
+        self._incidence_grid = g
+        self._hemi_grid = hemi
 
     def _inverse_cdf(self, u):
         """Radial offset for a uniform draw, from the tabulated inverse CDF.
@@ -147,9 +259,29 @@ class HarveyShackBSDF(BaseBSDF):
         b0 = beta[j]
         return b0 + frac * (beta[j + 1] - b0)
 
+    def _forward_cdf(self, delta):
+        """``C(delta) / C(_BETA_MAX)`` from the table, in the backend.
+
+        The same piecewise-linear function :meth:`_inverse_cdf` inverts, so
+        an offset drawn below ``C(delta_max)`` is below ``delta_max``.
+        """
+        cdf = resident_table(self, "cdf", self._cdf_grid)
+        beta = resident_table(self, "beta", self._beta_grid)
+        return _lerp(beta, cdf, delta, self._beta_grid.size)
+
+    def _hemispherical(self, g):
+        """``TIS(|beta0|) / C(_BETA_MAX)`` from the table, in the backend."""
+        grid = resident_table(self, "incidence", self._incidence_grid)
+        hemi = resident_table(self, "hemi", self._hemi_grid)
+        return _lerp(grid, hemi, g, self._incidence_grid.size)
+
     @property
     def total_integrated_scatter(self) -> float:
-        """Fraction of incident power scattered by this surface, in [0, 1].
+        """Fraction of incident power scattered at normal incidence, in [0, 1].
+
+        The lobe's hemispherical integral, ``C(1)`` of :meth:`_build_tables`
+        (for the slope-2 lobe, ``pi b0 l0^2 ln(1 + 1/l0^2)``), not its
+        integral over the direction-cosine disk of radius 2.
 
         Returns:
             TIS, clipped to 1.0.
@@ -157,6 +289,27 @@ class HarveyShackBSDF(BaseBSDF):
         if self._tis is None:
             self._build_tables()
         return min(float(self._tis), 1.0)
+
+    def total_integrated_scatter_at(self, theta_i) -> np.ndarray:
+        """Fraction of incident power scattered at incidence ``theta_i``.
+
+        The hemispherical integral of the lobe centred on the reference
+        direction of that incidence (chapter 04 R-04-9 asks for it over a
+        set of incidence angles): ``TIS(sin(theta_i))`` of
+        :meth:`_build_tables`, read from its table.
+
+        Args:
+            theta_i: Angle of the reference direction from the normal
+                [rad], scalar or array, in [0, pi/2].
+
+        Returns:
+            TIS at each angle, clipped to 1.0, as NumPy values.
+        """
+        if self._hemi_grid is None:
+            self._build_tables()
+        g = np.sin(np.clip(np.asarray(theta_i, dtype=np.float64), 0.0, 0.5 * np.pi))
+        tis = np.interp(g, self._incidence_grid, self._hemi_grid) * self._tis_disk
+        return np.minimum(tis, 1.0)
 
     def sample(
         self,
@@ -171,12 +324,17 @@ class HarveyShackBSDF(BaseBSDF):
         """Sample scattered directions from the ABg lobe about a reference ray.
 
         The scatter offset is drawn directly from the ABg distribution in
-        direction-cosine space: the radial magnitude ``|beta - beta0|`` comes
-        from a tabulated inverse CDF of ``BSDF(beta) * 2 * pi * beta`` and the
-        azimuth is uniform. Rays keep their full flux, so the surface acts as
-        a mirror (or diffuser sheet) whose reflection (or straight-through
-        transmission) is blurred by the ABg lobe: a polished surface (small
-        ``l0``) stays near-specular/near-collimated, a rough one spreads.
+        direction-cosine space, restricted to the directions that exist: the
+        azimuth is uniform, and the radial magnitude ``|beta - beta0|`` comes
+        from the tabulated inverse CDF of ``BSDF(beta) * 2 * pi * beta``
+        truncated at the largest offset that azimuth reaches inside the unit
+        disk. The weight ``C(delta_max(psi)) / TIS(|beta0|)`` then makes the
+        samples the lobe normalised over the reachable directions, with
+        expectation one: exactly one at normal incidence, a sampling weight
+        off it. So the surface acts as a lossless mirror (or diffuser sheet)
+        whose reflection (or straight-through transmission) is blurred by
+        the ABg lobe: a polished surface (small ``l0``) stays
+        near-specular/near-collimated, a rough one spreads.
 
         A per-ray draw against :attr:`transmissive_fraction` picks the
         reference ray the lobe is centred on: the specular reflection for a
@@ -266,20 +424,40 @@ class HarveyShackBSDF(BaseBSDF):
             raw_sign == 0.0, be.ones_like(raw_sign), raw_sign
         )
 
-        # Radial offset from the tabulated inverse CDF; azimuth uniform.
+        # Azimuth uniform; the radial offset from the inverse CDF truncated
+        # at the reach of this azimuth, delta_max(psi), so every sample is a
+        # propagating direction and none is discarded (issue 18 of the
+        # research repository). With e = (cos psi, sin psi) in the tangent
+        # frame, |beta0 + delta e| < 1 exactly when
+        # delta < -beta0.e + sqrt(1 - (beta0 x e)^2).
         u_radial = rng.uniform(ray_id, bounce, EventSlot.BSDF_U1)
         u_azimuth = rng.uniform(ray_id, bounce, EventSlot.BSDF_U2)
-        delta = self._inverse_cdf(u_radial)
         psi = 2.0 * be.pi * u_azimuth
+        cos_psi = be.cos(psi)
+        sin_psi = be.sin(psi)
+        proj = beta0_x * cos_psi + beta0_y * sin_psi
+        perp = beta0_x * sin_psi - beta0_y * cos_psi
+        delta_max = -proj + be.sqrt(
+            be.maximum(1.0 - perp * perp, be.zeros_like(perp))
+        )
+        c_max = self._forward_cdf(delta_max)
+        delta = self._inverse_cdf(u_radial * c_max)
 
-        beta_x = beta0_x + delta * be.cos(psi)
-        beta_y = beta0_y + delta * be.sin(psi)
+        beta_x = beta0_x + delta * cos_psi
+        beta_y = beta0_y + delta * sin_psi
 
-        # An offset can land outside the unit disk, i.e. on the wrong side of
-        # the reference ray's own hemisphere. Those samples are not
-        # physically reachable: keep the reference direction and give them
-        # zero weight rather than folding them back, which would distort the
-        # lobe.
+        # The weight that makes the truncated draw the lobe restricted to the
+        # reachable directions: the draw has density BSDF / C(delta_max(psi))
+        # per unit projected solid angle, the target BSDF / TIS(|beta0|), so
+        # w = C(delta_max(psi)) / TIS(|beta0|), whose mean over the azimuth is
+        # one (_build_tables). At normal incidence delta_max is 1 on every
+        # azimuth and w is exactly one; off it, w is a sampling weight.
+        g = be.sqrt(beta0_x * beta0_x + beta0_y * beta0_y)
+        g = be.where(g < 1.0, g, be.ones_like(g))
+        weight = c_max / self._hemispherical(g)
+
+        # A sample can still land on or past the unit circle by rounding at
+        # the truncation (measure zero); it keeps the reference direction.
         beta_sq = beta_x**2 + beta_y**2
         reachable = (beta_sq < 1.0) & valid
         normal_comp = be.sqrt(be.maximum(1.0 - beta_sq, be.zeros_like(beta_sq)))
@@ -299,12 +477,11 @@ class HarveyShackBSDF(BaseBSDF):
             be.zeros_like(scattered),
         )
 
-        # Full flux: the lobe redistributes energy rather than removing it.
-        # The physical scatter level is applied via ``scatter_fraction``,
-        # for which :attr:`total_integrated_scatter` is the natural value.
-        flux_weights = be.where(
-            reachable, be.ones_like(beta_sq), be.zeros_like(beta_sq)
-        )
+        # The lobe redistributes energy rather than removing it: its weight
+        # has expectation one at every incidence. The physical scatter level
+        # is applied via ``scatter_fraction``, for which
+        # :attr:`total_integrated_scatter` is the natural value.
+        flux_weights = be.where(valid, weight, be.zeros_like(weight))
 
         return scattered, flux_weights, transmitted
 
@@ -316,8 +493,10 @@ class HarveyShackBSDF(BaseBSDF):
     ) -> np.ndarray:
         """Return the fraction of incident power redistributed by the lobe.
 
-        The sampler conserves energy (rays keep full flux and are only
-        redirected), so this is 1.0. The ABg scatter level itself is
+        The lobe is normalised over the directions reachable from every
+        incidence, so its weight has expectation one and the surface loses
+        nothing: this is 1.0, the albedo the surface books the sampling
+        weight's residual against. The ABg scatter level itself is
         :attr:`total_integrated_scatter`, which is what a
         ``scatter_fraction`` should be set to for a physically scaled halo.
 
