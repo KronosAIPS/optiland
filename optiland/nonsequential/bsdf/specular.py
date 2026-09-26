@@ -35,6 +35,7 @@ class SpecularBRDF(BaseBSDF):
         rng: NSQRng | None = None,
         ray_id: np.ndarray | None = None,
         bounce: np.ndarray | None = None,
+        frame=None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Sample specular reflection directions.
 
@@ -46,6 +47,7 @@ class SpecularBRDF(BaseBSDF):
             rng: Unused for specular BRDF.
             ray_id: Unused for specular BRDF.
             bounce: Unused for specular BRDF.
+            frame: Unused for specular BRDF (no tangent frame).
 
         Returns:
             (reflected_dirs, ones, all_false) -- reflected unit vectors, unit

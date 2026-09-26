@@ -71,6 +71,7 @@ class BaseBSDF(ABC):
         rng: NSQRng,
         ray_id: np.ndarray,
         bounce: np.ndarray,
+        frame=None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Sample scattered ray directions, flux weights, and lobe side.
 
@@ -84,6 +85,12 @@ class BaseBSDF(ABC):
             ray_id: Per-ray identifiers, shape (N,), for keying the draw.
             bounce: Per-ray bounce/step index, shape (N,), for keying the
                 draw.
+            frame: The surface's rotation matrix (local to global, 3 x 3,
+                on the array backend), or None. A lobe that samples about
+                the normal builds its tangent frame in the surface's own
+                axes from it, so a rigidly rotated scene draws the rotated
+                directions from the same random numbers (issue 26 of the
+                research repository). None builds it on the world axes.
 
         Returns:
             A tuple (scattered_dirs, flux_weights, transmitted) where:

@@ -320,6 +320,7 @@ class HarveyShackBSDF(BaseBSDF):
         rng: NSQRng,
         ray_id: np.ndarray,
         bounce: np.ndarray,
+        frame=None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Sample scattered directions from the ABg lobe about a reference ray.
 
@@ -368,6 +369,9 @@ class HarveyShackBSDF(BaseBSDF):
             rng: Keyed PCG32 RNG.
             ray_id: Per-ray identifiers, shape (N,).
             bounce: Per-ray bounce/step index, shape (N,).
+            frame: The surface's rotation (local to global), or None for the
+                world axes: the tangent frame the offsets are drawn in
+                (``lambertian._orthonormal_basis``).
 
         Returns:
             (scattered_dirs, flux_weights, transmitted).
@@ -414,7 +418,7 @@ class HarveyShackBSDF(BaseBSDF):
             _orthonormal_basis,
         )
 
-        t_vec, b_vec = _orthonormal_basis(n_be)
+        t_vec, b_vec = _orthonormal_basis(n_be, frame)
 
         # Reference direction expressed in the local tangent frame.
         beta0_x = (d_ref * t_vec).sum(axis=1)

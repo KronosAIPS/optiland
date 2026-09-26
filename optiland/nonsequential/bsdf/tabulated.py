@@ -146,6 +146,7 @@ class TabulatedBSDF(BaseBSDF):
         rng: NSQRng,
         ray_id: np.ndarray,
         bounce: np.ndarray,
+        frame=None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Sample scattered directions from the tabulated BSDF.
 
@@ -167,6 +168,8 @@ class TabulatedBSDF(BaseBSDF):
             rng: Keyed PCG32 RNG.
             ray_id: Per-ray identifiers, shape (N,).
             bounce: Per-ray bounce/step index, shape (N,).
+            frame: The surface's rotation (local to global), or None for the
+                world axes (``lambertian._orthonormal_basis``).
 
         Returns:
             (scattered_dirs, flux_weights, transmitted).
@@ -201,7 +204,7 @@ class TabulatedBSDF(BaseBSDF):
         ly = sin_theta * be.sin(phi)
         lz = cos_theta
 
-        t_vec, b_vec = _orthonormal_basis(hemisphere)
+        t_vec, b_vec = _orthonormal_basis(hemisphere, frame)
         scattered = (
             lx[:, None] * t_vec + ly[:, None] * b_vec + lz[:, None] * hemisphere
         )
