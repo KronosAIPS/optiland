@@ -13,7 +13,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential import _tol
-from optiland.nonsequential.components.base import BaseComponent
+from optiland.nonsequential.components.base import BaseComponent, _resident_transform
 from optiland.nonsequential.components.coating_support import (
     reject_polarized_coating,
     resolve_reflectance,
@@ -177,6 +177,7 @@ class ReflectiveComponent(BaseComponent, LedgerBooking):
                 rng,
                 ray_id_key,
                 bounce_key,
+                frame=_resident_transform(self)[1],
             )
             # Route only a scatter_fraction of the hit rays into the lobe; the
             # rest reflect specularly.

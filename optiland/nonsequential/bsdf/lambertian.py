@@ -58,6 +58,7 @@ class LambertianBSDF(BaseBSDF):
         rng: NSQRng,
         ray_id: np.ndarray,
         bounce: np.ndarray,
+        frame=None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         """Sample cosine-weighted hemisphere directions around +/- normals.
 
@@ -75,6 +76,8 @@ class LambertianBSDF(BaseBSDF):
             rng: Keyed PCG32 RNG.
             ray_id: Per-ray identifiers, shape (N,).
             bounce: Per-ray bounce/step index, shape (N,).
+            frame: The surface's rotation (local to global, 3 x 3), or None
+                for the world axes; see :func:`_orthonormal_basis`.
 
         Returns:
             (scattered_dirs, flux_weights, transmitted); flux_weights =
@@ -109,7 +112,7 @@ class LambertianBSDF(BaseBSDF):
         ly = sin_theta * be.sin(phi)
         lz = cos_theta
 
-        t_vec, b_vec = _orthonormal_basis(hemisphere)
+        t_vec, b_vec = _orthonormal_basis(hemisphere, frame)
 
         scattered = (
             lx[:, None] * t_vec + ly[:, None] * b_vec + lz[:, None] * hemisphere
@@ -142,8 +145,20 @@ class LambertianBSDF(BaseBSDF):
         return be.ones(incident_dirs.shape[0]) * self.reflectance_value
 
 
-def _orthonormal_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _orthonormal_basis(n: np.ndarray, frame=None) -> tuple[np.ndarray, np.ndarray]:
     """Build two tangent vectors perpendicular to n, beside n.
+
+    With ``frame``, the surface's rotation ``R`` (local to global, the
+    matrix its placement carries), the construction below runs on the
+    normal in the surface's own axes, ``n R``, and the two vectors are
+    rotated back, ``t R^T``. The frame is then a property of the surface
+    rather than of the world axes: rotating the whole scene rotates it with
+    the surface, so the same random numbers leave in the same physical
+    direction (issue 26 of the research repository; chapter 10 section
+    10.3, invariant 3). A surface at the identity rotation gets exactly the
+    world-axis frame, bit for bit: a product with the identity matrix is
+    exact. Without ``frame`` the construction runs on the world axes, as
+    it did before.
 
     Uses the branchless construction of Duff et al., *Building an Orthonormal
     Basis, Revisited* (JCGT 2017). The denominator ``sign + n_z`` has
@@ -161,10 +176,14 @@ def _orthonormal_basis(n: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     Args:
         n: Normal vectors, shape (N, 3), already normalised. A zero vector
             yields an arbitrary but finite basis.
+        frame: Optional rotation matrix, shape (3, 3), local to global.
 
     Returns:
         Pair of tangent vectors (t, b), each shape (N, 3).
     """
+    if frame is not None:
+        t_local, b_local = _orthonormal_basis(n @ frame)
+        return t_local @ frame.T, b_local @ frame.T
     nx, ny, nz = n[:, 0], n[:, 1], n[:, 2]
 
     sign = be.copysign(be.ones_like(nz), nz)

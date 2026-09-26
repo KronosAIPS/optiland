@@ -138,10 +138,14 @@ def _cull_to_budget(
         rng: Keyed PCG32 RNG.
 
     Returns:
-        ``(kept, culled_flux, culled_mask)``: the surviving (boosted-flux)
-        subset as a new bundle, the pre-cull flux of the rays that were
-        killed (for ``total_flux_lost`` bookkeeping), and the NumPy bool
-        mask of which input rows were culled.
+        ``(kept, culled_flux, culled_mask, boost_residual)``: the surviving
+        (boosted-flux) subset as a new bundle, the pre-cull flux of the rays
+        that were killed (for ``total_flux_lost`` bookkeeping), the NumPy
+        bool mask of which input rows were culled, and the sum over the
+        survivors of (flux before minus flux after), a negative number: the
+        weight the boost hands them, which ch. 10 sec 10.2 books in the
+        sampling residual beside the culled flux, exactly as the roulette
+        block does (issue 28 of the research repository).
     """
     n = spawned.num_rays
     keep_prob = max(headroom / n, _BUDGET_CULL_SURVIVE_FLOOR) if n > 0 else 1.0
@@ -157,8 +161,37 @@ def _cull_to_budget(
     idx = np.where(keep_np)[0]
     kept = spawned.select(idx)
     kept.flux = kept.flux / keep_prob  # unbiased boost
-    return kept, culled_flux, culled_np
+    # Per ray, then summed: the difference of the two totals would carry the
+    # rounding of both, which is larger than the residual itself can be.
+    boost_residual = float(np.sum(flux_np[keep_np] - to_numpy(kept.flux)))
+    return kept, culled_flux, culled_np, boost_residual
 
+
+
+def detector_labels(scene, detectors) -> list[str]:
+    """The name each detector is known by, in the scene's detector order.
+
+    The registry name the detector was added under (the key of
+    ``SimulationResult.detectors``), else the detector's own ``name``, else
+    ``detector_<i>``. A detector built from a config carries an empty
+    ``name`` of its own, so the path record and the result must both read
+    the registry, or a detector hit is logged with an empty surface name
+    (issue 27 of the research repository).
+
+    Args:
+        scene: The scene being traced.
+        detectors: ``scene.detectors``, read once by the caller.
+
+    Returns:
+        One label per detector.
+    """
+    registry_names = get_detector_names(scene)
+    return [
+        registry_names[i]
+        if i < len(registry_names)
+        else (getattr(det, "name", "") or f"detector_{i}")
+        for i, det in enumerate(detectors)
+    ]
 
 
 class _BounceContext:
@@ -201,6 +234,7 @@ class _BounceContext:
     ) -> None:
         self.surfaces = scene.surfaces
         self.detectors = scene.detectors
+        self.detector_labels = detector_labels(scene, self.detectors)
         self.ir = ir
         self.path_recorder = path_recorder
         self.allocator = allocator
@@ -299,9 +333,8 @@ def bounce_body(backend, ctx: _BounceContext, rays: NSQRayBundle):
         mask_di = det_first & (det_idx == di)
         if backend._empty(mask_di):
             continue
-        det_name = getattr(det, "name", f"detector_{di}")
         ctx.path_recorder.log_hits(
-            rays, mask_di, det_name, t_offset=det_t_safe
+            rays, mask_di, ctx.detector_labels[di], t_offset=det_t_safe
         )
         det.record(rays, det_t_safe, mask_di)
         # Arriving flux by ghost order; a no-op unless the
@@ -1009,15 +1042,23 @@ class ArrayBackend(TracerBackend):
                         headroom = max(0, budget - rays.num_rays_alive)
                         if spawned.num_rays > headroom:
                             split_budget_saturated = True
-                            spawned, culled_flux_np, culled_np = _cull_to_budget(
-                                spawned, headroom, self.rng
-                            )
+                            (
+                                spawned,
+                                culled_flux_np,
+                                culled_np,
+                                boost_residual,
+                            ) = _cull_to_budget(spawned, headroom, self.rng)
                             if culled_np.any():
                                 num_rays_flux_killed.add(int(culled_np.sum()))
                                 total_flux_rr_killed.add(float(culled_flux_np.sum()))
                                 total_flux_sampling_residual.add(
                                     float(culled_flux_np.sum())
                                 )
+                            # Ch. 10 (10.2): the survivors' boost is the
+                            # other half of the cull's event residual; booking
+                            # only the culled flux left (10.1) open by it on
+                            # every saturated trace (issue 28).
+                            total_flux_sampling_residual.add(boost_residual)
                         if spawned.num_rays > 0:
                             rays = NSQRayBundle.concat([rays, spawned])
 
@@ -1097,9 +1138,9 @@ class ArrayBackend(TracerBackend):
         reflection_histograms: dict[str, object] = {}
         total_flux_detected = 0.0
         total_flux_tapped = 0.0
-        det_names = get_detector_names(scene)
+        det_names = detector_labels(scene, scene.detectors)
         for i, det in enumerate(scene.detectors):
-            name = det_names[i] if i < len(det_names) else (det.name or f"detector_{i}")
+            name = det_names[i]
             result = det.get_result()
             detector_results[name] = result
             histogram = det.reflection_histogram()

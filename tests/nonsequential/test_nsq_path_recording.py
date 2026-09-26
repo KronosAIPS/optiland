@@ -383,3 +383,49 @@ def test_record_paths_types_all_traceable(record_paths):
         assert result.ray_paths is not None
     else:
         assert result.ray_paths is None
+
+
+# ---------------------------------------------------------------------------
+# A detector hit carries the detector's name (issue 27 of the research
+# repository): the registry name, as SimulationResult.detectors keys it
+# ---------------------------------------------------------------------------
+
+
+def _two_detector_scene() -> NSQScene:
+    scene = _lens_scene()
+    scene.add_detector(
+        "TAP",
+        CoordinateSystem(z=120.0),
+        IrradianceDetectorConfig(
+            width=40, height=40, num_pixels_x=8, num_pixels_y=8, absorb=False
+        ),
+    )
+    return scene
+
+
+@pytest.mark.parametrize("backend_name", ["numpy", "torch"])
+def test_detector_hits_logged_with_the_detector_name(backend_name):
+    if backend_name == "torch":
+        pytest.importorskip("torch")
+    be.set_backend(backend_name)
+    try:
+        scene = _two_detector_scene()
+        backend = (
+            NumpyBackend(seed=3) if backend_name == "numpy" else TorchBackend(seed=3)
+        )
+        result = scene.trace(num_rays=400, seed=3, record_paths=True, backend=backend)
+        events = result.ray_paths["events"]
+        hits = events[events["event_type"] == "hit"]
+        names = set(hits["component_name"])
+        assert "" not in names
+        assert {"TAP", "D1"} <= names
+        assert names <= {"TAP", "D1"} | {n for n in names if n.startswith("L1")}
+        # Every ray that reaches D1 crossed the tap first, at z = 120, and the
+        # detector events sit on their detectors' planes.
+        for label, z in (("TAP", 120.0), ("D1", 200.0)):
+            rows = hits[hits["component_name"] == label]
+            assert rows.size > 0
+            np.testing.assert_allclose(rows["z"], z, atol=1e-4)  # float32 on torch
+        assert set(result.detectors) == {"D1", "TAP"}
+    finally:
+        be.set_backend("numpy")
