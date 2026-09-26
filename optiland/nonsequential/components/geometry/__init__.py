@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from .analytic import (
     ConicGeometry,
+    EvenAsphereGeometry,
     FinitePlaneGeometry,
     LensletArrayGeometry,
+    OddAsphereGeometry,
     ParaboloidGeometry,
     PlaneGeometry,
     SphereGeometry,
@@ -20,9 +22,11 @@ __all__ = [
     "AnalyticGeometry",
     "ComponentGeometry",
     "ConicGeometry",
+    "EvenAsphereGeometry",
     "FinitePlaneGeometry",
     "LensletArrayGeometry",
     "MeshGeometry",
+    "OddAsphereGeometry",
     "ParaboloidGeometry",
     "PlaneGeometry",
     "SphereGeometry",

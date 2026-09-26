@@ -24,6 +24,24 @@ def _to_float(value: Any) -> float:
     return f(value)
 
 
+def _asphere_fields(config: Any, suffix: str) -> dict:
+    """The asphere fields of a face (``coefficients<suffix>``, ``odd<suffix>``),
+    written only when the face has coefficients, so a conic face's JSON is
+    what it always was."""
+    coeffs = getattr(config, f"coefficients{suffix}", ())
+    values = (
+        [float(v) for v in coeffs.detach().cpu().numpy()]
+        if hasattr(coeffs, "detach")
+        else [_to_float(v) for v in coeffs]
+    )
+    if not values:
+        return {}
+    return {
+        f"coefficients{suffix}": values,
+        f"odd{suffix}": bool(getattr(config, f"odd{suffix}", False)),
+    }
+
+
 def _material_out(mat: Any) -> Any:
     from optiland.nonsequential.serialization import (  # noqa: PLC0415
         _serialize_material,
@@ -738,6 +756,10 @@ def _register_geometries() -> None:
     from optiland.nonsequential.components.geometry.analytic.annulus import (  # noqa: PLC0415
         AnnularPlaneGeometry,
     )
+    from optiland.nonsequential.components.geometry.analytic.asphere import (  # noqa: PLC0415
+        EvenAsphereGeometry,
+        OddAsphereGeometry,
+    )
     from optiland.nonsequential.components.geometry.analytic.conic import (  # noqa: PLC0415
         ConicGeometry,
         ParaboloidGeometry,
@@ -838,6 +860,33 @@ def _register_geometries() -> None:
             "faces": np.asarray(g.mesh.faces, dtype=np.int64).tolist(),
         },
     )
+    # Aspheres (KronosNSRT issue 30): the base conic's parameters, the
+    # polynomial coefficients as a list (tensors stay tensors in the IR, as
+    # the conic's radius does), and the refinement's three settings.
+    def asphere_params(g) -> dict:
+        coeffs = g.coefficients
+        return {
+            "radius": g.radius,
+            "conic": g.conic,
+            "aperture_radius": g.aperture_radius,
+            "coefficients": coeffs if hasattr(coeffs, "shape") else list(coeffs),
+            "max_iterations": g.max_iterations,
+            "guard_eta": g.guard_eta,
+            "residual_k": g.residual_k,
+        }
+
+    kinds.register_geometry(
+        "even_asphere",
+        EvenAsphereGeometry,
+        asphere_params,
+        description="conic base plus even radial polynomial, Newton-refined",
+    )
+    kinds.register_geometry(
+        "odd_asphere",
+        OddAsphereGeometry,
+        asphere_params,
+        description="conic base plus odd radial polynomial, Newton-refined",
+    )
     kinds.register_geometry(
         "lenslet_array",
         LensletArrayGeometry,
@@ -936,6 +985,8 @@ def _register_components() -> None:
             ),
             "conic1": _to_float(c._config.conic1),
             "conic2": _to_float(c._config.conic2),
+            **_asphere_fields(c._config, "1"),
+            **_asphere_fields(c._config, "2"),
         },
         from_dict=lambda cfg: LensConfig(
             r1=cfg["r1"],
@@ -946,6 +997,10 @@ def _register_components() -> None:
             back_aperture_radius=cfg.get("back_aperture_radius"),
             conic1=cfg.get("conic1", 0.0),
             conic2=cfg.get("conic2", 0.0),
+            coefficients1=tuple(cfg.get("coefficients1", ())),
+            coefficients2=tuple(cfg.get("coefficients2", ())),
+            odd1=bool(cfg.get("odd1", False)),
+            odd2=bool(cfg.get("odd2", False)),
         ),
         attached="*",
     )
@@ -967,6 +1022,7 @@ def _register_components() -> None:
             "reflectance": _to_float(config.reflectance),
             "conic": _to_float(config.conic),
             "aperture_radius": _to_float(config.aperture_radius),
+            **_asphere_fields(config, ""),
         }
 
     kinds.register_component(
@@ -980,6 +1036,8 @@ def _register_components() -> None:
             reflectance=cfg["reflectance"],
             conic=cfg.get("conic", 0.0),
             aperture_radius=cfg["aperture_radius"],
+            coefficients=tuple(cfg.get("coefficients", ())),
+            odd=bool(cfg.get("odd", False)),
         ),
         attached="*",
     )

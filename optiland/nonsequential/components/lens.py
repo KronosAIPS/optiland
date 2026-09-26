@@ -119,7 +119,9 @@ class Lens(CompoundComponent):
         surfaces: list[BaseComponent] = []
 
         # 1. Front face (refractive by default)
-        front_geom = ConicGeometry(cfg.r1, cfg.conic1, front_r)
+        front_geom = face_geometry(
+            cfg.r1, cfg.conic1, front_r, cfg.coefficients1, cfg.odd1
+        )
         surfaces.append(
             _make_surface(
                 cs_front,
@@ -133,7 +135,7 @@ class Lens(CompoundComponent):
         )
 
         # 2. Back face (refractive by default)
-        back_geom = ConicGeometry(cfg.r2, cfg.conic2, back_r)
+        back_geom = face_geometry(cfg.r2, cfg.conic2, back_r, cfg.coefficients2, cfg.odd2)
         surfaces.append(
             _make_surface(
                 cs_back,
@@ -147,8 +149,8 @@ class Lens(CompoundComponent):
         )
 
         # 3. Edge (cylindrical frustum, absorbing by default)
-        sag_front = _sag_at_rim(cfg.r1, cfg.conic1, front_r)
-        sag_back = _sag_at_rim(cfg.r2, cfg.conic2, back_r)
+        sag_front = _face_rim_sag(front_geom, cfg.r1, cfg.conic1, front_r)
+        sag_back = _face_rim_sag(back_geom, cfg.r2, cfg.conic2, back_r)
 
         wider_r = max(as_float(front_r), as_float(back_r))
         narrower_r = min(as_float(front_r), as_float(back_r))
@@ -234,6 +236,42 @@ def _offset_cs(cs: CoordinateSystem, dz: float) -> CoordinateSystem:
     from optiland.coordinate_system import CoordinateSystem  # noqa: PLC0415
 
     return CoordinateSystem(z=dz, reference_cs=cs)
+
+
+def face_geometry(radius, conic, aperture_radius, coefficients=(), odd=False):
+    """A conic face, or an asphere face when ``coefficients`` is non-empty.
+
+    Args:
+        radius: Vertex radius of curvature [mm].
+        conic: Conic constant.
+        aperture_radius: Semi-aperture [mm].
+        coefficients: Polynomial coefficients (see
+            :class:`~optiland.nonsequential.components.geometry.analytic.asphere.EvenAsphereGeometry`).
+        odd: Odd rather than even polynomial.
+
+    Returns:
+        A :class:`ConicGeometry`, :class:`EvenAsphereGeometry` or
+        :class:`OddAsphereGeometry`.
+    """
+    has_terms = (
+        coefficients.numel() > 0 if hasattr(coefficients, "numel") else len(coefficients) > 0
+    )
+    if not has_terms:
+        return ConicGeometry(radius, conic, aperture_radius)
+    from optiland.nonsequential.components.geometry.analytic.asphere import (  # noqa: PLC0415
+        EvenAsphereGeometry,
+        OddAsphereGeometry,
+    )
+
+    cls = OddAsphereGeometry if odd else EvenAsphereGeometry
+    return cls(radius, conic, aperture_radius, coefficients)
+
+
+def _face_rim_sag(geometry, radius, conic, aperture_radius) -> float:
+    """Detached rim sag of a face: the asphere's full sag, or the conic's."""
+    if hasattr(geometry, "rim_sag"):
+        return geometry.rim_sag()
+    return _sag_at_rim(radius, conic, aperture_radius)
 
 
 def _sag_at_rim(radius: float, conic: float, aperture_radius: float) -> float:

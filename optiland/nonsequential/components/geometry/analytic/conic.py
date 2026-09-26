@@ -162,31 +162,23 @@ class ConicGeometry(AnalyticGeometry):
         valid = solvable & be.isfinite(t) & (t > eps) & in_aperture & on_sag_sheet
         return valid, px, py
 
-    def ray_intersect(
-        self, origins: np.ndarray, directions: np.ndarray, eps: float | None = None
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-        """Intersect rays with the conic surface.
+    def _quadratic_roots(self, origins: np.ndarray, directions: np.ndarray) -> tuple:
+        """Both roots of the ray-quadric quadratic, in the stable form.
 
-        Solved in closed form: the sag form in the module docstring is
-        algebraically the quadric
-
-            c * (x^2 + y^2) + (1 + K) * c * z^2 - 2 * z = 0,
-
-        so substituting p(t) = o + t*d gives a quadratic in t. The same
-        equation covers the flat limit (c = 0), where it becomes linear.
-
-        The quadric is the whole conic, including points the sag function does
-        not describe (the far side of an ellipsoid, the second branch of a
-        hyperboloid), which :meth:`_root_valid` rejects.
+        The sag form in the module docstring is algebraically the quadric
+        ``c (x^2 + y^2) + (1 + K) c z^2 - 2 z = 0``; substituting
+        ``p(t) = o + t d`` gives ``a t^2 + b t + c_0 = 0``. Shared by
+        :meth:`ray_intersect` and by the asphere kinds, which start their
+        Newton refinement from these roots
+        (``docs/theory/07_geometry.md`` sections 7.3, 7.4 and 7.6).
 
         Args:
             origins: Ray origins in local frame, shape (N, 3) [mm].
             directions: Ray directions in local frame, shape (N, 3).
 
         Returns:
-            (t, normals, hit_mask, n_geom). n_geom points toward local +z
-            (the ``material_back`` side by contract; see
-            :meth:`ComponentGeometry.ray_intersect`).
+            ``(t1, t2, solvable1, solvable2)``: the two roots and the lanes on
+            which each came from a well-posed division.
         """
         ox, oy, oz = origins[:, 0], origins[:, 1], origins[:, 2]
         dx, dy, dz = directions[:, 0], directions[:, 1], directions[:, 2]
@@ -232,12 +224,41 @@ class ConicGeometry(AnalyticGeometry):
         q_ok = be.abs(q) > tiny
         t1 = q / be.where(a_ok, a, be.ones_like(a))
         t2 = c_0 / be.where(q_ok, q, be.ones_like(q))
+        return t1, t2, disc_ok & a_ok, disc_ok & q_ok
+
+    def ray_intersect(
+        self, origins: np.ndarray, directions: np.ndarray, eps: float | None = None
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Intersect rays with the conic surface.
+
+        Solved in closed form: the sag form in the module docstring is
+        algebraically the quadric
+
+            c * (x^2 + y^2) + (1 + K) * c * z^2 - 2 * z = 0,
+
+        so substituting p(t) = o + t*d gives a quadratic in t. The same
+        equation covers the flat limit (c = 0), where it becomes linear.
+
+        The quadric is the whole conic, including points the sag function does
+        not describe (the far side of an ellipsoid, the second branch of a
+        hyperboloid), which :meth:`_root_valid` rejects.
+
+        Args:
+            origins: Ray origins in local frame, shape (N, 3) [mm].
+            directions: Ray directions in local frame, shape (N, 3).
+
+        Returns:
+            (t, normals, hit_mask, n_geom). n_geom points toward local +z
+            (the ``material_back`` side by contract; see
+            :meth:`ComponentGeometry.ray_intersect`).
+        """
+        t1, t2, solvable1, solvable2 = self._quadratic_roots(origins, directions)
 
         if eps is None:
             eps = _tol.accept_t_min(be.abs(origins).max())
         args = (origins, directions, eps)
-        valid1, px1, py1 = self._root_valid(t1, disc_ok & a_ok, *args)
-        valid2, px2, py2 = self._root_valid(t2, disc_ok & q_ok, *args)
+        valid1, px1, py1 = self._root_valid(t1, solvable1, *args)
+        valid2, px2, py2 = self._root_valid(t2, solvable2, *args)
 
         # Nearest valid root along the ray.
         pick1 = valid1 & (~valid2 | (t1 <= t2))

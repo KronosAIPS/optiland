@@ -79,7 +79,11 @@ class Mirror(CompoundComponent):
             List containing exactly one ReflectiveComponent.
         """
         cfg = self._config
-        geom = ConicGeometry(cfg.radius, cfg.conic, cfg.aperture_radius)
+        from optiland.nonsequential.components.lens import face_geometry  # noqa: PLC0415
+
+        geom = face_geometry(
+            cfg.radius, cfg.conic, cfg.aperture_radius, cfg.coefficients, cfg.odd
+        )
         interaction = _resolve_interaction(cfg.surface, InteractionType.REFLECTIVE)
         return [
             _make_surface(

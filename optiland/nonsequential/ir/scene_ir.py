@@ -26,6 +26,8 @@ PrimitiveKind = Literal[
     "spherical_cavity",
     "mesh",
     "lenslet_array",
+    "even_asphere",
+    "odd_asphere",
 ]
 
 # Which physical interaction a primitive's hit dispatches to, independent of
