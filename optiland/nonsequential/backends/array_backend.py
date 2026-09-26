@@ -50,6 +50,7 @@ from optiland.nonsequential.path_recording import (  # noqa: F401
     _EVENT_DTYPE,
     PathRecorder,
 )
+from optiland.nonsequential import polarization as _polarization
 from optiland.nonsequential.ray_bundle import NSQRayBundle
 from optiland.nonsequential.rng import EventSlot, NSQRng, uniform_bits
 from optiland.nonsequential.sampling import russian_roulette
@@ -463,6 +464,11 @@ class ArrayBackend(TracerBackend):
     supports_splitting: bool = True
     alive_check_every: int = 0
     compact_every: int | None = None
+    #: The run-level polarization mode (R-06-9): ``"off"`` traces the scalar
+    #: flux and nothing else; ``"stokes"`` gives every batch the reduced
+    #: Stokes state of :mod:`optiland.nonsequential.polarization`. Set by a
+    #: backend's ``polarization`` argument.
+    polarization: str = "off"
 
     # Live count for the current bounce, read at most once and shared by
     # the alive check and the compaction bucket. None means "not read yet".
@@ -652,6 +658,10 @@ class ArrayBackend(TracerBackend):
         }
         if be.get_precision() == 32:
             env["uniform_bits"] = uniform_bits(32)
+        # R-06-10: a Stokes trace says so. Absent means the scalar trace, as
+        # in every record made before the mode existed.
+        if self.polarization != "off":
+            env["polarization"] = self.polarization
         return env
 
     # ------------------------------------------------------------------
@@ -930,6 +940,8 @@ class ArrayBackend(TracerBackend):
                     rays.flux = rays.flux * (batch / source_num_rays)
 
                 rays = self._prepare_bundle(rays)
+                if self.polarization != "off":
+                    _polarization.prepare_bundle(rays)
                 path_recorder.log_birth(rays, source_name)
 
                 depth = 0

@@ -72,6 +72,32 @@ MODES: tuple[str, ...] = ("off", "stokes")
 POL_FIELDS: tuple[str, ...] = ("pol_q", "pol_u", "pol_v", "pol_ex", "pol_ey", "pol_ez")
 
 
+#: The environment variable a backend built without an explicit
+#: ``polarization`` reads (``off`` or ``stokes``; unset is ``off``), so a
+#: harness that builds its own backends -- a catalogue runner, a notebook that
+#: calls ``scene.trace()`` -- can be run in Stokes mode unchanged, as
+#: ``OPTILAND_NSQ_COMPILE_STEP`` does for the compiled step.
+POLARIZATION_ENV = "OPTILAND_NSQ_POLARIZATION"
+
+
+def mode_for_backend(value: object) -> str:
+    """A backend's polarization mode: its explicit argument, or the environment's.
+
+    Args:
+        value: The backend's ``polarization`` argument; ``None`` reads
+            :data:`POLARIZATION_ENV`.
+
+    Returns:
+        ``"off"`` or ``"stokes"``.
+    """
+    if value is None:
+        import os  # noqa: PLC0415
+
+        env = os.environ.get(POLARIZATION_ENV, "").strip()
+        return normalise_mode(env) if env else "off"
+    return normalise_mode(value)
+
+
 def normalise_mode(value: object) -> str:
     """The polarization mode as one of :data:`MODES`.
 
@@ -405,6 +431,47 @@ def birth_axis(kx, ky, kz):
     n2 = ax * ax + ay * ay + az * az
     inv = 1.0 / be.where(n2 > 0, n2, one) ** 0.5
     return ax * inv, ay * inv, az * inv
+
+
+def _detached_zeros_like(x):
+    """Zeros of ``x``'s library, dtype, device and shape, with no gradient flag."""
+    if be.is_torch_tensor(x):
+        import torch  # noqa: PLC0415
+
+        return torch.zeros_like(x, requires_grad=False)
+    return np.zeros_like(x)
+
+
+def prepare_bundle(rays) -> None:
+    """Give a freshly generated, device-placed bundle its polarization state, in place.
+
+    Called once per batch by the trace loop when polarization is on, after the
+    backend has placed the bundle on its library and device. A bundle whose
+    source set no state is unpolarized, ``(q, u, v) = (0, 0, 0)``, with the
+    reference axis :func:`birth_axis` of its direction. A state a source did
+    set is moved onto the ray state's library and dtype. ``flux`` is not
+    touched: it is the Stokes ``I`` as it stands.
+
+    Args:
+        rays: An :class:`~optiland.nonsequential.ray_bundle.NSQRayBundle`.
+    """
+    if rays.pol_q is None:
+        rays.pol_q = _detached_zeros_like(rays.flux)
+        rays.pol_u = _detached_zeros_like(rays.flux)
+        rays.pol_v = _detached_zeros_like(rays.flux)
+        rays.pol_ex, rays.pol_ey, rays.pol_ez = birth_axis(rays.L, rays.M, rays.N)
+        return
+    for name in POL_FIELDS:
+        value = getattr(rays, name)
+        if be.is_torch_tensor(rays.flux) and not be.is_torch_tensor(value):
+            import torch  # noqa: PLC0415
+
+            value = torch.as_tensor(
+                np.asarray(value), dtype=rays.flux.dtype, device=rays.flux.device
+            )
+        elif not be.is_torch_tensor(rays.flux):
+            value = np.asarray(value, dtype=np.asarray(rays.flux).dtype)
+        setattr(rays, name, value)
 
 
 def transport_axis(e, k):

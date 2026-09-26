@@ -62,6 +62,7 @@ from optiland.nonsequential.backends.array_backend import (
 )
 from optiland.nonsequential.backends.graph_replay import GraphReplayUnavailable
 from optiland.nonsequential.ray_bundle import backend_live_permutation
+from optiland.nonsequential.polarization import mode_for_backend
 from optiland.nonsequential.rng import NSQRng
 
 if TYPE_CHECKING:
@@ -387,6 +388,7 @@ class TorchBackend(ArrayBackend):
         rng_kernel: Literal["torch", "warp"] = "torch",
         compile_step: bool | str | None = None,
         compile_options: dict | None = None,
+        polarization: str | bool | None = None,
     ) -> None:
         """Initialize TorchBackend.
 
@@ -419,6 +421,12 @@ class TorchBackend(ArrayBackend):
                 backend can be switched without a code change; unset, it is
                 off.
             compile_options: Compiler options for the compiled step.
+            polarization: ``"off"`` or ``"stokes"`` (``True``/``False`` are
+                accepted); ``None`` reads
+                :data:`~optiland.nonsequential.polarization.POLARIZATION_ENV`,
+                unset meaning ``"off"``. In Stokes mode the six state fields
+                are ray state like the others: carried by compaction, held in
+                the replay's static buffers, read by the compiled step.
 
         Raises:
             ValueError: If ``graph_replay`` is not ``False``, ``True`` or
@@ -475,6 +483,7 @@ class TorchBackend(ArrayBackend):
         self.compile_options = dict(compile_options or {})
         # Whether the last trace ran the compiled step (see _bounce_step).
         self.compiled_step_active = False
+        self.polarization = mode_for_backend(polarization)
 
     def _compiles_here(self) -> bool:
         """Whether this trace runs the compiled step, on the active device."""
