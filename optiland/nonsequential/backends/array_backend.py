@@ -941,7 +941,7 @@ class ArrayBackend(TracerBackend):
 
                 rays = self._prepare_bundle(rays)
                 if self.polarization != "off":
-                    _polarization.prepare_bundle(rays)
+                    _polarization.prepare_bundle(rays, source)
                 path_recorder.log_birth(rays, source_name)
 
                 depth = 0

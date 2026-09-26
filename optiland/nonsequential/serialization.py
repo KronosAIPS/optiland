@@ -343,7 +343,7 @@ def _serialize_source(name: str, source: Any) -> dict:
             f"Cannot serialize source '{name}' of type '{type(source).__name__}'. "
             f"Registered source kinds: {', '.join(kinds.SOURCES.names())}."
         ) from None
-    return {
+    out = {
         "type": spec.name,
         "name": name,
         "cs": _serialize_cs(source.cs),
@@ -352,6 +352,12 @@ def _serialize_source(name: str, source: Any) -> dict:
         **spec.to_dict(source),
         "medium": _serialize_material(getattr(source, "medium", None)),
     }
+    # The source's polarization (the research repository's issue 5), only
+    # when one was set, so a scene without one serializes as it always did.
+    polarization = getattr(source, "polarization", None)
+    if polarization is not None:
+        out["polarization"] = polarization.to_dict()
+    return out
 
 
 def _deserialize_source(d: dict, scene: NSQScene) -> None:
@@ -374,6 +380,14 @@ def _deserialize_source(d: dict, scene: NSQScene) -> None:
         medium=_deserialize_material(d.get("medium")),
     )
     scene.add_source(d["name"], _deserialize_cs(d["cs"]), config)
+    if d.get("polarization") is not None:
+        from optiland.nonsequential.polarization import (  # noqa: PLC0415
+            SourcePolarization,
+        )
+
+        scene.source_registry.get(d["name"]).polarization = (
+            SourcePolarization.from_dict(d["polarization"])
+        )
 
 
 # ---------------------------------------------------------------------------

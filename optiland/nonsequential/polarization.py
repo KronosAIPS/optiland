@@ -420,17 +420,37 @@ def birth_axis(kx, ky, kz):
         ``(ex, ey, ez)``, per ray.
     """
     one = be.ones_like(kx)
-    ex_x, ex_y, ex_z = one - kx * kx, -kx * ky, -kx * kz
-    ey_x, ey_y, ey_z = -ky * kx, one - ky * ky, -ky * kz
-    nx2 = ex_x * ex_x + ex_y * ex_y + ex_z * ex_z
+    zero = be.zeros_like(kx)
+    k = (kx, ky, kz)
+    ex, sx2 = perpendicular_axis((one, zero, zero), k)
+    ey, _ = perpendicular_axis((zero, one, zero), k)
     tol = degeneracy_tolerance(kx)
-    use_x = nx2 > tol * tol
-    ax = be.where(use_x, ex_x, ey_x)
-    ay = be.where(use_x, ex_y, ey_y)
-    az = be.where(use_x, ex_z, ey_z)
-    n2 = ax * ax + ay * ay + az * az
-    inv = 1.0 / be.where(n2 > 0, n2, one) ** 0.5
-    return ax * inv, ay * inv, az * inv
+    use_x = sx2 > tol * tol
+    return tuple(be.where(use_x, a, b) for a, b in zip(ex, ey, strict=True))
+
+
+def perpendicular_axis(a, k):
+    """``normalize(a - (a . k) k)``, formed as ``(k x a) x k``.
+
+    The double cross product is perpendicular to ``k`` to the dtype's own
+    rounding whatever the angle between ``a`` and ``k``; the subtraction
+    ``a - (a . k) k`` loses that as ``u / |k x a|`` when ``a`` is nearly
+    along ``k``.
+
+    Args:
+        a: ``(x, y, z)`` of the axis, per ray or broadcastable.
+        k: ``(x, y, z)`` of the unit direction, per ray.
+
+    Returns:
+        ``((ex, ey, ez), |k x a|^2)``; where ``k x a`` vanishes the axis is
+        returned unnormalised (zero) and the caller decides the fallback.
+    """
+    s = _cross(*k, *a)
+    e = _cross(*s, *k)
+    s2 = _dot(*s, *s)
+    n2 = _dot(*e, *e)
+    inv = 1.0 / be.where(n2 > 0, n2, be.ones_like(n2)) ** 0.5
+    return (e[0] * inv, e[1] * inv, e[2] * inv), s2
 
 
 def _detached_zeros_like(x):
@@ -442,24 +462,137 @@ def _detached_zeros_like(x):
     return np.zeros_like(x)
 
 
-def prepare_bundle(rays) -> None:
+class SourcePolarization:
+    """The polarization a source emits: a Stokes vector and the axis it is referred to.
+
+    Attributes:
+        stokes: ``(S0, S1, S2, S3)`` with ``S0 > 0`` and
+            ``S1^2 + S2^2 + S3^2 <= S0^2``; only the ratios matter, since the
+            source's ``total_flux`` sets ``I``. ``(1, 0, 0, 0)`` is
+            unpolarized.
+        reference_axis: The global direction ``S1 > 0`` is polarized along
+            (projected perpendicular to each ray's direction), or ``None``
+            for lab ``x`` (lab ``y`` for a ray along ``x``), the axis every
+            unpolarized ray is born with. A ray whose direction lies within
+            :func:`degeneracy_tolerance` of the given axis falls back to the
+            default axis.
+    """
+
+    def __init__(self, stokes=(1.0, 0.0, 0.0, 0.0), reference_axis=None) -> None:
+        s = [float(x) for x in stokes]
+        if len(s) != 4:
+            raise ValueError(f"stokes must have four entries, got {len(s)}")
+        if not s[0] > 0:
+            raise ValueError(f"stokes S0 must be positive, got {s[0]}")
+        excess = (s[1] ** 2 + s[2] ** 2 + s[3] ** 2) / s[0] ** 2 - 1.0
+        if excess > 1e-12:
+            raise ValueError(
+                f"stokes {tuple(s)} is not realizable: S1^2 + S2^2 + S3^2 exceeds S0^2 "
+                "(R-06-7)"
+            )
+        self.stokes = tuple(s)
+        if reference_axis is not None:
+            a = np.asarray(reference_axis, dtype=np.float64).reshape(3)
+            norm = float(np.linalg.norm(a))
+            if not norm > 0:
+                raise ValueError("reference_axis must be a non-zero vector")
+            reference_axis = tuple(float(x) for x in a / norm)
+        self.reference_axis = reference_axis
+
+    @property
+    def reduced(self) -> tuple[float, float, float]:
+        """``(q, u, v) = (S1, S2, S3) / S0``."""
+        s0 = self.stokes[0]
+        return self.stokes[1] / s0, self.stokes[2] / s0, self.stokes[3] / s0
+
+    @property
+    def unpolarized(self) -> bool:
+        return self.reduced == (0.0, 0.0, 0.0)
+
+    def to_dict(self) -> dict:
+        return {"stokes": list(self.stokes), "reference_axis": (
+            None if self.reference_axis is None else list(self.reference_axis)
+        )}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> SourcePolarization:
+        return cls(stokes=d["stokes"], reference_axis=d.get("reference_axis"))
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, SourcePolarization)
+            and self.stokes == other.stokes
+            and self.reference_axis == other.reference_axis
+        )
+
+    def __repr__(self) -> str:
+        return f"SourcePolarization(stokes={self.stokes}, reference_axis={self.reference_axis})"
+
+
+def set_source_polarization(scene, name: str, stokes=(1.0, 0.0, 0.0, 0.0), reference_axis=None):
+    """Give the scene's source ``name`` a polarization (read only in Stokes mode).
+
+    A scalar trace ignores it: the scalar engine traces the flux the source
+    emits, which the Stokes vector does not change (R-06-9: one set of model
+    inputs for both modes).
+
+    Args:
+        scene: The :class:`~optiland.nonsequential.scene.NSQScene`.
+        name: The source's registry name.
+        stokes: See :class:`SourcePolarization`.
+        reference_axis: See :class:`SourcePolarization`.
+
+    Returns:
+        The :class:`SourcePolarization` set.
+    """
+    pol = SourcePolarization(stokes, reference_axis)
+    scene.source_registry.get(name).polarization = pol
+    return pol
+
+
+def _constant_like(x, value: float):
+    return _detached_zeros_like(x) + value
+
+
+def prepare_bundle(rays, source=None) -> None:
     """Give a freshly generated, device-placed bundle its polarization state, in place.
 
     Called once per batch by the trace loop when polarization is on, after the
-    backend has placed the bundle on its library and device. A bundle whose
-    source set no state is unpolarized, ``(q, u, v) = (0, 0, 0)``, with the
-    reference axis :func:`birth_axis` of its direction. A state a source did
-    set is moved onto the ray state's library and dtype. ``flux`` is not
-    touched: it is the Stokes ``I`` as it stands.
+    backend has placed the bundle on its library and device. The state is the
+    source's :class:`SourcePolarization` (its ``polarization`` attribute, set
+    by :func:`set_source_polarization`), or unpolarized,
+    ``(q, u, v) = (0, 0, 0)``, when the source has none. The reference axis is
+    :func:`birth_axis` of the direction, or the source's own axis projected
+    perpendicular to it. A state a source's ``generate`` set itself is moved
+    onto the ray state's library and dtype. ``flux`` is not touched: it is
+    the Stokes ``I`` as it stands.
 
     Args:
         rays: An :class:`~optiland.nonsequential.ray_bundle.NSQRayBundle`.
+        source: The source that generated it, or ``None``.
     """
+    pol = getattr(source, "polarization", None)
     if rays.pol_q is None:
-        rays.pol_q = _detached_zeros_like(rays.flux)
-        rays.pol_u = _detached_zeros_like(rays.flux)
-        rays.pol_v = _detached_zeros_like(rays.flux)
-        rays.pol_ex, rays.pol_ey, rays.pol_ez = birth_axis(rays.L, rays.M, rays.N)
+        if pol is None or pol.unpolarized:
+            rays.pol_q = _detached_zeros_like(rays.flux)
+            rays.pol_u = _detached_zeros_like(rays.flux)
+            rays.pol_v = _detached_zeros_like(rays.flux)
+        else:
+            q, u, v = pol.reduced
+            rays.pol_q = _constant_like(rays.flux, q)
+            rays.pol_u = _constant_like(rays.flux, u)
+            rays.pol_v = _constant_like(rays.flux, v)
+        default = birth_axis(rays.L, rays.M, rays.N)
+        if pol is None or pol.reference_axis is None:
+            rays.pol_ex, rays.pol_ey, rays.pol_ez = default
+            return
+        a = tuple(_constant_like(rays.flux, c) for c in pol.reference_axis)
+        e, s2 = perpendicular_axis(a, (rays.L, rays.M, rays.N))
+        tol = degeneracy_tolerance(rays.L)
+        ok = s2 > tol * tol
+        rays.pol_ex = be.where(ok, e[0], default[0])
+        rays.pol_ey = be.where(ok, e[1], default[1])
+        rays.pol_ez = be.where(ok, e[2], default[2])
         return
     for name in POL_FIELDS:
         value = getattr(rays, name)
@@ -488,11 +621,7 @@ def transport_axis(e, k):
     Returns:
         ``(ex', ey', ez')``.
     """
-    ek = _dot(*e, *k)
-    px, py, pz = e[0] - ek * k[0], e[1] - ek * k[1], e[2] - ek * k[2]
-    n2 = px * px + py * py + pz * pz
-    inv = 1.0 / be.where(n2 > 0, n2, be.ones_like(n2)) ** 0.5
-    return px * inv, py * inv, pz * inv
+    return perpendicular_axis(e, k)[0]
 
 
 # ---------------------------------------------------------------------------

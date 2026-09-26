@@ -272,8 +272,8 @@ class TestSwitch:
         captured = {}
         original = P.prepare_bundle
 
-        def spy(rays):
-            original(rays)
+        def spy(rays, source=None):
+            original(rays, source)
             captured.update({f: np.array(getattr(rays, f)) for f in P.POL_FIELDS})
             captured["k"] = np.stack([rays.L, rays.M, rays.N], axis=1)
 
