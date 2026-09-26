@@ -1080,7 +1080,7 @@ class ArrayBackend(TracerBackend):
         num_rays_absorbed = 0
         for comp in scene.surfaces:
             if isinstance(comp, AbsorbingComponent):
-                total_flux_absorbed += float(to_numpy(comp._absorbed_flux))
+                total_flux_absorbed += comp.absorbed_flux()
                 num_rays_absorbed += int(to_numpy(comp._absorbed_count))
 
         # Collect the mirror and coating loss, and each surface's share of

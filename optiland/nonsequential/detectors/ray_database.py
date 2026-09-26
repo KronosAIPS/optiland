@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from optiland.nonsequential._tally import two_sum_error
 from optiland.nonsequential._utils import to_numpy
 from optiland.nonsequential.detectors.base import BaseDetector
 from optiland.nonsequential.results.ray_database import RayDatabase
@@ -69,6 +70,7 @@ class RayDatabaseDetector(BaseDetector):
         self._flux: list[np.ndarray] = []
         self._wavelength: list[np.ndarray] = []
         self._total_flux: float = 0.0
+        self._total_flux_comp: float = 0.0
         self._num_rays_hit: int = 0
 
     def record(self, rays: NSQRayBundle, t: np.ndarray, hit_mask: np.ndarray) -> None:
@@ -103,7 +105,12 @@ class RayDatabaseDetector(BaseDetector):
         hflux = flux_np[hit_mask_np]
         hwl = wl_np[hit_mask_np]
 
-        self._total_flux += float(hflux.sum())
+        # A compensated running total (issue 25 of the research repository):
+        # the rounding error of each batch's addition is kept beside it.
+        term = float(hflux.sum())
+        total = self._total_flux + term
+        self._total_flux_comp += two_sum_error(self._total_flux, term, total)
+        self._total_flux = total
         self._num_rays_hit += len(hx)
 
         if self.store_rays:
@@ -163,7 +170,7 @@ class RayDatabaseDetector(BaseDetector):
             L=np.array([]),
             M=np.array([]),
             N=np.array([]),
-            flux=np.array([self._total_flux]),
+            flux=np.array([self._total_flux + self._total_flux_comp]),
             wavelength=np.array([0.0]),
         )
 
@@ -178,6 +185,7 @@ class RayDatabaseDetector(BaseDetector):
         self._flux.clear()
         self._wavelength.clear()
         self._total_flux = 0.0
+        self._total_flux_comp = 0.0
         self._num_rays_hit = 0
         self.reset_reflection_tally()
         self.invalidate_frame()

@@ -114,12 +114,16 @@ def accumulator_identities(scene: NSQScene, tallies: Iterable[Any]) -> dict[str,
     out: dict[str, Any] = {}
     for i, tally in enumerate(tallies):
         out[f"trace tally {i}"] = ident(tally._dev)
+        if getattr(tally, "_dev_comp", None) is not None:
+            out[f"trace tally {i} compensation"] = ident(tally._dev_comp)
     for kind, owners in (("surface", scene.surfaces), ("detector", scene.detectors)):
         for j, owner in enumerate(owners):
             label = getattr(owner, "name", "") or f"{kind} {j}"
             for attr, value in getattr(owner, "__dict__", {}).items():
                 if isinstance(value, (Tally, _TallyVector)):
                     out[f"{label}.{attr}"] = ident(value._dev)
+                    if getattr(value, "_dev_comp", None) is not None:
+                        out[f"{label}.{attr} compensation"] = ident(value._dev_comp)
                 elif torch.is_tensor(value):
                     out[f"{label}.{attr}"] = ident(value)
     return out
