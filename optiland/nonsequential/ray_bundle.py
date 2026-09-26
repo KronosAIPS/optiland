@@ -19,6 +19,11 @@ import optiland.backend as be
 # silently wrapping or dropping the entry.
 MEDIUM_STACK_MAX_DEPTH = 8
 
+# The optional polarization fields, in order (the same tuple as
+# ``optiland.nonsequential.polarization.POL_FIELDS``, kept here so the bundle
+# does not import the polarization module).
+_POL_FIELDS = ("pol_q", "pol_u", "pol_v", "pol_ex", "pol_ey", "pol_ez")
+
 # Sentinel medium id for "no medium" / unused stack slots.
 MEDIUM_STACK_EMPTY = -1
 
@@ -338,6 +343,30 @@ class NSQRayBundle:
     medium_depth: np.ndarray | None = None
     medium_stack_underflows: np.ndarray | None = None
     reflections: np.ndarray | None = None
+    # Polarization state (the research repository's issue 5), present only
+    # when the trace runs with polarization="stokes" and None otherwise: the
+    # reduced Stokes vector (q, u, v) = (Q, U, V) / I -- I is ``flux`` -- and
+    # the reference axis e (the p direction of the ray's Stokes frame),
+    # shape (N,) each. See :mod:`optiland.nonsequential.polarization` for the
+    # conventions. Every row operation below carries them when present.
+    pol_q: np.ndarray | None = None
+    pol_u: np.ndarray | None = None
+    pol_v: np.ndarray | None = None
+    pol_ex: np.ndarray | None = None
+    pol_ey: np.ndarray | None = None
+    pol_ez: np.ndarray | None = None
+
+    @property
+    def polarized(self) -> bool:
+        """True when the bundle carries the polarization state."""
+        return self.pol_q is not None
+
+    def _carry_polarization(self, kwargs: dict, rows) -> dict:
+        """Add each polarization field, passed through ``rows``, to ``kwargs``."""
+        if self.pol_q is not None:
+            for name in _POL_FIELDS:
+                kwargs[name] = rows(getattr(self, name))
+        return kwargs
 
     def __post_init__(self) -> None:
         if self.k_current is None:
@@ -419,6 +448,7 @@ class NSQRayBundle:
         )
         if self.ray_id is not None:
             kwargs["ray_id"] = self.ray_id[mask]
+        self._carry_polarization(kwargs, lambda a: a[mask])
         return NSQRayBundle(**kwargs)
 
     def take(self, idx) -> NSQRayBundle:
@@ -464,6 +494,7 @@ class NSQRayBundle:
         )
         if self.ray_id is not None:
             kwargs["ray_id"] = self.ray_id[idx]
+        self._carry_polarization(kwargs, lambda a: a[idx])
         return NSQRayBundle(**kwargs)
 
     def advance(self, t: np.ndarray) -> None:
@@ -529,6 +560,7 @@ class NSQRayBundle:
             kwargs["ray_id"] = ray_id
         elif self.ray_id is not None:
             kwargs["ray_id"] = _rows_copy(self.ray_id, idx)
+        self._carry_polarization(kwargs, lambda a: _rows_copy(a, idx))
         return NSQRayBundle(**kwargs)
 
     @staticmethod
@@ -569,4 +601,14 @@ class NSQRayBundle:
         )
         if all(b.ray_id is not None for b in bundles):
             kwargs["ray_id"] = _rows_concat([b.ray_id for b in bundles])
+        polarized = [b.pol_q is not None for b in bundles]
+        if any(polarized):
+            if not all(polarized):
+                raise ValueError(
+                    "NSQRayBundle.concat: some bundles carry the polarization "
+                    "state and some do not; a trace is polarized throughout or "
+                    "not at all"
+                )
+            for name in _POL_FIELDS:
+                kwargs[name] = _rows_concat([getattr(b, name) for b in bundles])
         return NSQRayBundle(**kwargs)

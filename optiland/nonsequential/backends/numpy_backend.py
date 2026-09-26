@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from optiland.nonsequential.backends.array_backend import ArrayBackend
+from optiland.nonsequential.polarization import mode_for_backend
 from optiland.nonsequential.rng import NSQRng
 
 if TYPE_CHECKING:
@@ -35,14 +36,21 @@ class NumpyBackend(ArrayBackend):
     host_reads_free = True
     supports_splitting = True
 
-    def __init__(self, seed: int | None = None) -> None:
+    def __init__(
+        self, seed: int | None = None, polarization: str | bool | None = None
+    ) -> None:
         """Initialize NumpyBackend.
 
         Args:
             seed: Optional random seed for reproducibility.
+            polarization: ``"off"`` or ``"stokes"`` (``True``/``False`` are
+                accepted); ``None`` reads
+                :data:`~optiland.nonsequential.polarization.POLARIZATION_ENV`,
+                unset meaning ``"off"``.
         """
         self.seed = seed
         self.rng = NSQRng(seed)
+        self.polarization = mode_for_backend(polarization)
 
     def _maybe_compact(self, rays: NSQRayBundle, depth: int) -> NSQRayBundle:
         """Compact dead rays after every bounce for the NumPy fast path.

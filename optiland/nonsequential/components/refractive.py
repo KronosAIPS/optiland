@@ -28,6 +28,7 @@ from optiland.nonsequential.components.sampling_support import (
     scatter_branch,
 )
 from optiland.nonsequential.materials.nsq_material import medium_stack_id_value
+from optiland.nonsequential.polarization import fresnel_stokes
 from optiland.nonsequential.ray_bundle import (
     MEDIUM_STACK_EMPTY,
     MEDIUM_STACK_MAX_DEPTH,
@@ -326,6 +327,17 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         R_used = be.where(tir, be.ones_like(R_used), R_used)
         T_used = be.where(tir, be.zeros_like(T_used), T_used)
 
+        # Stokes mode (the research repository's issue 5): R and T become the
+        # polarization-aware M00 + M01 q of the ray's state in this plane of
+        # incidence -- the scalar values bit for bit for an unpolarized ray.
+        stokes = None
+        if rays.pol_q is not None:
+            stokes = fresnel_stokes(
+                rays, dirs, normals, n1, n2, cos_theta_i, sin2_t, tir, rs, rp,
+                R_used, T_used, coating=self.coating, wavelength=wl,
+            )
+            R_used, T_used = stokes.R_eff, stokes.T_eff
+
         # --- Detached-sample / attached-weight ---
         # The decision is detached with detach(), not by copying the value
         # to the host: a branch probability is a number the sampler must
@@ -430,6 +442,8 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         rays.L = be.where(hit_col[:, 0], new_d[:, 0], rays.L)
         rays.M = be.where(hit_col[:, 0], new_d[:, 1], rays.M)
         rays.N = be.where(hit_col[:, 0], new_d[:, 2], rays.N)
+        if stokes is not None:
+            stokes.finish(rays, do_reflect, hit_mask)
 
         # Update n_current/k_current: stays medium 1 on reflect, becomes
         # medium 2 on refract.
@@ -584,6 +598,8 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             rays.L = new_dirs[:, 0]
             rays.M = new_dirs[:, 1]
             rays.N = new_dirs[:, 2]
+            if stokes is not None:
+                stokes.scatter(rays, scatters)
             bsdf_gate = be.where(scatters, bsdf_weights, be.ones_like(bsdf_weights))
             # What the lobe did not return is a surface loss when the weight
             # is a physical fraction of the incident flux, and a surface loss
