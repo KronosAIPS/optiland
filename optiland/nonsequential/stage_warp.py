@@ -61,17 +61,53 @@ from optiland.nonsequential import _tol
 #: Metal backend, and on the CPU Warp runs one serial thread.
 SUPPORTED_DEVICE_TYPES: tuple[str, ...] = ("cuda",)
 
-# No fused multiply-add anywhere in this module: the torch stage rounds every
-# product before the sum, on the CPU and on CUDA alike.
+# No fused multiply-add unless written: the torch stage rounds every product
+# of its elementwise arithmetic before the sum, on the CPU and on CUDA alike.
+# The one place torch does fuse is its matrix product (the frame transform),
+# which is written with an explicit fused multiply-add below.
 wp.set_module_options({"fuse_fp": False, "enable_backward": True})
+
+_FMA_SNIPPET = "return fma(a, b, c);"
+_FMA_ADJ = "adj_a += b * adj_ret; adj_b += a * adj_ret; adj_c += adj_ret;"
+
+
+@wp.func_native(_FMA_SNIPPET, _FMA_ADJ)
+def _fma64(a: wp.float64, b: wp.float64, c: wp.float64) -> wp.float64: ...
+
+
+@wp.func_native(_FMA_SNIPPET, _FMA_ADJ)
+def _fma32(a: wp.float32, b: wp.float32, c: wp.float32) -> wp.float32: ...
 
 #: Layout of the placement vector: translation (3), then the rotation matrix
 #: row-major (9), local = (global - T) @ R, global normal = local normal @ R^T.
 _XF = 12
 
 
-def _make_kernels(FT):
-    """The two intersection kernels for one float type."""
+def _make_kernels(FT, fma):
+    """The two intersection kernels for one float type.
+
+    Two orders are the torch stage's own and are reproduced here, both
+    measured on the Apple silicon CPU with torch 2.14:
+
+    - the (N, 3) @ (3, 3) matrix product is ``fma(a2, R2j, fma(a1, R1j,
+      a0 * R0j))`` for every entry, at both precisions;
+    - a sum over the last axis of an (N, 3) array (``.sum(axis=1)``) is
+      ``(x + z) + y`` at float64 and ``(x + y) + z`` at float32, the lane
+      order of the CPU's vector reduction. The order is a kernel argument
+      (``sum_order``), probed from torch on the device at load time
+      (:func:`sum_order`), so a device whose reduction orders the terms
+      otherwise gets its own.
+    """
+
+    @wp.func
+    def _sum3(x: FT, y: FT, z: FT, order: int):
+        if order == 1:
+            return (x + z) + y
+        return (x + y) + z
+
+    @wp.func
+    def _mm(a0: FT, a1: FT, a2: FT, r0: FT, r1: FT, r2: FT):
+        return fma(a2, r2, fma(a1, r1, a0 * r0))
 
     @wp.func
     def _to_local(
@@ -80,27 +116,27 @@ def _make_kernels(FT):
         px = x - xf[0]
         py = y - xf[1]
         pz = z - xf[2]
-        lx = (px * xf[3] + py * xf[6]) + pz * xf[9]
-        ly = (px * xf[4] + py * xf[7]) + pz * xf[10]
-        lz = (px * xf[5] + py * xf[8]) + pz * xf[11]
+        lx = _mm(px, py, pz, xf[3], xf[6], xf[9])
+        ly = _mm(px, py, pz, xf[4], xf[7], xf[10])
+        lz = _mm(px, py, pz, xf[5], xf[8], xf[11])
         return lx, ly, lz
 
     @wp.func
     def _dir_local(
         x: FT, y: FT, z: FT, xf: wp.array(dtype=FT)
     ):
-        lx = (x * xf[3] + y * xf[6]) + z * xf[9]
-        ly = (x * xf[4] + y * xf[7]) + z * xf[10]
-        lz = (x * xf[5] + y * xf[8]) + z * xf[11]
+        lx = _mm(x, y, z, xf[3], xf[6], xf[9])
+        ly = _mm(x, y, z, xf[4], xf[7], xf[10])
+        lz = _mm(x, y, z, xf[5], xf[8], xf[11])
         return lx, ly, lz
 
     @wp.func
     def _to_global_normal(
         x: FT, y: FT, z: FT, xf: wp.array(dtype=FT)
     ):
-        gx = (x * xf[3] + y * xf[4]) + z * xf[5]
-        gy = (x * xf[6] + y * xf[7]) + z * xf[8]
-        gz = (x * xf[9] + y * xf[10]) + z * xf[11]
+        gx = _mm(x, y, z, xf[3], xf[4], xf[5])
+        gy = _mm(x, y, z, xf[6], xf[7], xf[8])
+        gz = _mm(x, y, z, xf[9], xf[10], xf[11])
         return gx, gy, gz
 
     @wp.func
@@ -137,6 +173,7 @@ def _make_kernels(FT):
         gp: wp.array(dtype=FT),
         ports: wp.array(dtype=FT),
         nports: int,
+        sum_order: int,
         t_hit: wp.array(dtype=FT),
         normals: wp.array2d(dtype=FT),
         hit: wp.array(dtype=wp.bool),
@@ -152,7 +189,7 @@ def _make_kernels(FT):
         inf = gp[3]
         plx, ply, plz = _to_local(x[i], y[i], z[i], xf)
         dx, dy, dz = _dir_local(L[i], M[i], N[i], xf)
-        t_adv = -((plx * dx + ply * dy) + plz * dz)
+        t_adv = -_sum3(plx * dx, ply * dy, plz * dz, sum_order)
         ox = plx + t_adv * dx
         oy = ply + t_adv * dy
         oz = plz + t_adv * dz
@@ -237,6 +274,7 @@ def _make_kernels(FT):
         t_min: wp.array(dtype=FT),
         xf: wp.array(dtype=FT),
         gp: wp.array(dtype=FT),
+        sum_order: int,
         t_hit: wp.array(dtype=FT),
         normals: wp.array2d(dtype=FT),
         hit: wp.array(dtype=wp.bool),
@@ -258,7 +296,7 @@ def _make_kernels(FT):
         inf = gp[8]
         plx, ply, plz = _to_local(x[i], y[i], z[i], xf)
         dx, dy, dz = _dir_local(L[i], M[i], N[i], xf)
-        t_adv = -((plx * dx + ply * dy) + plz * dz)
+        t_adv = -_sum3(plx * dx, ply * dy, plz * dz, sum_order)
         ox = plx + t_adv * dx
         oy = ply + t_adv * dy
         oz = plz + t_adv * dz
@@ -311,12 +349,12 @@ def _make_kernels(FT):
         gx = (negc * px) / s
         gy = (negc * py) / s
         gz = FT(1.0)
-        n_len = wp.sqrt((gx * gx + gy * gy) + gz * gz)
+        n_len = wp.sqrt(_sum3(gx * gx, gy * gy, gz * gz, sum_order))
         den = n_len + tiny
         ngx = gx / den
         ngy = gy / den
         ngz = gz / den
-        dot = (dx * ngx + dy * ngy) + dz * ngz
+        dot = _sum3(dx * ngx, dy * ngy, dz * ngz, sum_order)
         nlx = ngx
         nly = ngy
         nlz = ngz
@@ -347,7 +385,36 @@ def _make_kernels(FT):
     return {"cavity": k_cavity, "conic": k_conic}
 
 
-_KERNELS = {torch.float64: _make_kernels(wp.float64), torch.float32: _make_kernels(wp.float32)}
+_KERNELS = {
+    torch.float64: _make_kernels(wp.float64, _fma64),
+    torch.float32: _make_kernels(wp.float32, _fma32),
+}
+_SUM_ORDER: dict = {}
+
+
+def sum_order(dtype: torch.dtype, device: Any) -> int:
+    """How torch orders a three-term sum over the last axis on this device and dtype.
+
+    0 for ``(x + y) + z``, 1 for ``(x + z) + y``. Probed once with the row
+    ``(s, 1, s)``, ``s`` half an ulp of 1: summed as ``(s + 1) + s`` it rounds
+    to 1 twice (ties to even), summed as ``(s + s) + 1`` it is ``1 + 2 s``
+    exactly. Cached per dtype and device.
+
+    Args:
+        dtype: The working float dtype.
+        device: The torch device.
+
+    Returns:
+        The order flag the kernels take.
+    """
+    key = (dtype, str(device))
+    order = _SUM_ORDER.get(key)
+    if order is None:
+        half_ulp = 2.0**-53 if dtype == torch.float64 else 2.0**-24
+        probe = torch.tensor([[half_ulp, 1.0, half_ulp]], dtype=dtype, device=device)
+        order = 0 if float(probe.sum(dim=1)[0]) == 1.0 else 1
+        _SUM_ORDER[key] = order
+    return order
 _WP_FLOAT = {torch.float64: wp.float64, torch.float32: wp.float32}
 
 _prepared: set = set()
@@ -374,6 +441,10 @@ def prepare(device: Any) -> None:
     if name in _prepared:
         return
     wp.load_module(module=__name__, device=wp.device_from_torch(tdev))
+    # The sum-order probe reads a value to the host: done here, before any
+    # bounce, never inside a recorded one.
+    for dtype in (torch.float64, torch.float32):
+        sum_order(dtype, tdev)
     _prepared.add(name)
 
 
@@ -573,6 +644,7 @@ def _launch(kind, inputs_t, outputs_t, nports, *, requires_grad=False, tape=None
     args = list(wp_in)
     if kind == "cavity":
         args.append(int(nports))
+    args.append(sum_order(like.dtype, like.device))
     n = int(like.shape[0])
     kwargs = {"dim": n, "inputs": args, "outputs": wp_out}
     if tdev.type == "cuda":
