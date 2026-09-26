@@ -45,10 +45,20 @@ on both backends through plain Python operators (``+ * & | ^ << >>``):
   rather than a 64-step doubling loop, which is both fewer array operations
   and free of any data-dependent control flow.
 
-The uniform is produced in the backend's working float dtype. At float64 it
-is the same double as the host implementation returns, bit for bit; at
-float32 it is that same value rounded to float32, which is the price of
-running the conversion where the rays live.
+The uniform is produced in the backend's working float dtype, from the 32-bit
+output ``k``, and it is always in the half-open interval [0, 1):
+
+* at float64 it is ``k * 2**-32``: the conversion is exact, the same double
+  the host reference gives, and its largest value is ``1 - 2**-32``;
+* at float32 it is ``(k >> 8) * 2**-24``: the top 24 bits, an integer below
+  ``2**24`` that float32 holds exactly, scaled by a power of two, so the
+  value is exact on every device and its largest is ``1 - 2**-24``.
+
+Until issue 62 of the research repository the float32 uniform was the float64
+one rounded to float32; every ``k`` from ``2**32 - 128`` up rounded to exactly
+1.0 (probability ``2**-25`` per draw). :func:`uniform_bits` says which bits a
+precision's uniform is made of, and a trace records it at float32 in
+``SimulationResult.environment["uniform_bits"]``.
 
 On CUDA the same draw can run as one Warp kernel instead of the limb
 arithmetic (:mod:`optiland.nonsequential.rng_warp`, opted into with
@@ -94,6 +104,14 @@ _U64_1 = np.uint64(1)
 _U32_31 = np.uint32(31)
 
 _TWO_POW_32 = 4294967296.0
+
+# The float32 uniform: the top 24 of the 32 output bits, times 2**-24. Every
+# integer below 2**24 is exact in float32, and so is the scaling, so the
+# largest value is 1 - 2**-24 and 1.0 is never drawn (issue 62 of the
+# research repository).
+_FLOAT32_UNIFORM_BITS = 24
+_FLOAT32_UNIFORM_SHIFT = 32 - _FLOAT32_UNIFORM_BITS
+_TWO_POW_MINUS_24 = 2.0**-_FLOAT32_UNIFORM_BITS
 
 # Plain-int mirrors of the constants above, for the limb path.
 _MULT_INT = 6364136223846793005
@@ -556,9 +574,10 @@ def pcg32_uniform(
 ) -> Any:
     """Draw one PCG32-derived uniform float per key, in [0, 1).
 
-    The conversion is exact at float64 -- 32 bits of mantissa are plenty --
-    so the value matches the host reference double for double. At float32
-    it is that double rounded to float32.
+    At float64 the value is the 32-bit output times ``2**-32``, exact, so it
+    matches the host reference double for double. At float32 it is the top
+    24 bits of the output times ``2**-24``, also exact, so no draw rounds up
+    to 1.0 (see :func:`uniform_bits` and the module docstring).
 
     Args:
         seed: Trace-level RNG seed.
@@ -572,7 +591,35 @@ def pcg32_uniform(
         working precision.
     """
     bits = pcg32_uint32(seed, ray_id, bounce, event_slot, offset)
-    return be.cast(bits) / _TWO_POW_32
+    if be.get_precision() == 64:
+        return be.cast(bits) / _TWO_POW_32
+    return be.cast(bits >> _FLOAT32_UNIFORM_SHIFT) * _TWO_POW_MINUS_24
+
+
+def uniform_bits(precision: int | str | None = None) -> int:
+    """How many of the 32 output bits the uniform is made of, at a precision.
+
+    32 at float64 (the output times ``2**-32``, exact); 24 at float32 (the
+    top 24 bits times ``2**-24``, exact). Both the limb path and the Warp
+    kernel (:mod:`optiland.nonsequential.rng_warp`) form the uniform this
+    way, so the answer is the same for either.
+
+    Args:
+        precision: 32, 64, ``"float32"`` or ``"float64"``; the active
+            backend's working precision when omitted.
+
+    Returns:
+        32 or 24.
+    """
+    if precision is None:
+        precision = be.get_precision()
+    if precision in (64, "float64"):
+        return 32
+    if precision in (32, "float32"):
+        return _FLOAT32_UNIFORM_BITS
+    raise ValueError(
+        f"unknown precision {precision!r}; expected 32, 64, 'float32' or 'float64'"
+    )
 
 
 class NSQRng:

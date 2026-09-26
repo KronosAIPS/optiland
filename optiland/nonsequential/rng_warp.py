@@ -18,17 +18,20 @@ arithmetic that wraps modulo 2**64, so the same draw is one kernel launch:
     state_d   = MULT**d * state_0 + inc * (MULT**d - 1) / (MULT - 1),
                 d = bounce + offset                         (jump-ahead)
     bits      = xsh_rr(state_d)                             (32 bits)
-    u         = float(bits) * 2**-32                        (working dtype)
+    u         = float64(bits) * 2**-32                      (float64)
+    u         = float32(bits >> 8) * 2**-24                 (float32)
 
 The jump-ahead is the doubling identity of the host reference
 (``rng._pcg32_advance``), run while the remaining step count is non-zero;
 the limb path composes the same affine map from four 16-bit table lookups.
 Both are exact modulo 2**64, so the state, the 32 output bits and the
 uniform are the same bit for bit: at float64 the conversion is exact, and at
-float32 both paths round the 32-bit integer to nearest (``cvt.rn`` on CUDA)
-and then scale by a power of two, which is exact. The scale is passed to the
-kernel as a value rather than written as a literal, so neither compiler can
-choose a different constant.
+float32 both paths take the top 24 bits, an integer that float32 holds
+exactly, and scale it by a power of two, which is exact too, so no rounding
+mode enters and 1.0 is never drawn (issue 62 of the research repository;
+:func:`optiland.nonsequential.rng.uniform_bits`). The shift and the scale are
+passed to the kernel as values rather than written as literals, so neither
+compiler can choose a different constant.
 
 Use it through the torch backend, ``TorchBackend(rng_kernel="warp")``. The
 backend uses this kernel only when Warp imports and the device is CUDA;
@@ -67,6 +70,10 @@ from optiland.nonsequential.rng import NSQRng
 SUPPORTED_DEVICE_TYPES: tuple[str, ...] = ("cuda",)
 
 _TWO_POW_MINUS_32 = 2.0**-32
+#: The float32 uniform: the top 24 of the 32 output bits, times 2**-24, as
+#: the limb path forms it (``rng.pcg32_uniform``).
+_TWO_POW_MINUS_24 = _rng._TWO_POW_MINUS_24
+_FLOAT32_SHIFT = _rng._FLOAT32_UNIFORM_SHIFT
 _I64_MIN = -(1 << 63)
 
 
@@ -186,12 +193,14 @@ def _k_uniform32(
     use_scalar: wp.int32,
     offset: wp.int64,
     k: _Keys,
+    shift: wp.uint32,
     scale: wp.float32,
     out: wp.array(dtype=wp.float32),
 ):
     i = wp.tid()
     d = _delta(bounce, bounce_scalar, use_scalar, offset, i)
-    out[i] = wp.float32(_xsh_rr(_state_after(wp.uint64(ray_id[i]), d, k))) * scale
+    top = _xsh_rr(_state_after(wp.uint64(ray_id[i]), d, k)) >> shift
+    out[i] = wp.float32(top) * scale
 
 
 @wp.kernel(enable_backward=False)
@@ -281,6 +290,7 @@ def _launch(
     slot_mix: int,
     out: torch.Tensor,
     scale: float | None = None,
+    shift: int | None = None,
 ) -> None:
     _init()
     n = int(ray_id.shape[0])
@@ -295,6 +305,8 @@ def _launch(
         wp.int64(offset),
         _keys(initstate, slot_mix),
     ]
+    if shift is not None:
+        inputs.append(wp.uint32(shift))
     if scale is not None:
         inputs.append(
             wp.float64(scale) if out.dtype == torch.float64 else wp.float32(scale)
@@ -352,7 +364,10 @@ def _op_uniform(
 ) -> torch.Tensor:
     dtype = torch.float64 if double else torch.float32
     out = torch.empty(ray_id.shape[0], dtype=dtype, device=ray_id.device)
-    kernel = _k_uniform64 if double else _k_uniform32
+    if double:
+        kernel, scale, shift = _k_uniform64, _TWO_POW_MINUS_32, None
+    else:
+        kernel, scale, shift = _k_uniform32, _TWO_POW_MINUS_24, _FLOAT32_SHIFT
     _launch(
         kernel,
         ray_id,
@@ -363,7 +378,8 @@ def _op_uniform(
         initstate,
         slot_mix,
         out,
-        _TWO_POW_MINUS_32,
+        scale,
+        shift,
     )
     return out
 

@@ -88,6 +88,11 @@ class SimulationResult:
             same bit for bit, only the cost differs). A backend with a
             choice also records what was asked for (``rng_kernel_requested``)
             and, when it could not be honoured, why (``rng_kernel_note``).
+            At float32, ``uniform_bits`` says how many of the generator's
+            32 output bits each uniform is made of (24: the top 24 bits
+            times 2**-24; :func:`optiland.nonsequential.rng.uniform_bits`).
+            A float32 record without it was drawn with the earlier
+            construction, the 32-bit output rounded to float32.
     """
 
     detectors: dict[str, object] = field(default_factory=dict)
