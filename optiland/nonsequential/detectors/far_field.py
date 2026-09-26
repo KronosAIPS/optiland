@@ -20,7 +20,8 @@ from optiland.nonsequential.components.geometry.analytic.plane import (
 from optiland.nonsequential.detectors.base import (
     BaseDetector,
     _accumulate_into,
-    _new_flat_accumulator,
+    _new_bin_accumulator,
+    bin_values,
 )
 from optiland.nonsequential.results.far_field_pattern import FarFieldPattern
 
@@ -87,7 +88,7 @@ class FarFieldDetector(BaseDetector):
         # The widest float the device has (float64; float32 on Apple's mps),
         # on the active backend and device, mutated in place by every
         # record() call -- see accumulator_dtype in detectors/base.py.
-        self._intensity = _new_flat_accumulator(num_bins_theta * num_bins_phi)
+        self._intensity = _new_bin_accumulator(num_bins_theta * num_bins_phi)
         self._num_rays_hit = 0
         self._total_flux = Tally()
 
@@ -163,6 +164,7 @@ class FarFieldDetector(BaseDetector):
             self._intensity,
             i_theta * self.num_bins_phi + i_phi,
             flux_masked / solid_angle,
+            key=getattr(rays, "ray_id", None),
         )
         self._num_rays_hit = accumulate(self._num_rays_hit, masked_count(hit_mask))
         # Track the radiometric flux separately: _intensity is divided by the
@@ -197,7 +199,7 @@ class FarFieldDetector(BaseDetector):
         """
         theta_centres = 0.5 * (self._theta_edges[:-1] + self._theta_edges[1:])
         phi_centres = 0.5 * (self._phi_edges[:-1] + self._phi_edges[1:])
-        intensity = to_numpy(self._intensity).reshape(
+        intensity = to_numpy(bin_values(self._intensity)).reshape(
             self.num_bins_theta, self.num_bins_phi
         )
         return FarFieldPattern(
@@ -210,7 +212,7 @@ class FarFieldDetector(BaseDetector):
 
     def reset(self) -> None:
         """Clear accumulated data."""
-        self._intensity = _new_flat_accumulator(self.num_bins_theta * self.num_bins_phi)
+        self._intensity = _new_bin_accumulator(self.num_bins_theta * self.num_bins_phi)
         self._num_rays_hit = 0
         self._total_flux = Tally()
         self.reset_reflection_tally()

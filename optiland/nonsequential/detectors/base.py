@@ -96,6 +96,111 @@ def _new_flat_accumulator(size: int):
     return buf
 
 
+#: The largest number of elements a detector's row accumulator holds (2 MiB
+#: of float64), and the largest number of rows it is split into.
+_BIN_ROWS_MAX_ELEMENTS = 1 << 18
+_BIN_ROWS_MAX = 1 << 16
+
+
+def bin_rows(size: int) -> int:
+    """How many rows a float64 accumulator of ``size`` bins is split into.
+
+    The largest power of two with ``rows * size <= _BIN_ROWS_MAX_ELEMENTS``,
+    at most :data:`_BIN_ROWS_MAX` and at least 1. A function of the
+    detector's size alone, so the same for every batch size and device.
+
+    Args:
+        size: Number of bins.
+
+    Returns:
+        The number of rows, a power of two.
+    """
+    rows = min(_BIN_ROWS_MAX, max(1, _BIN_ROWS_MAX_ELEMENTS // max(int(size), 1)))
+    return 1 << (rows.bit_length() - 1)
+
+
+def _new_bin_accumulator(size: int):
+    """Create a detector's persistent accumulation buffer, split into rows by ray.
+
+    A plain scatter-add into a bin adds its contributions one after another,
+    so a bin that receives ``K`` of them rounds as ``K u``, not as the
+    ``log2(K) u`` of a pairwise sum: the catalogue's window adds 3.7 million
+    equal weights into one bin and its ledger closed to 4.0e-11 against the
+    1e-11 of section 10.3 of the theory (KronosNSRT issue 23). Where the
+    device has a float64 accumulator the buffer is therefore ``(rows,
+    size)``: a contribution of ray ``i`` is added into row ``i % rows``
+    (:func:`_accumulate_into`), so a bin's ``K`` contributions are spread over
+    ``rows`` running sums of about ``K / rows`` terms, and the rows are
+    reduced pairwise when the detector is read (:func:`bin_values`). The
+    error per bin is about ``(K / rows + log2 rows) u``.
+
+    The row is chosen by the ray's id, not by its position in the batch, so
+    a row receives the same contributions in the same order whatever the
+    batch size: wherever a plain scatter-add was bit-identical across batch
+    sizes this one is too. The buffer is added into in place and never
+    rebound, as before. Where the widest float is float32 (Apple's ``mps``)
+    the buffer is the flat one of :func:`_new_flat_accumulator`, accumulated
+    by the grouped scatter-add as before.
+
+    Args:
+        size: Number of bins.
+
+    Returns:
+        A zero-filled ``(rows, size)`` float64 buffer, or a flat float32 one.
+    """
+    if accumulator_dtype() != be.float64:
+        return _new_flat_accumulator(size)
+    buf = be.zeros((bin_rows(size), size), dtype=be.float64)
+    if getattr(buf, "requires_grad", False):
+        buf = buf.detach()
+    return buf
+
+
+def bin_values(buffer):
+    """A detector buffer's bins: its rows reduced pairwise, or the flat buffer itself.
+
+    Args:
+        buffer: A buffer from :func:`_new_bin_accumulator` or
+            :func:`_new_flat_accumulator`, or ``None``.
+
+    Returns:
+        The flat ``(size,)`` bins on the buffer's library and device (a view
+        of the buffer when it has one row), attached to any graph the
+        contributions carried; ``None`` for ``None``.
+    """
+    if buffer is None or len(buffer.shape) == 1:
+        return buffer
+    rows = buffer
+    while rows.shape[0] > 1:
+        rows = rows[0::2] + rows[1::2]
+    return rows[0]
+
+
+def _row_flat_index(buffer, flat, key):
+    """The flat index into a row buffer: row ``key % rows``, bin ``flat``.
+
+    Args:
+        buffer: A ``(rows, size)`` accumulation buffer.
+        flat: Bin index per contribution, in the buffer's index format.
+        key: Ray id per contribution (same format), or ``None`` to deal the
+            contributions round-robin by position.
+
+    Returns:
+        The index into the buffer's flat storage.
+    """
+    rows, size = int(buffer.shape[0]), int(buffer.shape[1])
+    if rows == 1:
+        return flat
+    if key is None:
+        if is_torch_tensor(flat):
+            import torch  # noqa: PLC0415
+
+            key = torch.arange(flat.shape[0], device=flat.device, dtype=flat.dtype)
+        else:
+            key = np.arange(np.shape(flat)[0])
+    return (key % rows) * size + flat
+
+
 def _flat_index_like(buffer, flat_np):
     """Convert a flat-index array to ``buffer``'s format.
 
@@ -117,7 +222,7 @@ def _flat_index_like(buffer, flat_np):
     return flat_np
 
 
-def _accumulate_into(buffer, flat_np, contribution) -> None:
+def _accumulate_into(buffer, flat_np, contribution, key=None) -> None:
     """Scatter-add ``contribution`` into ``buffer`` in place, in the buffer's dtype.
 
     ``buffer`` is a persistent accumulation buffer created by
@@ -137,10 +242,16 @@ def _accumulate_into(buffer, flat_np, contribution) -> None:
     (docs/theory/12_gpu_mapping.md S12.5) and so carries no gradient, but it
     is computed beside the ray state and stays there.
 
+    A ``(rows, size)`` buffer from :func:`_new_bin_accumulator` takes each
+    contribution into the row of its ray (``key % rows``); see there.
+
     Args:
-        buffer: Persistent accumulation buffer, shape (size,).
+        buffer: Persistent accumulation buffer, shape (size,) or (rows, size).
         flat_np: Flat bin indices for each contribution, shape (K,), integer.
         contribution: Values to add, shape (K,), any array-like.
+        key: The ray id of each contribution, shape (K,), for a row buffer:
+            ``rays.ray_id``. ``None`` deals the contributions round-robin by
+            position (bounded the same way, but not batch-invariant).
     """
     if is_torch_tensor(buffer):
         import torch  # noqa: PLC0415
@@ -155,13 +266,21 @@ def _accumulate_into(buffer, flat_np, contribution) -> None:
         # one-call copy from Apple's mps writes zeros there). On one device
         # this is the plain cast it always was.
         src = to_device_dtype(contribution, buffer.device, buffer.dtype)
-        if buffer.dtype == torch.float32:
+        if buffer.dim() == 2:
+            rows_key = None if key is None else _flat_index_like(buffer, key)
+            buffer.view(-1).index_add_(0, _row_flat_index(buffer, idx, rows_key), src)
+        elif buffer.dtype == torch.float32:
             _grouped_index_add_(buffer, idx, src)
         else:
             buffer.index_add_(0, idx, src)
         return
 
     contrib_np = to_numpy(contribution).astype(buffer.dtype, copy=False)
+    if buffer.ndim == 2:
+        key_np = None if key is None else np.asarray(to_numpy(key))
+        flat_np = _row_flat_index(buffer, np.asarray(to_numpy(flat_np)), key_np)
+        np.add.at(buffer.reshape(-1), flat_np, contrib_np)
+        return
     np.add.at(buffer, flat_np, contrib_np)
 
 
@@ -510,9 +629,9 @@ class BaseDetector(ABC):
         """
         if self.reflection_bins > 0:
             size = self.reflection_bins + 1
-            self._refl_flux = _new_flat_accumulator(size)
-            self._refl_flux_sq = _new_flat_accumulator(size)
-            self._refl_hits = _new_flat_accumulator(size)
+            self._refl_flux = _new_bin_accumulator(size)
+            self._refl_flux_sq = _new_bin_accumulator(size)
+            self._refl_hits = _new_bin_accumulator(size)
         else:
             self._refl_flux = None
             self._refl_flux_sq = None
@@ -545,9 +664,10 @@ class BaseDetector(ABC):
         zero = be.zeros_like(rays.flux)
         weight = be.where(hit_mask, rays.flux, zero)
         hits = be.where(hit_mask, be.ones_like(rays.flux), zero)
-        _accumulate_into(self._refl_flux, bins, weight)
-        _accumulate_into(self._refl_flux_sq, bins, weight * weight)
-        _accumulate_into(self._refl_hits, bins, hits)
+        key = getattr(rays, "ray_id", None)
+        _accumulate_into(self._refl_flux, bins, weight, key=key)
+        _accumulate_into(self._refl_flux_sq, bins, weight * weight, key=key)
+        _accumulate_into(self._refl_hits, bins, hits, key=key)
 
     def reflection_histogram(self):
         """The arriving flux by reflection count, or ``None`` without bins.
@@ -563,9 +683,10 @@ class BaseDetector(ABC):
             ReflectionHistogram,
         )
 
-        flux = np.asarray(to_numpy(self._refl_flux), dtype=np.float64)
-        flux_sq = np.asarray(to_numpy(self._refl_flux_sq), dtype=np.float64)
-        hits = np.rint(np.asarray(to_numpy(self._refl_hits), dtype=np.float64))
+        refl_flux = bin_values(self._refl_flux)
+        flux = np.asarray(to_numpy(refl_flux), dtype=np.float64)
+        flux_sq = np.asarray(to_numpy(bin_values(self._refl_flux_sq)), dtype=np.float64)
+        hits = np.rint(np.asarray(to_numpy(bin_values(self._refl_hits)), dtype=np.float64))
         return ReflectionHistogram(
             flux=flux[:-1].copy(),
             flux_sq=flux_sq[:-1].copy(),
@@ -573,7 +694,7 @@ class BaseDetector(ABC):
             overflow_flux=float(flux[-1]),
             overflow_flux_sq=float(flux_sq[-1]),
             overflow_num_rays_hit=int(hits[-1]),
-            data=self._refl_flux,
+            data=refl_flux,
         )
 
     @abstractmethod

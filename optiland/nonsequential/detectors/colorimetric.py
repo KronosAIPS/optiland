@@ -30,7 +30,7 @@ import numpy as np
 import optiland.backend as be
 from optiland.nonsequential._tally import Tally
 from optiland.nonsequential._utils import clamp_int, floor_to_int, int_to_float_like, to_numpy
-from optiland.nonsequential.detectors.base import _new_flat_accumulator
+from optiland.nonsequential.detectors.base import _new_bin_accumulator, bin_values
 from optiland.nonsequential.detectors.far_field import FarFieldDetector
 from optiland.nonsequential.detectors.irradiance import IrradianceDetector
 
@@ -85,7 +85,7 @@ class _TristimulusMixin:
 
     def _init_channels(self, size: int) -> None:
         self._size = size
-        self._channels = [_new_flat_accumulator(size) for _ in range(3)]
+        self._channels = [_new_bin_accumulator(size) for _ in range(3)]
         self._cmf = cmf_table()
 
     def _weights(self, wavelength_um):
@@ -124,10 +124,12 @@ class _TristimulusMixin:
     def reset(self) -> None:
         """Clear the radiometric map and the three channels."""
         super().reset()
-        self._channels = [_new_flat_accumulator(self._size) for _ in range(3)]
+        self._channels = [_new_bin_accumulator(self._size) for _ in range(3)]
 
     def _tristimulus(self) -> np.ndarray:
-        return np.stack([np.asarray(to_numpy(ch), dtype=np.float64) for ch in self._channels])
+        return np.stack(
+            [np.asarray(to_numpy(bin_values(ch)), dtype=np.float64) for ch in self._channels]
+        )
 
 
 class ColorimetricDetector(_TristimulusMixin, IrradianceDetector):
