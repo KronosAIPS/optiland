@@ -216,10 +216,13 @@ def _ulps(a: torch.Tensor, b: torch.Tensor) -> float:
 @pytest.mark.parametrize("precision", ["float64", "float32"])
 @pytest.mark.parametrize("case", sorted(_CASES))
 def test_the_stage_is_the_components_own_intersect(torch_backend_state, device, precision, case):
-    """``t``, both normals, the hit mask and ``_local_root``, bit for bit on the CPU.
+    """``t``, both normals, the hit mask and ``_local_root``, bit for bit on every device.
 
-    On CUDA the kernel is compared within the float64 summation window: torch's
-    own CUDA matrix product and reductions are not ordered as on the CPU.
+    On CUDA the kernels follow torch's own CUDA orders, probed at load: the
+    division by a host scalar as a product with the reciprocal, the sums over
+    the last axis, and the placement product's per-row order (research
+    repository issue 77; before that the rotated cavity's normals were up to
+    3,209 ulp apart on the A100).
     """
     stage = _stage()
     _use_device(device)
@@ -238,10 +241,43 @@ def test_the_stage_is_the_components_own_intersect(torch_backend_state, device, 
     names = ("t", "normals", "hit_mask", "n_geom", "t_adv", "t_local")
     for name, a, b in zip(names, (*ref, *ref_root), (*got, *got_root), strict=True):
         assert a.dtype == b.dtype and a.shape == b.shape, name
-        if device == "cpu" or a.dtype == torch.bool:
-            np.testing.assert_array_equal(_bits(a), _bits(b), err_msg=name)
-        else:
-            assert _ulps(a, b) <= _CUDA_FLOAT64_MAX_ULP, name
+        np.testing.assert_array_equal(_bits(a), _bits(b), err_msg=name)
+
+
+_SWEEP_WIDTHS = list(range(1, 70)) + [127, 128, 129, 1000, 1003, 4099]
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("precision", ["float64", "float32"])
+@pytest.mark.parametrize("case", ["cavity-rotated", "conic-hyperboloid-rotated"])
+def test_the_stage_is_bit_identical_at_every_width(torch_backend_state, device, precision, case):
+    """Every output bit equal to the component's own intersect at widths 1 to 69 and a few odd large ones.
+
+    torch's placement product rounds its rows in an order that depends on the
+    width (a small-width cuBLAS kernel on the A100, a tail loop on the Apple
+    silicon CPU; research repository issue 77); the kernels follow the order
+    probed at load, row by row, and a width no order matches runs the torch
+    stage. The test also requires that the kernels ran at every width.
+    """
+    stage = _stage()
+    _use_device(device)
+    be.set_precision(precision)
+    comp, (p, d, alive) = _CASES[case]()
+    comp.refresh_backend_transform()
+    kind = stage.kind_of(comp)
+    dtype = torch.float64 if precision == "float64" else torch.float32
+    tables = stage.matmul_orders(dtype, torch.device(be.get_device()))
+    assert tables.refusal is None
+    for n in _SWEEP_WIDTHS:
+        assert tables.covers(n), f"no probed order reproduces torch's product at width {n}"
+        rays = _bundle(p[:n], d[:n], alive[:n])
+        ref = comp.intersect(rays)
+        ref_root = comp._local_root
+        got = stage.intersect_component(comp, kind, rays, stage.accept_threshold(rays))
+        got_root = comp._local_root
+        for name, a, b in zip(("t", "normals", "hit_mask", "n_geom", "t_adv", "t_local"),
+                              (*ref, *ref_root), (*got, *got_root), strict=True):
+            np.testing.assert_array_equal(_bits(a), _bits(b), err_msg=f"{name} at width {n}")
 
 
 def test_components_the_kernels_do_not_cover_keep_their_own_intersect(torch_backend_state):

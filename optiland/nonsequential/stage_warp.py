@@ -34,16 +34,19 @@ torch stage does not fuse, and every expression is evaluated in the order the
 torch stage evaluates it; the scalars a torch expression takes from Python
 floats are cast to the working dtype on the host as torch casts them. Three
 orders are torch's own and are reproduced from measurement rather than from
-the source text: the matrix product of the frame transform is a chain of
-fused multiply-adds (written with an explicit ``fma``); a sum over the last
-axis of an (N, 3) array is ordered by the device's vector reduction (probed
-at load, :func:`sum_order`); and a division by a Python number may be a
-product with the rounded reciprocal (probed at load, :func:`scalar_division`).
-On the Apple silicon CPU the stage is bit-identical to ``BaseComponent
-.intersect`` at float64 and float32, rotated placements included. On CUDA
-the first A100 run found one-ulp differences in the cavity's normals and
-larger ones for a rotated placement (cuBLAS orders the transform otherwise);
-see the tests.
+the source text, each probed on the device at load: the placement product
+``(N, 3) @ (3, 3)``, whose rounding order the matrix library chooses by the
+width and, on the CPU, row by row (:func:`matmul_orders`; mostly a chain of
+fused multiply-adds, written with an explicit ``fma``); a sum over the last
+axis of an (N, 3) array, ordered by the device's reduction
+(:func:`sum_order`); and a division by a Python number, which torch's CUDA
+kernel takes as a product with the rounded reciprocal
+(:func:`scalar_division`). Measured on the A100 (2026-09-27, research
+repository issue 77): the first CUDA run's differences (one ulp in the
+cavity's normals, up to 3,209 ulp in a rotated one's) were the division
+alone, and cuBLAS rounds the product as the CPU does from 17 rows up but
+otherwise below; with all three probed the stage is bit-identical to
+``BaseComponent.intersect`` (see the tests, which run on CUDA where present).
 
 **Gradients.** In gradient mode the launch is recorded on a Warp tape inside
 a ``torch.autograd.Function``, and the backward pass replays the tape's
@@ -92,6 +95,25 @@ def _fma32(a: wp.float32, b: wp.float32, c: wp.float32) -> wp.float32: ...
 #: row-major (9), local = (global - T) @ R, global normal = local normal @ R^T.
 _XF = 12
 
+#: The orders a three-term dot product ``a0 r0 + a1 r1 + a2 r2`` can be
+#: rounded in, as the matrix product of a library forms it: the products taken
+#: in one of six orders, the second and the third term added either by a
+#: fused multiply-add or as a separately rounded product. Code
+#: ``4 * permutation + 2 * fused_second + fused_third``.
+MM_ORDERS: tuple[tuple[tuple[int, int, int], int, int], ...] = tuple(
+    (perm, f1, f2)
+    for perm in ((0, 1, 2), (0, 2, 1), (1, 0, 2), (1, 2, 0), (2, 0, 1), (2, 1, 0))
+    for f1 in (0, 1)
+    for f2 in (0, 1)
+)
+#: The fused multiply-add chain ``fma(a2, r2, fma(a1, r1, a0 r0))``: torch's
+#: product on the Apple silicon CPU and cuBLAS's on the A100 for most widths.
+MM_FMA_CHAIN = wp.constant(3)
+#: Widths below this are probed row by row at load time; from it on the
+#: product is modelled as one main order with the last ``n mod block`` rows in
+#: their own orders, probed at widths 4,096 to 4,111 and 65,536 to 65,539.
+MM_SMALL = 65
+
 
 def _make_kernels(FT, fma):
     """The two intersection kernels for one float type.
@@ -122,38 +144,115 @@ def _make_kernels(FT, fma):
         return x / s
 
     @wp.func
-    def _mm(a0: FT, a1: FT, a2: FT, r0: FT, r1: FT, r2: FT):
-        return fma(a2, r2, fma(a1, r1, a0 * r0))
+    def _term(k: int, a0: FT, a1: FT, a2: FT, r0: FT, r1: FT, r2: FT):
+        if k == 0:
+            return a0, r0
+        if k == 1:
+            return a1, r1
+        return a2, r2
+
+    @wp.func
+    def _mm(a0: FT, a1: FT, a2: FT, r0: FT, r1: FT, r2: FT, code: int):
+        # One entry of an (N, 3) @ (3, 3) product in the rounding order
+        # ``code`` names (see MM_ORDERS): the three products taken in the
+        # order of the permutation, the second and the third added either
+        # with a fused multiply-add or as a rounded product.
+        if code == MM_FMA_CHAIN:
+            return fma(a2, r2, fma(a1, r1, a0 * r0))
+        p = code // 4
+        i0 = int(0)
+        i1 = int(1)
+        i2 = int(2)
+        if p == 1:
+            i1 = 2
+            i2 = 1
+        elif p == 2:
+            i0 = 1
+            i1 = 0
+        elif p == 3:
+            i0 = 1
+            i1 = 2
+            i2 = 0
+        elif p == 4:
+            i0 = 2
+            i1 = 0
+            i2 = 1
+        elif p == 5:
+            i0 = 2
+            i2 = 0
+        x0, y0 = _term(i0, a0, a1, a2, r0, r1, r2)
+        x1, y1 = _term(i1, a0, a1, a2, r0, r1, r2)
+        x2, y2 = _term(i2, a0, a1, a2, r0, r1, r2)
+        acc = x0 * y0
+        if (code // 2) % 2 == 1:
+            acc = fma(x1, y1, acc)
+        else:
+            acc = acc + x1 * y1
+        if code % 2 == 1:
+            acc = fma(x2, y2, acc)
+        else:
+            acc = acc + x2 * y2
+        return acc
+
+    @wp.func
+    def _row_code(
+        i: int, n: int, form: int,
+        small: wp.array3d(dtype=int), meta: wp.array(dtype=int), tail: wp.array3d(dtype=int),
+    ):
+        # The rounding order torch's product gave row ``i`` of an ``n``-row
+        # product at load time (form 0: ``a @ R``, form 1: ``a @ R.T``):
+        # measured row by row below MM_SMALL rows, above it a main order with
+        # the last ``n mod block`` rows in their own orders, in one of two
+        # regimes (MatmulOrders.code is the same function on the host).
+        if n < small.shape[1]:
+            return small[form, n, i]
+        reg = int(1)
+        if n < meta[5 * form + 4]:
+            reg = 0
+        block = meta[5 * form + 2 * reg + 1]
+        base = n - n % block
+        if i < base:
+            return meta[5 * form + 2 * reg]
+        return tail[2 * form + reg, n % block, i - base]
 
     @wp.func
     def _to_local(
-        x: FT, y: FT, z: FT, xf: wp.array(dtype=FT)
+        x: FT, y: FT, z: FT, xf: wp.array(dtype=FT), code: int
     ):
         px = x - xf[0]
         py = y - xf[1]
         pz = z - xf[2]
-        lx = _mm(px, py, pz, xf[3], xf[6], xf[9])
-        ly = _mm(px, py, pz, xf[4], xf[7], xf[10])
-        lz = _mm(px, py, pz, xf[5], xf[8], xf[11])
+        lx = _mm(px, py, pz, xf[3], xf[6], xf[9], code)
+        ly = _mm(px, py, pz, xf[4], xf[7], xf[10], code)
+        lz = _mm(px, py, pz, xf[5], xf[8], xf[11], code)
         return lx, ly, lz
 
     @wp.func
     def _dir_local(
-        x: FT, y: FT, z: FT, xf: wp.array(dtype=FT)
+        x: FT, y: FT, z: FT, xf: wp.array(dtype=FT), code: int
     ):
-        lx = _mm(x, y, z, xf[3], xf[6], xf[9])
-        ly = _mm(x, y, z, xf[4], xf[7], xf[10])
-        lz = _mm(x, y, z, xf[5], xf[8], xf[11])
+        lx = _mm(x, y, z, xf[3], xf[6], xf[9], code)
+        ly = _mm(x, y, z, xf[4], xf[7], xf[10], code)
+        lz = _mm(x, y, z, xf[5], xf[8], xf[11], code)
         return lx, ly, lz
 
     @wp.func
     def _to_global_normal(
-        x: FT, y: FT, z: FT, xf: wp.array(dtype=FT)
+        x: FT, y: FT, z: FT, xf: wp.array(dtype=FT), code: int
     ):
-        gx = _mm(x, y, z, xf[3], xf[4], xf[5])
-        gy = _mm(x, y, z, xf[6], xf[7], xf[8])
-        gz = _mm(x, y, z, xf[9], xf[10], xf[11])
+        gx = _mm(x, y, z, xf[3], xf[4], xf[5], code)
+        gy = _mm(x, y, z, xf[6], xf[7], xf[8], code)
+        gz = _mm(x, y, z, xf[9], xf[10], xf[11], code)
         return gx, gy, gz
+
+    @wp.kernel
+    def k_mm_probe(
+        a: wp.array2d(dtype=FT), r: wp.array2d(dtype=FT), out: wp.array3d(dtype=FT)
+    ):
+        # Every candidate order of ``a @ r`` (r already transposed for the
+        # second form), for the load-time probe.
+        i, j, code = wp.tid()
+        out[i, j, code] = _mm(a[i, 0], a[i, 1], a[i, 2], r[0, j], r[1, j], r[2, j], code)
 
     @wp.func
     def _cavity_root_valid(
@@ -195,6 +294,9 @@ def _make_kernels(FT, fma):
         ports: wp.array(dtype=FT),
         nports: int,
         sum_order: int,
+        mm_small: wp.array3d(dtype=int),
+        mm_meta: wp.array(dtype=int),
+        mm_tail: wp.array3d(dtype=int),
         recip: int,
         t_hit: wp.array(dtype=FT),
         normals: wp.array2d(dtype=FT),
@@ -210,8 +312,11 @@ def _make_kernels(FT, fma):
         r2 = gp[1]
         floor = gp[2]
         inf = gp[3]
-        plx, ply, plz = _to_local(x[i], y[i], z[i], xf)
-        dx, dy, dz = _dir_local(L[i], M[i], N[i], xf)
+        n = x.shape[0]
+        code_f = _row_code(i, n, 0, mm_small, mm_meta, mm_tail)
+        code_b = _row_code(i, n, 1, mm_small, mm_meta, mm_tail)
+        plx, ply, plz = _to_local(x[i], y[i], z[i], xf, code_f)
+        dx, dy, dz = _dir_local(L[i], M[i], N[i], xf, code_f)
         t_adv = -_sum3(plx * dx, ply * dy, plz * dz, sum_order)
         ox = plx + t_adv * dx
         oy = ply + t_adv * dy
@@ -262,11 +367,11 @@ def _make_kernels(FT, fma):
             th = inf
         t_hit[i] = th
         hit[i] = hit_l and accepted and alive[i]
-        gx, gy, gz = _to_global_normal(nx * flip, ny * flip, nz * flip, xf)
+        gx, gy, gz = _to_global_normal(nx * flip, ny * flip, nz * flip, xf, code_b)
         normals[i, 0] = gx
         normals[i, 1] = gy
         normals[i, 2] = gz
-        qx, qy, qz = _to_global_normal(-nx, -ny, -nz, xf)
+        qx, qy, qz = _to_global_normal(-nx, -ny, -nz, xf, code_b)
         n_geom[i, 0] = qx
         n_geom[i, 1] = qy
         n_geom[i, 2] = qz
@@ -298,6 +403,9 @@ def _make_kernels(FT, fma):
         xf: wp.array(dtype=FT),
         gp: wp.array(dtype=FT),
         sum_order: int,
+        mm_small: wp.array3d(dtype=int),
+        mm_meta: wp.array(dtype=int),
+        mm_tail: wp.array3d(dtype=int),
         t_hit: wp.array(dtype=FT),
         normals: wp.array2d(dtype=FT),
         hit: wp.array(dtype=wp.bool),
@@ -317,8 +425,11 @@ def _make_kernels(FT, fma):
         floor = gp[6]
         tiny = gp[7]
         inf = gp[8]
-        plx, ply, plz = _to_local(x[i], y[i], z[i], xf)
-        dx, dy, dz = _dir_local(L[i], M[i], N[i], xf)
+        n = x.shape[0]
+        code_f = _row_code(i, n, 0, mm_small, mm_meta, mm_tail)
+        code_b = _row_code(i, n, 1, mm_small, mm_meta, mm_tail)
+        plx, ply, plz = _to_local(x[i], y[i], z[i], xf, code_f)
+        dx, dy, dz = _dir_local(L[i], M[i], N[i], xf, code_f)
         t_adv = -_sum3(plx * dx, ply * dy, plz * dz, sum_order)
         ox = plx + t_adv * dx
         oy = ply + t_adv * dy
@@ -394,18 +505,18 @@ def _make_kernels(FT, fma):
             th = inf
         t_hit[i] = th
         hit[i] = hit_l and accepted and alive[i]
-        ax, ay, az = _to_global_normal(nlx, nly, nlz, xf)
+        ax, ay, az = _to_global_normal(nlx, nly, nlz, xf, code_b)
         normals[i, 0] = ax
         normals[i, 1] = ay
         normals[i, 2] = az
-        bx, by, bz = _to_global_normal(ngx, ngy, ngz, xf)
+        bx, by, bz = _to_global_normal(ngx, ngy, ngz, xf, code_b)
         n_geom[i, 0] = bx
         n_geom[i, 1] = by
         n_geom[i, 2] = bz
         t_adv_out[i] = t_adv
         t_local_out[i] = t_out
 
-    return {"cavity": k_cavity, "conic": k_conic}
+    return {"cavity": k_cavity, "conic": k_conic, "mm_probe": k_mm_probe}
 
 
 _KERNELS = {
@@ -474,6 +585,232 @@ def scalar_division(dtype: torch.dtype, device: Any) -> int:
         mode = 1 if (np.array_equal(got, recip) and not np.array_equal(got, true)) else 0
         _SCALAR_DIVISION[key] = mode
     return mode
+
+
+# ---------------------------------------------------------------------------
+# The order of torch's (N, 3) @ (3, 3) product, per width and row
+# ---------------------------------------------------------------------------
+
+#: Tie-break among orders that match every probed value: the FMA chain, then
+#: the plain rounded sum, then the chain with the last term unfused, then the
+#: rest in code order.
+_MM_PREFERENCE = (3, 0, 2) + tuple(c for c in range(24) if c not in (3, 0, 2))
+_MM_BLOCKS = (1, 2, 4, 8, 16)
+#: Widths the two regimes above ``MM_SMALL`` are learnt at: every residue
+#: mod 16 just above the row-by-row table, and every residue at 4,096 plus a
+#: check at 65,536.
+_MM_MID = tuple(range(MM_SMALL, MM_SMALL + 16))
+_MM_LARGE = tuple(range(4096, 4112)) + (65536, 65537, 65538, 65539)
+_MM_TABLES: dict = {}
+
+
+class MatmulOrders:
+    """torch's rounding order for ``a @ R`` (form 0) and ``a @ R.T`` (form 1), measured on one device.
+
+    Attributes:
+        small: ``(2, MM_SMALL, MM_SMALL - 1)`` codes, row ``i`` of an ``n``-row
+            product at ``[form, n, i]``; -1 where no order of
+            :data:`MM_ORDERS` matched (that width then runs the torch stage).
+        meta: ``(2, 5)``: per form the main order and block of the mid
+            regime, the same of the large regime, and the width from which
+            the large regime holds.
+        tail: ``(4, 16, 16)``: per form and regime (``2 form + regime``) the
+            codes of the last ``n mod block`` rows.
+        refusal: None, or why the kernels cannot follow the product above
+            ``MM_SMALL`` on this device.
+        tensors: The three tables on the device, as the kernels take them.
+    """
+
+    def __init__(self, small, meta, tail, refusal, device):
+        self.small = small
+        self.meta = meta
+        self.tail = tail
+        self.refusal = refusal
+        self.small_ok = [bool((small[:, n, :n] >= 0).all()) for n in range(MM_SMALL)]
+        self.tensors = (
+            torch.as_tensor(small, dtype=torch.int32, device=device).contiguous(),
+            torch.as_tensor(meta.reshape(-1), dtype=torch.int32, device=device).contiguous(),
+            torch.as_tensor(tail, dtype=torch.int32, device=device).contiguous(),
+        )
+
+    def code(self, form: int, n: int, i: int) -> int:
+        """The order of row ``i`` of an ``n``-row product (the kernels' ``_row_code``)."""
+        if n < MM_SMALL:
+            return int(self.small[form, n, i])
+        reg = 0 if n < self.meta[form, 4] else 1
+        main, block = self.meta[form, 2 * reg], self.meta[form, 2 * reg + 1]
+        base = n - n % block
+        return int(main) if i < base else int(self.tail[2 * form + reg, n % block, i - base])
+
+    def covers(self, n: int) -> bool:
+        """Whether a launch of ``n`` rays reproduces torch's product on every row."""
+        if self.refusal is not None:
+            return False
+        if n < MM_SMALL:
+            return self.small_ok[n]
+        return True
+
+
+def _mm_choose(match_row) -> int:
+    for code in _MM_PREFERENCE:
+        if match_row[code]:
+            return code
+    return -1
+
+
+def _mm_probe_rows(dtype, device, form: int, n: int, trials: int, rng) -> torch.Tensor:
+    """For each of ``n`` rows, which of the 24 orders reproduce torch's ``a @ R`` (or ``@ R.T``)
+    on every one of ``trials`` random products of width ``n``; an (n, 24) boolean tensor."""
+    kernel = _KERNELS[dtype]["mm_probe"]
+    ivt = torch.int64 if dtype == torch.float64 else torch.int32
+    acc = torch.ones((n, 24), dtype=torch.bool, device=device)
+    for _ in range(trials):
+        # Unit normal entries: products of one size, so the orders' roundings
+        # differ on 15 to 45 percent of the entries (a spread of magnitudes
+        # hides the smaller terms' rounding and discriminates less).
+        a = torch.tensor(rng.standard_normal((n, 3)), dtype=dtype, device=device)
+        r = torch.tensor(rng.standard_normal((3, 3)), dtype=dtype, device=device)
+        got = a @ (r.T if form else r)
+        rk = (r.T if form else r).contiguous()
+        cand = torch.empty((n, 3, 24), dtype=dtype, device=device)
+        kwargs = {"dim": (n, 3, 24), "inputs": [wp.from_torch(a), wp.from_torch(rk)],
+                  "outputs": [wp.from_torch(cand)]}
+        if device.type == "cuda":
+            kwargs["stream"] = wp.stream_from_torch(torch.cuda.current_stream(device))
+        else:
+            kwargs["device"] = wp.device_from_torch(device)
+        wp.launch(kernel, **kwargs)
+        acc &= (cand.view(ivt) == got.view(ivt)[:, :, None]).all(dim=1)
+    return acc
+
+
+def _mm_regime(widths, matches):
+    """A main order, a block and the tail rows' orders that every probed width shares, or None."""
+    common = np.ones(24, dtype=bool)
+    for n, m in zip(widths, matches, strict=True):
+        common &= m[: n - n % 16].all(axis=0)
+    main = _mm_choose(common)
+    if main < 0:
+        return None
+    for block in _MM_BLOCKS:
+        if all(m[: n - n % block, main].all() for n, m in zip(widths, matches, strict=True)):
+            break
+    else:
+        return None
+    tail = np.full((16, 16), -1, dtype=np.int32)
+    for r in range(1, block):
+        share = np.ones((r, 24), dtype=bool)
+        for n, m in zip(widths, matches, strict=True):
+            if n % block == r:
+                share &= m[n - r:]
+        codes = [_mm_choose(row) for row in share]
+        if min(codes) < 0:
+            return None
+        tail[r, :r] = codes
+    return main, block, tail
+
+
+def _mm_follows(regime, dtype, device, form, n0, rng) -> bool:
+    """Whether widths ``n0`` to ``n0 + 15`` round every row as ``regime`` says."""
+    main, block, tail = regime
+    for n in range(n0, n0 + 16):
+        m = _mm_probe_rows(dtype, device, form, n, 6, rng).cpu().numpy()
+        base = n - n % block
+        codes = [main] * base + [int(tail[n % block, j]) for j in range(n - base)]
+        if not all(m[i, c] for i, c in enumerate(codes)):
+            return False
+    return True
+
+
+def matmul_orders(dtype: torch.dtype, device: Any) -> MatmulOrders:
+    """How torch rounds the placement products of ``BaseComponent.intersect`` on this device.
+
+    The stage transforms the ray state with ``(p - T) @ R`` and ``d @ R`` and
+    the normals back with ``n @ R.T``: (N, 3) @ (3, 3) products that torch
+    hands to its matrix library, which picks a kernel by the shapes, and the
+    kernel fixes the order in which each entry's three products are rounded
+    and summed. Measured (2026-09-27, research repository issue 77): on the
+    A100 cuBLAS gives the fused chain :data:`MM_FMA_CHAIN` from 17 rows up and
+    another order at 1 to 16 rows; on the Apple silicon CPU the chain holds
+    for every row except the last ``n mod 2`` or ``n mod 4`` rows, which a
+    tail loop rounds otherwise, up to a width that depends on the dtype and
+    the form (about 700 rows for float64 ``@ R.T``, above 1,200 for float32),
+    and for every row above it.
+
+    So the order is probed here once per dtype and device: row by row for
+    every width below :data:`MM_SMALL`; above it as two regimes of a main
+    order plus the orders of a tail block, one learnt at the 16 widths from
+    ``MM_SMALL`` and one at 4,096 to 4,111 (checked at 65,536 to 65,539), and
+    where the two differ, the width at which the second takes over, found by
+    bisection on blocks of 16 consecutive widths. The kernels read the order
+    per row. Widths between the probed ones are assumed to follow the model;
+    the stage's width sweep and whole-trace tests check it.
+
+    Args:
+        dtype: The working float dtype.
+        device: The torch device.
+
+    Returns:
+        The tables, cached per dtype and device.
+    """
+    tdev = torch.device(device)
+    if tdev.type == "cuda" and tdev.index is None:
+        tdev = torch.device("cuda", torch.cuda.current_device())
+    key = (dtype, str(tdev))
+    cached = _MM_TABLES.get(key)
+    if cached is not None:
+        return cached
+    _init()
+    rng = np.random.default_rng(20260927)
+    small = np.full((2, MM_SMALL, MM_SMALL - 1), -1, dtype=np.int32)
+    meta = np.zeros((2, 5), dtype=np.int32)
+    tail = np.full((4, 16, 16), -1, dtype=np.int32)
+    refusal = None
+    with torch.no_grad():
+        for form in (0, 1):
+            rows = [_mm_probe_rows(dtype, tdev, form, n, 48, rng) for n in range(1, MM_SMALL)]
+            mid = [_mm_probe_rows(dtype, tdev, form, n, 48, rng) for n in _MM_MID]
+            large = [_mm_probe_rows(dtype, tdev, form, n, 8 if n < 65536 else 2, rng) for n in _MM_LARGE]
+            rows = [r.cpu().numpy() for r in rows]
+            mid = [m.cpu().numpy() for m in mid]
+            large = [m.cpu().numpy() for m in large]
+            for n, m in zip(range(1, MM_SMALL), rows, strict=True):
+                small[form, n, :n] = [_mm_choose(row) for row in m]
+            regime_mid = _mm_regime(_MM_MID, mid)
+            regime_large = _mm_regime(_MM_LARGE, large)
+            if regime_mid is None or regime_large is None:
+                refusal = f"no main order and tail block match torch's product from {MM_SMALL} rows (form {form})"
+                continue
+            switch = MM_SMALL
+            same = (
+                regime_mid[0] == regime_large[0]
+                and regime_mid[1] == regime_large[1]
+                and np.array_equal(regime_mid[2], regime_large[2])
+            )
+            if not same:
+                # The large regime holds from some width on: the smallest
+                # block of 16 widths it holds on, by bisection.
+                lo, hi = _MM_MID[-1], _MM_LARGE[0]
+                while hi - lo > 1:
+                    mid_n = (lo + hi) // 2
+                    if _mm_follows(regime_large, dtype, tdev, form, mid_n, rng):
+                        hi = mid_n
+                    else:
+                        lo = mid_n
+                switch = hi
+                if not _mm_follows(regime_mid, dtype, tdev, form, max(MM_SMALL, switch - 16), rng):
+                    refusal = (
+                        f"torch's product changes order near width {switch} in a way the "
+                        f"two-regime model does not hold (form {form})"
+                    )
+            meta[form] = (regime_mid[0], regime_mid[1], regime_large[0], regime_large[1], switch)
+            tail[2 * form] = regime_mid[2]
+            tail[2 * form + 1] = regime_large[2]
+    tables = MatmulOrders(small, meta, tail, refusal, tdev)
+    _MM_TABLES[key] = tables
+    return tables
+
+
 _WP_FLOAT = {torch.float64: wp.float64, torch.float32: wp.float32}
 
 _prepared: set = set()
@@ -505,6 +842,7 @@ def prepare(device: Any) -> None:
     for dtype in (torch.float64, torch.float32):
         sum_order(dtype, tdev)
         scalar_division(dtype, tdev)
+        matmul_orders(dtype, tdev)
     _prepared.add(name)
 
 
@@ -523,6 +861,10 @@ def availability(device: Any) -> str | None:
         prepare(tdev)
     except Exception as exc:  # noqa: BLE001 - any failure means "use the torch stage"
         return f"Warp could not load its kernels ({type(exc).__name__})"
+    for dtype in (torch.float64, torch.float32):
+        refusal = matmul_orders(dtype, tdev).refusal
+        if refusal is not None:
+            return f"the kernels cannot follow torch's placement product here: {refusal}"
     return None
 
 
@@ -718,6 +1060,8 @@ def _launch(kind, inputs_t, outputs_t, nports, *, recip=0, requires_grad=False, 
     if kind == "cavity":
         args.append(int(nports))
     args.append(sum_order(like.dtype, like.device))
+    for table in matmul_orders(like.dtype, like.device).tensors:
+        args.append(wp.from_torch(table, dtype=wp.int32))
     if kind == "cavity":
         args.append(int(recip))
     n = int(like.shape[0])
@@ -819,6 +1163,10 @@ def intersect_component(component, kind: str, rays, t_min):
         ``(t, normals, hit_mask, n_geom)``.
     """
     like = rays.x
+    if not matmul_orders(like.dtype, like.device).covers(int(like.shape[0])):
+        # A width at which torch's placement product rounds a row in an order
+        # the kernels do not reproduce: the component's own intersect runs.
+        return component.intersect(rays)
     xf, gp, ports, nports = _component_inputs(component, kind, like)
     if ports is None:
         ports = xf  # unused placeholder for the operator's signature
