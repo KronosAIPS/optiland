@@ -11,15 +11,19 @@ Per call (one chunk of rays at a time, the chunk size fixed by the ray count):
 1. **Every (ray, leaf) box test** (the slab method on each leaf's oriented
    box). The bounding volume hierarchy of the research repository's issue 1
    replaces this list later.
-2. **Candidates.** The boxes a ray meets beyond its start ``t0`` sorted by
-   entry distance (a stable sort, so ties keep leaf order); the nearest
-   ``n_candidates`` are solved from the leaf's mid-plane, and the nearest
-   ``n_ambiguous`` of those the ray meets within the leaf's normal cone
-   ("ambiguous": it can cross the leaf twice) also from the box's two ends.
-   A dynamic loop would stop at the first round whose boxes all start beyond
-   the best hit; fixed shapes solve them all and keep the nearest root, which
-   is the same answer. A ray with more boxes than candidates, whose best
-   root lies beyond the first unsolved box, is flagged (``overflow``): it may
+2. **Candidates, in two rounds of fixed shape.** The boxes a ray meets
+   beyond its start ``t0`` sorted by entry distance (a stable sort, so ties
+   keep leaf order); the nearest ``n_candidates`` (8) are solved from the
+   leaf's mid-plane, and the nearest ``n_ambiguous`` (4) of those the ray
+   meets within the leaf's normal cone ("ambiguous": it can cross the leaf
+   twice) also from the box's two ends. A dynamic loop would stop at the
+   first round whose boxes all start beyond the best hit; fixed shapes solve
+   them all and keep the nearest root, which is the same answer. A ray whose
+   best root lies beyond the first box the round did not solve is *in doubt*
+   (a ray through the many small leaves around a pole, a grazing ray); the
+   rays in doubt are gathered into a queue of fixed capacity and solved again
+   over 32 boxes, 16 of them from both ends (:func:`intersect`). A ray still
+   in doubt, or beyond the queue's capacity, is flagged ``overflow``: it may
    have lost a nearer root, and the geometry counts it.
 3. **Newton in (s, r, t)** on each lane: ``F = S(s, r) - o - t d``, ``J = [S_s,
    S_r, -d]`` solved by Cramer's rule; ``n_iter`` fixed iterations, masked, the
@@ -57,10 +61,15 @@ import numpy as np
 DEFAULT_N_ITER = 16
 #: Residual tolerance in units of the working dtype at the coordinate scale.
 DEFAULT_K_TOL = 32.0
-#: Boxes solved per ray from the mid-plane start.
-DEFAULT_N_CANDIDATES = 12
-#: Ambiguous boxes per ray also solved from both box ends.
-DEFAULT_N_AMBIGUOUS = 6
+#: Boxes solved per ray from the mid-plane start, first round.
+DEFAULT_N_CANDIDATES = 8
+#: Ambiguous boxes per ray also solved from both box ends, first round.
+DEFAULT_N_AMBIGUOUS = 4
+#: The same for the rays in doubt after it (second round).
+DEFAULT_N_CANDIDATES_2 = 32
+DEFAULT_N_AMBIGUOUS_2 = 16
+#: The second round's queue capacity, a share of the rays of the call.
+DEFAULT_SECOND_ROUND_SHARE = 0.25
 #: The deflation length, a fraction of the leaf's scale.
 ELL_FACTOR = 1e-4
 #: The clamp on (s, r) during the iterations, beyond [0, 1] on each side.
@@ -497,7 +506,7 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
         "tpre": pick(tpre),
         "steps": pick(conv),
         "residual": pick(res),
-        "overflow": (best > next_box) | (best > next_amb),
+        "doubt": (best > next_box) | (best > next_amb),
     }
     # the Jacobian columns at the winner, for the adjoint
     out["Ss"] = ops.stack([pick(Ss[:, k]) for k in range(3)], -1)
@@ -505,9 +514,39 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
     return out
 
 
+def _rounds(ops, dl, o, d, t0, n_iter, k_tol, C, A):
+    """One round over every ray given, chunked so a chunk's arrays stay bounded."""
+    n = o.shape[0]
+    L = max(dl.n, 1)
+    lanes_per_ray = min(C, dl.n) + 2 * min(A, C, dl.n)
+    size = max(1, min(_MAX_BOX_PAIRS // L, _MAX_LANES // max(lanes_per_ray, 1)))
+    parts = [
+        _chunk(ops, dl, o[a : min(n, a + size)], d[a : min(n, a + size)], t0[a : min(n, a + size)],
+               n_iter, k_tol, C, A)
+        for a in range(0, n, size)
+    ]
+    if len(parts) == 1:
+        return parts[0]
+    return {k: ops.cat([p[k] for p in parts], 0) for k in parts[0]}
+
+
 def intersect(ops: _Ops, dl: DeviceLeaves, o, d, t0, *, n_iter=DEFAULT_N_ITER, k_tol=DEFAULT_K_TOL,
-              n_candidates=DEFAULT_N_CANDIDATES, n_ambiguous=DEFAULT_N_AMBIGUOUS):
+              n_candidates=DEFAULT_N_CANDIDATES, n_ambiguous=DEFAULT_N_AMBIGUOUS,
+              n_candidates_2=DEFAULT_N_CANDIDATES_2, n_ambiguous_2=DEFAULT_N_AMBIGUOUS_2,
+              second_round_share=DEFAULT_SECOND_ROUND_SHARE):
     """Nearest root of every ray beyond its start ``t0`` (module docstring).
+
+    Two rounds of fixed shape. The first solves every ray's nearest
+    ``n_candidates`` boxes (``n_ambiguous`` of them also from both ends). A
+    ray is *in doubt* when its best root lies beyond the first box that round
+    did not solve (or the first ambiguous box it did not solve from its ends):
+    a ray through the many small leaves around a pole, or a grazing ray. The
+    rays in doubt are gathered, by a stable sort on the doubt flag, into a
+    queue of fixed capacity (``second_round_share`` of the rays, at least 64)
+    and solved again over their nearest ``n_candidates_2`` boxes
+    (``n_ambiguous_2`` from both ends); their results replace the first
+    round's. A ray still in doubt after it, or in doubt beyond the queue's
+    capacity, is flagged ``overflow``.
 
     Args:
         ops: The operation table of the working arrays.
@@ -518,18 +557,42 @@ def intersect(ops: _Ops, dl: DeviceLeaves, o, d, t0, *, n_iter=DEFAULT_N_ITER, k
     Returns:
         A dict of per-ray arrays: ``t`` (inf for a miss), ``hit``, ``leaf``
         (-1 for a miss), ``leaf_safe`` (0 for a miss), the leaf's ``s, r``,
-        the patch's ``u, v``, ``steps``, ``residual``, ``overflow``, and the
-        Jacobian columns ``Ss``, ``Sr`` at the winning lane's last iterate.
+        the patch's ``u, v``, ``steps``, ``residual``, ``overflow``,
+        ``second_round`` (the ray was solved again), and the Jacobian columns
+        ``Ss``, ``Sr`` at the winning lane's last iterate.
     """
     n = o.shape[0]
-    L = max(dl.n, 1)
-    lanes_per_ray = min(n_candidates, dl.n) + 2 * min(n_ambiguous, n_candidates, dl.n)
-    size = max(1, min(_MAX_BOX_PAIRS // L, _MAX_LANES // max(lanes_per_ray, 1)))
-    parts = []
     with ops.errstate():
-        for a in range(0, n, size):
-            b = min(n, a + size)
-            parts.append(_chunk(ops, dl, o[a:b], d[a:b], t0[a:b], n_iter, k_tol, n_candidates, n_ambiguous))
-    if len(parts) == 1:
-        return parts[0]
-    return {k: ops.cat([p[k] for p in parts], 0) for k in parts[0]}
+        out = _rounds(ops, dl, o, d, t0, n_iter, k_tol, n_candidates, n_ambiguous)
+        doubt = out.pop("doubt")
+        more = dl.n > n_candidates or n_ambiguous_2 > n_ambiguous
+        if not more or n_candidates_2 <= 0 or n == 0:
+            out["overflow"] = doubt
+            out["second_round"] = doubt & ~doubt
+            return out
+        cap = min(n, max(64, int(math.ceil(second_round_share * n))))
+        key = ops.where(doubt, ops.zeros_like(out["steps"]), ops.zeros_like(out["steps"]) + 1.0)
+        sel = ops.argsort_stable(key[None, :])[0, :cap]
+        taken = doubt[sel]
+        o2 = _rounds(ops, dl, o[sel], d[sel], t0[sel], n_iter, k_tol,
+                     max(n_candidates_2, n_candidates), max(n_ambiguous_2, n_ambiguous))
+        doubt2 = o2.pop("doubt")
+        in_queue = doubt & ~doubt
+        in_queue = _put(ops, in_queue, sel, taken)
+        for k, v in o2.items():
+            cur = out[k][sel]
+            mask = taken if v.ndim == 1 else taken[:, None]
+            out[k] = _put(ops, out[k], sel, ops.where(mask, v, cur))
+        still = _put(ops, doubt & ~doubt, sel, taken & doubt2)
+        out["overflow"] = (doubt & ~in_queue) | still
+        out["second_round"] = in_queue
+    return out
+
+
+def _put(ops, target, idx, values):
+    """``target`` with ``target[idx] = values`` (a copy on torch, fixed shapes)."""
+    if ops.torch is not None:
+        return target.index_put((idx,), values)
+    out = target.copy()
+    out[idx] = values
+    return out

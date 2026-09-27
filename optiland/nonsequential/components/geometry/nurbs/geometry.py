@@ -143,6 +143,9 @@ class NurbsGeometry(ComponentGeometry):
         k_tol: float = K.DEFAULT_K_TOL,
         n_candidates: int = K.DEFAULT_N_CANDIDATES,
         n_ambiguous: int = K.DEFAULT_N_AMBIGUOUS,
+        n_candidates_2: int = K.DEFAULT_N_CANDIDATES_2,
+        n_ambiguous_2: int = K.DEFAULT_N_AMBIGUOUS_2,
+        second_round_share: float = K.DEFAULT_SECOND_ROUND_SHARE,
     ) -> None:
         """Build the kind from the library's arrays.
 
@@ -155,7 +158,10 @@ class NurbsGeometry(ComponentGeometry):
             cone_deg, tangent_deg, max_depth: The leaf rule.
             n_iter: Fixed Newton iteration count.
             k_tol: Residual tolerance in units of the working dtype.
-            n_candidates, n_ambiguous: Boxes solved per ray (see :mod:`.kernel`).
+            n_candidates, n_ambiguous: Boxes solved per ray in the first round
+                (see :func:`.kernel.intersect`).
+            n_candidates_2, n_ambiguous_2, second_round_share: The second
+                round, for the rays in doubt after the first.
 
         Raises:
             ValueError: A bad array, a non-positive weight, an option out of range.
@@ -181,6 +187,11 @@ class NurbsGeometry(ComponentGeometry):
         self.k_tol = float(k_tol)
         self.n_candidates = int(n_candidates)
         self.n_ambiguous = int(n_ambiguous)
+        self.n_candidates_2 = int(n_candidates_2)
+        self.n_ambiguous_2 = int(n_ambiguous_2)
+        if not 0.0 < float(second_round_share) <= 1.0:
+            raise ValueError("second_round_share must lie in (0, 1]")
+        self.second_round_share = float(second_round_share)
         self._leaf_key = None
         self._generation = 0
         self._device_cache: dict = {}
@@ -298,6 +309,8 @@ class NurbsGeometry(ComponentGeometry):
             out = K.intersect(
                 ops, dl, o, d, t0, n_iter=self.n_iter, k_tol=self.k_tol,
                 n_candidates=self.n_candidates, n_ambiguous=self.n_ambiguous,
+                n_candidates_2=self.n_candidates_2, n_ambiguous_2=self.n_ambiguous_2,
+                second_round_share=self.second_round_share,
             )
             leaf = out["leaf_safe"]
             hit = out["hit"]
@@ -309,6 +322,7 @@ class NurbsGeometry(ComponentGeometry):
         if ops.torch is not None and self._needs_adjoint(origins, directions):
             t, n_par = self._attached_step(ops, dl, adj, origins, directions, out, n_par)
         self.last_overflow = out["overflow"]
+        self.last_second_round = out["second_round"]
         self.last_steps = ops.where(hit, out["steps"], ops.full_like(out["steps"], -1.0))
         self.last_leaf = out["leaf"]
         self.last_u = out["u"]
@@ -392,6 +406,8 @@ class NurbsGeometry(ComponentGeometry):
             self.arrays, cone_deg=self.cone_deg, tangent_deg=self.tangent_deg,
             max_depth=self.max_depth, n_iter=self.n_iter, k_tol=self.k_tol,
             n_candidates=self.n_candidates, n_ambiguous=self.n_ambiguous,
+            n_candidates_2=self.n_candidates_2, n_ambiguous_2=self.n_ambiguous_2,
+            second_round_share=self.second_round_share,
         )
 
     def lowered_params(self) -> dict:
@@ -414,4 +430,7 @@ class NurbsGeometry(ComponentGeometry):
             "k_tol": self.k_tol,
             "n_candidates": self.n_candidates,
             "n_ambiguous": self.n_ambiguous,
+            "n_candidates_2": self.n_candidates_2,
+            "n_ambiguous_2": self.n_ambiguous_2,
+            "second_round_share": self.second_round_share,
         }
