@@ -71,7 +71,7 @@ Public API (selected)::
         ParaboloidGeometry, PlaneGeometry,
         CylindricalFrustumGeometry, AnnularPlaneGeometry,
         SphericalCavityGeometry, SphericalPort, LensletArrayGeometry,
-        EvenAsphereGeometry, OddAsphereGeometry,
+        EvenAsphereGeometry, OddAsphereGeometry, NurbsGeometry,
         # BSDF
         SpecularBRDF, LambertianBSDF, HarveyShackBSDF, TabulatedBSDF,
         # Detectors
@@ -273,6 +273,7 @@ from optiland.nonsequential.components.geometry import (
     ConicGeometry,
     FinitePlaneGeometry,
     MeshGeometry,
+    NurbsGeometry,
     ParaboloidGeometry,
     PlaneGeometry,
     SphereGeometry,
@@ -412,6 +413,7 @@ __all__ = [
     "EvenAsphereGeometry",
     "FinitePlaneGeometry",
     "MeshGeometry",
+    "NurbsGeometry",
     "OddAsphereGeometry",
     "ParaboloidGeometry",
     "PlaneGeometry",

@@ -783,6 +783,9 @@ def _register_geometries() -> None:
     from optiland.nonsequential.components.geometry.mesh.mesh_geometry import (  # noqa: PLC0415
         MeshGeometry,
     )
+    from optiland.nonsequential.components.geometry.nurbs.geometry import (  # noqa: PLC0415
+        NurbsGeometry,
+    )
 
     def conic_params(g) -> dict:
         return {
@@ -886,6 +889,15 @@ def _register_geometries() -> None:
         OddAsphereGeometry,
         asphere_params,
         description="conic base plus odd radial polynomial, Newton-refined",
+    )
+    # NURBS patches (KronosNSRT issue 66): the library's array contract, the
+    # net as given (a tensor stays a tensor, the gradient rule's attached
+    # parameters control_points and weights), and the solver's settings.
+    kinds.register_geometry(
+        "nurbs",
+        NurbsGeometry,
+        lambda g: g.lowered_params(),
+        description="trimmed-NURBS patches in the library's array contract, leaves and fixed-count Newton",
     )
     kinds.register_geometry(
         "lenslet_array",
