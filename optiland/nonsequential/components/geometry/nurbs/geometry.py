@@ -36,8 +36,9 @@ Changes against the prototype (the research card N1, section 5)
 ----------------------------------------------------------------
 - Fixed shapes: every candidate of a ray is solved in one masked pass (the
   prototype processed rounds of four while any box was nearer than the best
-  hit, a host read per round); a ray with more boxes than candidates whose
-  best root lies beyond the first unsolved box is flagged (:attr:`last_overflow`).
+  hit, a host read per round); the rays in doubt after the first pass (best
+  root beyond the first unsolved box) are solved again in a queue of fixed
+  capacity, and a ray still in doubt is flagged (:attr:`last_overflow`).
 - A ray leaving the surface is recognised without a caller flag: a lane whose
   box holds the ray's start ``t0`` deflates the root at ``t0`` (the prototype
   was told which rays started on the surface).
@@ -46,7 +47,11 @@ Changes against the prototype (the research card N1, section 5)
   most: the prototype's pole slivers (64 leaves of the sphere at the depth
   cap, each 1/2048 of the meridian) are gone; the sphere has 336 leaves, the
   bicubic patch of the study 123 (the prototype's count).
-- The normal at a collapsed edge (a pole) is the edge's limit (:func:`.kernel.unit_normal`).
+- A leaf must fill 0.3 of its box's footprint (the rings of a densely
+  sampled revolved profile otherwise overlap by the dozen).
+- A collapsed edge (a pole) is snapped exact and such a leaf's net is stored
+  relative to it; the normal is evaluated on the net re-centred at the point,
+  and at the edge itself it is the edge's limit (:func:`.kernel.unit_normal`).
 
 The adjoint (ticket D)
 ----------------------
