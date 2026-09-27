@@ -21,9 +21,9 @@ What each class pins, and the route it uses:
   only returns the fixed-width passes' bits.
 - ``TestMissReasons``: every miss reason is reachable and recorded, and a
   miss never reports a distance.
-- ``TestFirstCrossing``: on a strongly aspheric surface the nearest crossing
-  is returned where the base-conic seed alone converges to a farther one;
-  checked against a brute-force sign scan.
+- ``TestFirstCrossing``: on a strongly aspheric surface (an even and an odd
+  gull-wing) the nearest crossing is returned where the base-conic seed alone
+  converges to a farther one; checked against a brute-force sign scan.
 - ``TestAdjoint``: dt and the normal with respect to the curvature, the conic
   constant, every coefficient and the placement, against fourth-order central
   differences of the primal root.
@@ -440,10 +440,20 @@ class TestMissReasons:
 
 
 class TestFirstCrossing:
-    """A strongly aspheric (non-monotone) surface: the nearest crossing."""
+    """A strongly aspheric (non-monotone) surface: the nearest crossing.
 
-    def test_against_brute_force(self):
-        g = EvenAsphereGeometry(25.0, 0.0, 12.0, [0.0, -3e-4, 2e-6])
+    The even gull-wing (conic base, r^4 and r^6) and an odd one (the R = 25 mm
+    sphere minus 1.5e-3 r^3: the sag rises to 0.59 mm near r = 8.9 mm and
+    falls toward the 12 mm rim; without the scan candidate 110 of its 716
+    hits on this fan are lost).
+    """
+
+    @pytest.mark.parametrize("cls,base,coeffs", [
+        (EvenAsphereGeometry, (25.0, 0.0, 12.0), [0.0, -3e-4, 2e-6]),
+        (OddAsphereGeometry, (25.0, 0.0, 12.0), [0.0, 0.0, -1.5e-3]),
+    ], ids=["even", "odd"])
+    def test_against_brute_force(self, cls, base, coeffs):
+        g = cls(*base, coeffs)
         o, d = _fan(1500, 12.0, z0=-5.0, seed=2)
         t, _, hit, _ = g.ray_intersect(o, d)
 
@@ -485,12 +495,19 @@ class TestAdjoint:
 
     PARAMS = ["radius", "conic", "a1", "a4", "a6", "a8", "shift_z", "shift_x"]
 
+    #: Base coefficients per kind: even (r^2, r^4, r^6, r^8) and odd (r^1 to
+    #: r^4, the r^1 term a cone point of slope 1e-3 at the vertex).
+    BASE = {"even": [2e-4, 1e-6, 1e-8, 1e-9], "odd": [1e-3, 2e-4, 1e-5, 1e-7]}
+    POWERS = {"even": [2, 4, 6, 8], "odd": [1, 2, 3, 4]}
+
     @staticmethod
-    def _outputs(name: str, value, o, d):
+    def _outputs(name: str, value, o, d, kind: str = "even"):
         """t and the normal's x and z at every ray, as functions of one
         parameter (a torch scalar), others at the theory's values."""
         radius, conic = 25.0, -0.5
-        coeffs = [torch.tensor(v, dtype=torch.float64) for v in [2e-4, 1e-6, 1e-8, 1e-9]]
+        coeffs = [
+            torch.tensor(v, dtype=torch.float64) for v in TestAdjoint.BASE[kind]
+        ]
         shift = [torch.tensor(0.0, dtype=torch.float64) for _ in range(2)]
         if name == "radius":
             radius = value
@@ -500,7 +517,8 @@ class TestAdjoint:
             coeffs[["a1", "a4", "a6", "a8"].index(name)] = value
         else:
             shift[["shift_z", "shift_x"].index(name)] = value
-        g = EvenAsphereGeometry(radius, conic, 12.5, coeffs)
+        cls = EvenAsphereGeometry if kind == "even" else OddAsphereGeometry
+        g = cls(radius, conic, 12.5, coeffs)
         O = torch.tensor(o, dtype=torch.float64)
         offset = torch.stack(
             [shift[1], torch.zeros((), dtype=torch.float64), shift[0]]
@@ -508,21 +526,22 @@ class TestAdjoint:
         t, _, hit, n = g.ray_intersect(O + offset, torch.tensor(d, dtype=torch.float64))
         return t, n, hit
 
+    @pytest.mark.parametrize("kind", ["even", "odd"])
     @pytest.mark.parametrize("name", PARAMS)
-    def test_matches_finite_differences(self, name):
+    def test_matches_finite_differences(self, name, kind):
         _set("torch", "float64")
+        coeff_names = ["a1", "a4", "a6", "a8"]
         base = {
-            "radius": 25.0, "conic": -0.5, "a1": 2e-4, "a4": 1e-6, "a6": 1e-8,
-            "a8": 1e-9, "shift_z": 0.0, "shift_x": 0.0,
+            "radius": 25.0, "conic": -0.5, "shift_z": 0.0, "shift_x": 0.0,
+            **dict(zip(coeff_names, self.BASE[kind])),
         }[name]
         # Steps that move the sag at the rim by about 1e-3 mm: the primal root
         # is accurate to ~1e-14 mm (tolerance and polish), so the rounding
         # term of the difference is ~1e-14 / 1e-3 relative to the derivative,
         # and the h^4 truncation term is below it.
         h = {
-            "radius": 25.0 * 1e-4, "conic": 1e-3, "a1": 1e-3 / 12.5**2,
-            "a4": 1e-3 / 12.5**4, "a6": 1e-3 / 12.5**6, "a8": 1e-3 / 12.5**8,
-            "shift_z": 1e-3, "shift_x": 1e-3,
+            "radius": 25.0 * 1e-4, "conic": 1e-3, "shift_z": 1e-3, "shift_x": 1e-3,
+            **{k: 1e-3 / 12.5**p for k, p in zip(coeff_names, self.POWERS[kind])},
         }[name]
         # Origins in a 16 mm square 8 mm below the vertex, directions within
         # about 17 degrees of the axis: most rays hit the 12.5 mm aperture.
@@ -536,7 +555,7 @@ class TestAdjoint:
         d /= np.linalg.norm(d, axis=1, keepdims=True)
 
         p = torch.tensor(base, dtype=torch.float64, requires_grad=True)
-        t, n, hit = self._outputs(name, p, o, d)
+        t, n, hit = self._outputs(name, p, o, d, kind)
         hit_np = _np(hit)
         assert hit_np.sum() >= 30
         rows = np.where(hit_np)[0]
@@ -549,7 +568,9 @@ class TestAdjoint:
 
         def value(x):
             with torch.no_grad():
-                tt, nn, hh = self._outputs(name, torch.tensor(x, dtype=torch.float64), o, d)
+                tt, nn, hh = self._outputs(
+                    name, torch.tensor(x, dtype=torch.float64), o, d, kind
+                )
                 assert np.array_equal(_np(hh), hit_np)
                 return np.stack([_np(tt)[rows], _np(nn[:, 0])[rows], _np(nn[:, 2])[rows]])
 
@@ -566,7 +587,7 @@ class TestTraced:
 
     FOCAL = 50.0
 
-    def _scene(self, detector):
+    def _scene(self, detector, kind: str = "even"):
         # A concave paraboloid opening toward +z, built as a flat base plus
         # r^2 / (4 f): exact, so every reflected ray passes through (0, 0, f).
         # The source sits below the focal plane and fires down, so the only
@@ -585,7 +606,10 @@ class TestTraced:
             "M",
             ReflectiveComponent(
                 CoordinateSystem(),
-                EvenAsphereGeometry(0.0, 0.0, 10.0, [1.0 / (4 * f)]),
+                EvenAsphereGeometry(0.0, 0.0, 10.0, [1.0 / (4 * f)])
+                if kind == "even"
+                # the odd kind's entry 1 multiplies r^2
+                else OddAsphereGeometry(0.0, 0.0, 10.0, [0.0, 1.0 / (4 * f)]),
                 reflectance=1.0,
                 name="M",
             ),
@@ -593,10 +617,13 @@ class TestTraced:
         scene.add_detector("D", CoordinateSystem(z=f), detector)
         return scene
 
+    @pytest.mark.parametrize("kind", ["even", "odd"])
     @pytest.mark.parametrize("backend", ["numpy", "torch"])
-    def test_paraboloid_focuses_to_a_point(self, backend):
+    def test_paraboloid_focuses_to_a_point(self, backend, kind):
         _set(backend, "float64")
-        scene = self._scene(RayDatabaseConfig(width=40.0, height=40.0, absorb=True))
+        scene = self._scene(
+            RayDatabaseConfig(width=40.0, height=40.0, absorb=True), kind
+        )
         res = scene.trace(num_rays=2000, seed=3, max_depth=4)
         db = res.detectors["D"]
         x = np.asarray(_np(db.x), float)
