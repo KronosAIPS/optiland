@@ -522,41 +522,312 @@ _ALL_PLACEMENTS = [
     *(("lens", _lens_scene, _LENS, k) for k in ("x", "y", "z", "rx", "ry")),
 ]
 
+#: The operation count K of each scene's derivative chain (T-09-6, first form,
+#: the maintainer's ruling 3 of 2026-09-27): the number of operations of the
+#: recorded autograd graph from which the parameter is reachable, counted by
+#: :func:`_operation_count` (each node once, the loss's own operations and the
+#: detector's reductions included) on the reverse-mode trace of the scene at
+#: this file's settings. Counted from the code, before any bound was set; the
+#: research repository's chapter 09 carries the same table with the measured
+#: forward-reverse gap per scene. A change of the derivative chain changes a
+#: count: ``test_operation_count_is_the_stated_one`` then fails and the table is
+#: recounted, here and in the chapter, with the change that moved it.
+_K_PER_SCENE = {
+    "detector-x": 118,
+    "detector-y": 118,
+    "detector-z": 118,
+    "detector-rx": 126,
+    "detector-ry": 127,
+    "detector-rz": 127,
+    "source-x": 122,
+    "source-y": 122,
+    "source-z": 122,
+    "source-rx": 141,
+    "source-ry": 142,
+    "mirror-z": 362,
+    "mirror-rx": 387,
+    "mirror-ry": 388,
+    "lens-x": 1517,
+    "lens-y": 1517,
+    "lens-z": 1517,
+    "lens-rx": 1605,
+    "lens-ry": 1608,
+    "lens-thickness": 1328,
+}
+
+
+def _thickness_loss(t):
+    scene, width = _lens_scene(dict(_LENS), thickness=t)
+    return _centroid(_trace(scene).detectors["D1"].data, width)
+
+
+_T096_CASES = [
+    *((f"{o}-{k}", _placement_loss(b, n, k), n[k]) for o, b, n, k in _ALL_PLACEMENTS),
+    ("lens-thickness", _thickness_loss, 5.0),
+]
+
+
+def _operation_count(output, leaf) -> int:
+    """Operations of ``output``'s autograd graph from which ``leaf`` is reachable, each once."""
+    reach: dict[int, bool] = {}
+    stack = [(output.grad_fn, False)]
+    while stack:
+        fn, expanded = stack.pop()
+        if fn is None or (id(fn) in reach and not expanded):
+            continue
+        children = [nxt for nxt, _ in fn.next_functions if nxt is not None]
+        if not expanded:
+            reach[id(fn)] = False
+            stack.append((fn, True))
+            stack.extend((c, False) for c in children if id(c) not in reach)
+            continue
+        hit = getattr(fn, "variable", None) is leaf
+        reach[id(fn)] = hit or any(reach.get(id(c), False) for c in children)
+    return sum(reach.values())
+
+
+def _forward_and_reverse(loss, value: float):
+    """Forward-mode tangent and reverse-mode gradient of one loss."""
+    from torch.autograd import forward_ad
+
+    param = _g(value)
+    (reverse,) = torch.autograd.grad(loss(param), param)
+    with forward_ad.dual_level():
+        dual = forward_ad.make_dual(
+            torch.tensor(value, dtype=torch.float64), torch.tensor(1.0, dtype=torch.float64)
+        )
+        tangent = forward_ad.unpack_dual(loss(dual)).tangent
+    assert tangent is not None, "the forward-mode tangent never reached the output"
+    return tangent.item(), reverse.item()
+
 
 class TestForwardModeCrossCheck:
-    """One trace in forward mode against the reverse-mode gradient (R-09-9, T-09-6).
+    """One trace in forward mode against the reverse-mode gradient (R-09-9, T-09-6, first form).
 
     Forward mode here is ``torch.autograd.forward_ad``: the placement is a
     dual tensor, the register recognises its tangent as a derivative to
     attach, and the landing centroid comes out with its directional
     derivative. The two modes compute the same derivative with the same
-    operations in a different order (and forward mode, being forward-only,
-    runs with compaction on), so they differ by rounding only. The bound is
-    the one the finite-difference tolerance above uses for the loss's own
-    rounding, ``K * u`` relative with ``K = 1e4`` operations and
-    ``u = 2**-53``: about 1.1e-12. Chapter 09's T-09-6 asks for ``64 u``
-    (7.1e-15); measured on the development machine (Apple silicon, CPU,
-    float64, 2,000 rays, seed 3), 13 of these 19 cases are within it and the
-    worst, the lens tilts, are at about 240 u and 950 u.
+    operations in a different order, so they differ by rounding only. The
+    bound is the maintainer's first form of T-09-6 (ruling 3 of 2026-09-27):
+    ``K u`` relative, with ``K`` the operation count of the scene's derivative
+    chain (:data:`_K_PER_SCENE`) and ``u = 2**-53``.
+
+    What the measurement behind the table found (the research repository's
+    build log B6_gradients_2): the gap does not follow ``K``; it follows the
+    cancellation between the paths by which the parameter enters the trace (a
+    lens tilt moves the front and the back surface, whose contributions to
+    the derivative are each about 30 times the derivative and of opposite
+    sign). At this file's seed every scene is inside ``K u`` (the worst, the
+    lens tilt about y, at 0.55 K u); at seed 5 the same scene is at 1.23 K u,
+    so ``K u`` is a per-scene scale, not a bound. The bound that holds at
+    every seed measured is the second form below.
     """
 
     @pytest.mark.parametrize(
-        ("build", "nominal", "key"),
-        [case[1:] for case in _ALL_PLACEMENTS],
-        ids=[f"{case[0]}-{case[3]}" for case in _ALL_PLACEMENTS],
+        ("scene", "loss", "value"), _T096_CASES, ids=[c[0] for c in _T096_CASES]
     )
-    def test_forward_equals_reverse(self, build, nominal, key):
-        from torch.autograd import forward_ad
+    def test_forward_equals_reverse(self, scene, loss, value):
+        forward, reverse = _forward_and_reverse(loss, value)
+        rel = abs(forward - reverse) / abs(reverse)
+        assert rel < _K_PER_SCENE[scene] * _U, (
+            f"{scene}: forward {forward:.17e} reverse {reverse:.17e}: "
+            f"{rel / _U:.1f} u > K = {_K_PER_SCENE[scene]}"
+        )
 
-        loss = _placement_loss(build, nominal, key)
-        param = _g(nominal[key])
-        (reverse,) = torch.autograd.grad(loss(param), param)
+    @pytest.mark.parametrize(
+        ("scene", "loss", "value"), _T096_CASES, ids=[c[0] for c in _T096_CASES]
+    )
+    def test_operation_count_is_the_stated_one(self, scene, loss, value):
+        param = _g(value)
+        k = _operation_count(loss(param), param)
+        assert k == _K_PER_SCENE[scene], (
+            f"{scene}: the derivative chain now has {k} operations, the table states "
+            f"{_K_PER_SCENE[scene]}: recount the table here and in chapter 09"
+        )
+
+
+# -- T-09-6, second form: against the sum of absolute contributions ---------------
+
+
+def _centroid_bin_weights(width: float) -> torch.Tensor:
+    """``x + y / 2`` at the four pixel centres of the 2 x 2 detector, in bin order."""
+    q = width / 4.0
+    return torch.tensor([-1.5 * q, 0.5 * q, -0.5 * q, 1.5 * q], dtype=torch.float64)
+
+
+def _entry_split_contributions(loss, value: float, width: float) -> torch.Tensor:
+    """Every contribution c[e, i] of the forward-mode derivative, by entry element e and hit i.
+
+    The derivative of the loss is a sum over the rays' detector hits i and
+    over the entry elements e: every element of every attached transform the
+    parameter reaches (one ``parameter_register._tangent_only`` call per
+    translation and per rotation of an owner, or of a source's batch). One
+    forward-mode trace per entry element keeps that element's tangent and
+    zeroes the others; the detector's splat is observed at its scatter-add;
+    a hit's contribution is its four corner tangents weighted by the loss's
+    derivative with respect to the four bin sums (the loss is a smooth
+    function of them). Returns a tensor (entry elements, hits).
+    """
+    from torch.autograd import forward_ad
+
+    import optiland.nonsequential.detectors.irradiance as irradiance
+    import optiland.nonsequential.parameter_register as register
+
+    original_tangent_only = register._tangent_only
+    original_accumulate = irradiance._accumulate_into
+    state = {"call": 0, "keep": None, "live": []}
+    hits: list = []
+
+    def tangent_only(x):
+        d = original_tangent_only(x)
+        call = state["call"]
+        state["call"] += 1
+        if state["keep"] is None:
+            tan = forward_ad.unpack_dual(x).tangent
+            if tan is not None:
+                flat = tan.reshape(-1)
+                state["live"].extend((call, e) for e in range(x.numel()) if flat[e] != 0)
+            return d
+        mask = torch.zeros(x.numel(), dtype=x.dtype)
+        if state["keep"][0] == call:
+            mask[state["keep"][1]] = 1.0
+        return d * mask.reshape(x.shape)
+
+    def accumulate(buffer, flat, contribution, key=None):
+        hits.append((flat, contribution))
+        return original_accumulate(buffer, flat, contribution, key=key)
+
+    def one_trace(keep):
+        state["call"] = 0
+        state["keep"] = keep
+        hits.clear()
         with forward_ad.dual_level():
             dual = forward_ad.make_dual(
-                torch.tensor(nominal[key], dtype=torch.float64),
-                torch.tensor(1.0, dtype=torch.float64),
+                torch.tensor(value, dtype=torch.float64), torch.tensor(1.0, dtype=torch.float64)
             )
-            tangent = forward_ad.unpack_dual(loss(dual)).tangent
-        assert tangent is not None, "the forward-mode tangent never reached the output"
-        rel = abs(tangent.item() - reverse.item()) / abs(reverse.item())
-        assert rel < _K_OPS * _U, f"forward {tangent.item():.15e} reverse {reverse.item():.15e}"
+            loss(dual)
+            out = [
+                (f.long(), *(t.detach() if t is not None else None for t in forward_ad.unpack_dual(c)))
+                for f, c in hits
+            ]
+        return out
+
+    register._tangent_only = tangent_only
+    irradiance._accumulate_into = accumulate
+    try:
+        nominal = one_trace(None)
+        live = list(state["live"])
+        bins = torch.zeros(4, dtype=torch.float64)
+        for f, p, _ in nominal:
+            bins.index_add_(0, f, p)
+        g = _centroid_bin_weights(width)
+        total = bins.sum()
+        dloss_dbin = (g - (bins * g).sum() / total) / total
+        rows = []
+        for keep in live:
+            rows.append(
+                sum(
+                    dloss_dbin[f] * (torch.zeros_like(p) if t is None else t)
+                    for f, p, t in one_trace(keep)
+                )
+            )
+    finally:
+        register._tangent_only = original_tangent_only
+        irradiance._accumulate_into = original_accumulate
+    return torch.stack(rows)
+
+
+def _seeded_loss(build, nominal, key, seed):
+    def loss(value):
+        p = dict(nominal)
+        p[key] = value
+        scene, width = build(p)
+        result = scene.trace(num_rays=_NUM_RAYS, seed=seed, max_depth=8)
+        return _centroid(result.detectors["D1"].data, width)
+
+    return loss
+
+
+_SECOND_FORM_CASES = [
+    ("lens-ry", _lens_scene, _LENS, "ry"),
+    ("lens-rx", _lens_scene, _LENS, "rx"),
+    ("detector-rz", _detector_scene, _DETECTOR, "rz"),
+]
+
+
+class TestForwardModeAgainstAbsoluteSum:
+    """T-09-6, second form: ``64 u`` relative to the sum of absolute contributions.
+
+    The derivative is a sum of contributions c[e, i] over the detector hits i
+    and the entry elements e of the parameter. The maintainer's ruling 3 names
+    the sum of absolute per-ray contributions; the measurement behind it (the
+    research repository's build log B6_gradients_2) found the cancellation
+    between the entry elements inside one ray -- the front and the back
+    surface of a tilted lens -- and none between rays in these scenes, so the
+    sum runs over both. Measured on the development machine (Apple silicon,
+    CPU, float64, 2,000 rays): at most 15 u of that sum at seed 3 and 33 u at
+    seed 5 over the 20 placement scenes, where the gap in units of the
+    derivative itself reaches 881 u and 1,971 u. The three scenes here are the
+    three with the largest such gap; the split costs one forward trace per
+    live entry element (14 or 15 for a lens tilt).
+    """
+
+    @pytest.mark.parametrize("seed", [_SEED, 5])
+    @pytest.mark.parametrize(
+        ("scene", "build", "nominal", "key"),
+        _SECOND_FORM_CASES,
+        ids=[c[0] for c in _SECOND_FORM_CASES],
+    )
+    def test_gap_within_64u_of_the_absolute_sum(self, scene, build, nominal, key, seed):
+        loss = _seeded_loss(build, nominal, key, seed)
+        width = build(dict(nominal))[1]
+        forward, reverse = _forward_and_reverse(loss, nominal[key])
+        contributions = _entry_split_contributions(loss, nominal[key], width)
+        # the split is the same linear map entry by entry: it sums to the derivative
+        assert contributions.sum().item() == pytest.approx(forward, rel=1e-12, abs=0.0)
+        absolute = contributions.abs().sum().item()
+        gap = abs(forward - reverse)
+        assert gap < 64 * _U * absolute, (
+            f"{scene} seed {seed}: gap {gap:.3e} is {gap / (_U * absolute):.1f} u of the "
+            f"absolute sum {absolute:.6e} (the derivative {reverse:.6e})"
+        )
+
+
+# -- T-09-10: attached placements give finite gradients at float32 ------------------
+
+
+_FLOAT32_PLACEMENTS = [c for c in _ALL_PLACEMENTS if c[0] != "lens"]
+
+
+class TestFloat32PlacementGradients:
+    """R-09-10, T-09-10: the gradients of attached placements are finite at float32.
+
+    Over three decades of ray count, at the working precision float32 (the
+    placement tensors float64, the device build of the transform in float32).
+    The lens scenes are not here: at float32 the singlet placed at z = 50 mm
+    is refused at construction by the volume's rim-coincidence check, whose
+    1e-6 mm tolerance is below float32's resolution there (about 3.8e-6 mm at
+    55 mm), with or without a gradient (the research repository's build log
+    B6_gradients_2 files it). Measured on the development machine (Apple
+    silicon, CPU, seed 3): every gradient finite; float32 against float64 at
+    a median 1.5e-7 to 3.2e-7 relative and at worst 5.4e-5 (mirror tilt about
+    x at 20,000 rays), reported, not graded.
+    """
+
+    @pytest.mark.parametrize("num_rays", [200, 2_000, 20_000])
+    @pytest.mark.parametrize(
+        ("owner", "build", "nominal", "key"),
+        _FLOAT32_PLACEMENTS,
+        ids=[f"{c[0]}-{c[3]}" for c in _FLOAT32_PLACEMENTS],
+    )
+    def test_finite(self, owner, build, nominal, key, num_rays):
+        be.set_precision("float32")
+        param = _g(nominal[key])
+        p = dict(nominal)
+        p[key] = param
+        scene, width = build(p)
+        data = scene.trace(num_rays=num_rays, seed=_SEED, max_depth=8).detectors["D1"].data
+        (grad,) = torch.autograd.grad(_centroid(data.double(), width), param)
+        assert torch.isfinite(grad), f"{owner}-{key} at {num_rays} rays: {grad.item()}"
+        assert grad.item() != 0.0

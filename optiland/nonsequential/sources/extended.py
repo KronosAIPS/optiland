@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from optiland.backend.utils import to_numpy
-from optiland.nonsequential._utils import as_detached_param
+from optiland.nonsequential._utils import as_attachable_param, host_float
 from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.ray_bundle import NSQRayBundle
 from optiland.nonsequential.rng import EventSlot
@@ -68,16 +68,15 @@ class ExtendedSource(BaseNSQSource):
             medium: Medium the source is embedded in (default: vacuum).
         """
         super().__init__(cs, spectrum, total_flux)
-        self.width = as_detached_param(width, "width", "ExtendedSource")
-        self.height = as_detached_param(height, "height", "ExtendedSource")
+        # Each may carry a derivative: the trace attaches the emission points
+        # and directions to it by the change of variables (chapter 09
+        # section 9.7, R-09-4).
+        self.width = as_attachable_param(width)
+        self.height = as_attachable_param(height)
         self.aperture_radius = (
-            as_detached_param(aperture_radius, "aperture_radius", "ExtendedSource")
-            if aperture_radius is not None
-            else None
+            as_attachable_param(aperture_radius) if aperture_radius is not None else None
         )
-        self.half_angle_deg = as_detached_param(
-            half_angle_deg, "half_angle_deg", "ExtendedSource"
-        )
+        self.half_angle_deg = as_attachable_param(half_angle_deg)
         self.medium = medium
 
     def generate(self, ray_id: np.ndarray, rng: NSQRng) -> NSQRayBundle:
@@ -99,7 +98,7 @@ class ExtendedSource(BaseNSQSource):
             # Circular aperture: uniform disk sampling
             u1 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1))
             u2 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2))
-            r = self.aperture_radius * np.sqrt(u1)
+            r = host_float(self.aperture_radius) * np.sqrt(u1)
             phi_pos = 2.0 * np.pi * u2
             lx = r * np.cos(phi_pos)
             ly = r * np.sin(phi_pos)
@@ -107,17 +106,18 @@ class ExtendedSource(BaseNSQSource):
             # Rectangular aperture
             u1 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1))
             u2 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2))
-            lx = (u1 - 0.5) * self.width
-            ly = (u2 - 0.5) * self.height
+            lx = (u1 - 0.5) * host_float(self.width)
+            ly = (u2 - 0.5) * host_float(self.height)
 
         lz_pos = np.zeros(num_rays)
 
         # Sample emission directions (Lambertian or cone)
-        cos_max = np.cos(np.radians(self.half_angle_deg))
+        half_angle_deg = host_float(self.half_angle_deg)
+        cos_max = np.cos(np.radians(half_angle_deg))
         u1d = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U3))
         u2d = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U4))
 
-        if self.half_angle_deg >= 90.0:
+        if half_angle_deg >= 90.0:
             # Cosine-weighted hemisphere (Lambertian)
             cos_theta = np.sqrt(u1d)
         else:

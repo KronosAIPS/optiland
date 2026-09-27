@@ -439,30 +439,49 @@ class TestDifferentiableParameterContract:
         be.set_backend("numpy")
 
     def test_source_aperture_radius_rejects_grad_tensor(self):
-        """Source sampling is NumPy; a grad tensor must raise, not detach."""
+        """A grad tensor must never be silently detached.
+
+        Superseded by chapter 09 R-09-4 (the research repository's issue 31):
+        a top-hat beam's radius is now attached by the change of variables
+        (``test_nsq_source_jacobians.py``), so it is kept as the tensor given;
+        a truncated Gaussian's radius, the truncation edge, still raises.
+        """
         from optiland.nonsequential.sources.collimated import CollimatedSource
 
         r = torch.tensor(5.0, dtype=torch.float64, requires_grad=True)
+        source = CollimatedSource(
+            CoordinateSystem(),
+            Spectrum.monochromatic(0.55),
+            total_flux=1.0,
+            aperture_radius=r,
+        )
+        assert source.aperture_radius is r
         with pytest.raises(NotImplementedError, match="cannot be differentiated"):
             CollimatedSource(
                 CoordinateSystem(),
                 Spectrum.monochromatic(0.55),
                 total_flux=1.0,
                 aperture_radius=r,
+                profile="gaussian",
             )
 
     def test_point_source_half_angle_rejects_grad_tensor(self):
-        """Angular sampling is NumPy; a grad tensor must raise."""
+        """A grad tensor must never be silently detached.
+
+        Superseded by chapter 09 R-09-4 (the research repository's issue 31):
+        the cone's half-angle is now attached by the change of variables
+        (``test_nsq_source_jacobians.py``), so it is kept as the tensor given.
+        """
         from optiland.nonsequential.sources.point import PointSource
 
         a = torch.tensor(10.0, dtype=torch.float64, requires_grad=True)
-        with pytest.raises(NotImplementedError, match="cannot be differentiated"):
-            PointSource(
-                CoordinateSystem(),
-                Spectrum.monochromatic(0.55),
-                total_flux=1.0,
-                half_angle_deg=a,
-            )
+        source = PointSource(
+            CoordinateSystem(),
+            Spectrum.monochromatic(0.55),
+            total_flux=1.0,
+            half_angle_deg=a,
+        )
+        assert source.half_angle_deg is a
 
     def test_plain_floats_still_accepted_everywhere(self):
         """The guard must not disturb ordinary float usage."""
