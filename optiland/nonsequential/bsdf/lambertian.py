@@ -31,6 +31,11 @@ class LambertianBSDF(BaseBSDF):
             surface, e.g. a ground-glass diffuser) instead of the
             reflective one. Defaults to 0.0: a pure diffuse reflector,
             identical to this class's behaviour before D-5.
+
+    Polarization: in a Stokes trace (the research repository's issue 5) a ray
+    this lobe scatters leaves depolarized (``preserves_polarization`` is
+    False: the minimal version has no Mueller scatter model, chapter 06
+    R-06-8), with its reference axis carried to the scattered direction.
     """
 
     def __init__(

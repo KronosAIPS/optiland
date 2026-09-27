@@ -600,7 +600,9 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             rays.M = new_dirs[:, 1]
             rays.N = new_dirs[:, 2]
             if stokes is not None:
-                stokes.scatter(rays, scatters)
+                stokes.scatter(
+                    rays, scatters, getattr(self.bsdf, "preserves_polarization", False)
+                )
             bsdf_gate = be.where(scatters, bsdf_weights, be.ones_like(bsdf_weights))
             # What the lobe did not return is a surface loss when the weight
             # is a physical fraction of the incident flux, and a surface loss

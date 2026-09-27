@@ -101,6 +101,11 @@ class HarveyShackBSDF(BaseBSDF):
             residual; the identity (10.1) closes either way. Setting the
             flag False, which describes this weight, changes an assertion of
             the fork's suite and waits for the maintainer's ruling.
+
+    Polarization: in a Stokes trace (the research repository's issue 5) a ray
+    this lobe scatters leaves depolarized (``preserves_polarization`` is
+    False: the minimal version has no Mueller scatter model, chapter 06
+    R-06-8), with its reference axis carried to the scattered direction.
     """
 
     def __init__(

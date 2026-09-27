@@ -21,6 +21,7 @@ from optiland.nonsequential.components.coating_support import (
 from optiland.nonsequential.components.ledger import LedgerBooking
 from optiland.nonsequential.components.sampling_support import scatter_branch
 from optiland.nonsequential.materials.nsq_material import VACUUM
+from optiland.nonsequential.polarization import mirror_stokes, scatter_state
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -155,7 +156,23 @@ class ReflectiveComponent(BaseComponent, LedgerBooking):
 
         # D-3: reflectance is mandatory, applied to every hit ray regardless
         # of whether it also scatters through a BSDF below.
-        R = resolve_reflectance(self.reflectance, rays.wavelength)
+        # A thin-film stack as the reflectance (a dielectric or metal mirror)
+        # is evaluated at each ray's own angle of incidence; every other
+        # reflectance is angle-blind and never reads it.
+        stack_mirror = callable(getattr(self.reflectance, "evaluate", None))
+        cos_i = be.abs(raw_dot[:, 0]) if stack_mirror else None
+        R = resolve_reflectance(self.reflectance, rays.wavelength, cos_i)
+        # Stokes mode (the research repository's issue 5): the flux factor is
+        # M00 + M01 q of the ray's state in this plane of incidence -- the
+        # scalar R bit for bit for an unpolarized ray.
+        stokes = None
+        if rays.pol_q is not None:
+            stokes = mirror_stokes(
+                rays, dirs, normals, R,
+                stack=self.reflectance.stack if stack_mirror else None,
+                wavelength=rays.wavelength, cos_i=be.abs(raw_dot[:, 0]),
+            )
+            R = stokes.R_eff
         # Ch. 10 (10.1): the (1 - R) a mirror below unit reflectance removes
         # is a destination, not a leak. Booked before the multiply, while
         # the incoming weight is still in hand. The event is exactly
@@ -191,6 +208,18 @@ class ReflectiveComponent(BaseComponent, LedgerBooking):
             rays.flux = rays.flux * be.where(hit_mask, sf_gate, be.ones_like(sf_gate))
 
             new_dirs = be.where(scatters[:, None], bsdf_dirs, new_dirs)
+            if stokes is not None:
+                # The specular state first, then what the lobe does to it.
+                stokes.finish(
+                    rays, hit_mask, (reflected[:, 0], reflected[:, 1], reflected[:, 2])
+                )
+                stokes = None
+                rays.L = new_dirs[:, 0]
+                rays.M = new_dirs[:, 1]
+                rays.N = new_dirs[:, 2]
+                scatter_state(
+                    rays, scatters, getattr(self.bsdf, "preserves_polarization", False)
+                )
             # What the lobe did not return is a surface loss when the weight
             # is a physical fraction of the incident flux, and a surface
             # loss plus a zero-mean event residual when it is a sampling
@@ -208,6 +237,10 @@ class ReflectiveComponent(BaseComponent, LedgerBooking):
         rays.L = new_dirs[:, 0]
         rays.M = new_dirs[:, 1]
         rays.N = new_dirs[:, 2]
+        if stokes is not None:
+            stokes.finish(
+                rays, hit_mask, (reflected[:, 0], reflected[:, 1], reflected[:, 2])
+            )
 
         # n_current unchanged (reflection stays in same medium)
         rays.bounce = be.where(hit_mask, rays.bounce + 1, rays.bounce)

@@ -802,22 +802,110 @@ class FresnelStokes:
         rays.pol_ez = be.where(hit_mask, e[2], rays.pol_ez)
 
     @staticmethod
-    def scatter(rays, scattered) -> None:
-        """A ray routed through a scatter lobe leaves depolarized (R-06-8, kappa = 0).
+    def scatter(rays, scattered, preserves: bool = False) -> None:
+        """A ray routed through a scatter lobe: see :func:`scatter_state`."""
+        scatter_state(rays, scattered, preserves)
 
-        Its reference axis is carried to the lobe's direction. A lobe that
-        keeps polarization is build item 6.
-        """
+
+def scatter_state(rays, scattered, preserves: bool = False) -> None:
+    """The state of a ray a scatter lobe sent in a new direction (R-06-8).
+
+    The minimal polarization carries no Mueller scatter model: a lobe either
+    depolarizes the rays it scatters completely (``kappa = 0``: the
+    Lambertian, Harvey-Shack and tabulated lobes, whatever their angle), or,
+    for the specular lobe, whose direction is the mirror direction the
+    surface event already gave the state for, keeps the state. Either way the
+    reference axis is carried to the lobe's direction by re-projection. An
+    angle-dependent or Mueller-matrix scatter model (R-06-8's middle and full
+    levels) is outside the minimal version.
+
+    Args:
+        rays: The bundle, its direction already the lobe's.
+        scattered: Per-ray mask of the rays the lobe took.
+        preserves: The lobe's ``preserves_polarization`` flag.
+    """
+    if not preserves:
         zero = _detached_zeros_like(rays.pol_q)
         rays.pol_q = be.where(scattered, zero, rays.pol_q)
         rays.pol_u = be.where(scattered, zero, rays.pol_u)
         rays.pol_v = be.where(scattered, zero, rays.pol_v)
-        e = transport_axis(
-            (rays.pol_ex, rays.pol_ey, rays.pol_ez), (rays.L, rays.M, rays.N)
-        )
-        rays.pol_ex = be.where(scattered, e[0], rays.pol_ex)
-        rays.pol_ey = be.where(scattered, e[1], rays.pol_ey)
-        rays.pol_ez = be.where(scattered, e[2], rays.pol_ez)
+    k = (rays.L, rays.M, rays.N)
+    e, s2 = perpendicular_axis((rays.pol_ex, rays.pol_ey, rays.pol_ez), k)
+    # A lobe can send a ray along its old axis, where the re-projection
+    # vanishes; that ray takes the birth axis of its new direction (the
+    # state of a depolarized ray does not depend on the axis).
+    tol = degeneracy_tolerance(rays.L)
+    ok = s2 > tol * tol
+    fallback = birth_axis(*k)
+    e = tuple(be.where(ok, a, b) for a, b in zip(e, fallback, strict=True))
+    rays.pol_ex = be.where(scattered, e[0], rays.pol_ex)
+    rays.pol_ey = be.where(scattered, e[1], rays.pol_ey)
+    rays.pol_ez = be.where(scattered, e[2], rays.pol_ez)
+
+
+def transport_state(rays, mask) -> None:
+    """Carry the reference axis of ``mask``'s rays to their new direction.
+
+    For an element that turns ``k`` without a plane of incidence and without
+    acting on the polarization (the ideal paraxial lens): the state is kept
+    and the axis re-projected perpendicular to the new direction
+    (:func:`transport_axis`). The re-projection differs from a parallel
+    transport of the axis by a rotation of second order in the deflection,
+    which an ideal thin lens, having no polarization model of its own, does
+    not define.
+
+    Args:
+        rays: The bundle, its direction already the new one.
+        mask: Per-ray mask of the rays the element turned.
+    """
+    e = transport_axis(
+        (rays.pol_ex, rays.pol_ey, rays.pol_ez), (rays.L, rays.M, rays.N)
+    )
+    rays.pol_ex = be.where(mask, e[0], rays.pol_ex)
+    rays.pol_ey = be.where(mask, e[1], rays.pol_ey)
+    rays.pol_ez = be.where(mask, e[2], rays.pol_ez)
+
+
+def incidence_frame(rays, dirs, normals):
+    """The ray's state in the plane-of-incidence frame of a surface, and ``s``.
+
+    1. The incoming reference axis is re-projected perpendicular to ``k`` (a
+       kind that does not transport it exactly leaves it slightly off).
+    2. The plane of incidence: ``s = k x n / |k x n|``; where
+       ``|k x n| < sqrt(eps)`` the interface is degenerate (normal incidence,
+       R-06-4), ``s = k x e`` and the rotation is skipped exactly.
+    3. The rotation from ``e`` to ``p_in = s x k`` (no trigonometric call).
+
+    Shared by every surface event that has a plane of incidence: the
+    refractive interface and the mirror.
+
+    Args:
+        rays: The bundle (reads its state and reference axis).
+        dirs, normals: ``(N, 3)`` incident directions and surface normals.
+
+    Returns:
+        ``(s, q, u, v)``: ``s`` as an ``(x, y, z)`` tuple of per-ray arrays and
+        the reduced state in the ``(p_in, s, k)`` frame.
+    """
+    k = (dirs[:, 0], dirs[:, 1], dirs[:, 2])
+    nrm = (normals[:, 0], normals[:, 1], normals[:, 2])
+    e = transport_axis((rays.pol_ex, rays.pol_ey, rays.pol_ez), k)
+
+    s_raw = _cross(*k, *nrm)
+    ls2 = _dot(*s_raw, *s_raw)
+    tol = degeneracy_tolerance(ls2)
+    deg = ls2 < tol * tol
+    inv = 1.0 / be.where(deg, be.ones_like(ls2), ls2) ** 0.5
+    s_frame = _cross(*k, *e)
+    s = tuple(
+        be.where(deg, sf, sr * inv) for sf, sr in zip(s_frame, s_raw, strict=True)
+    )
+    p_in = _cross(*s, *k)
+    c2, s2 = rotation_2psi(e, p_in, k)
+    c2 = be.where(deg, be.ones_like(c2), c2)
+    s2 = be.where(deg, be.zeros_like(s2), s2)
+    q, u = rotate(rays.pol_q, rays.pol_u, c2, s2)
+    return s, q, u, rays.pol_v
 
 
 def fresnel_stokes(
@@ -826,12 +914,9 @@ def fresnel_stokes(
 ) -> FresnelStokes:
     """The Stokes half of a refractive interface, before the branch is drawn.
 
-    1. The incoming reference axis is re-projected perpendicular to ``k`` (a
-       kind that does not yet transport it leaves it slightly off).
-    2. The plane of incidence: ``s = k x n / |k x n|``; where
-       ``|k x n| < sqrt(eps)`` the interface is degenerate (normal incidence,
-       R-06-4), ``s = k x e`` and the rotation is skipped exactly.
-    3. The rotation from ``e`` to ``p_in = s x k`` (no trigonometric call).
+    1. to 3. The state in the plane of incidence (:func:`incidence_frame`):
+       the axis re-projected, ``s = k x n / |k x n|`` (``s = k x e`` at a
+       degenerate interface), the rotation from ``e`` to ``p_in = s x k``.
     4. The interface elements. A bare interface: the Fresnel reflection with
        the TIR phase, and the transmission ``sqrt(T_s T_p)`` with
        ``T_s = 1 - r_s^2``, ``T_p = 1 - r_p^2`` and ``M_t01 = -M_r01``. A
@@ -854,25 +939,7 @@ def fresnel_stokes(
     Returns:
         A :class:`FresnelStokes`.
     """
-    k = (dirs[:, 0], dirs[:, 1], dirs[:, 2])
-    nrm = (normals[:, 0], normals[:, 1], normals[:, 2])
-    e = transport_axis((rays.pol_ex, rays.pol_ey, rays.pol_ez), k)
-
-    s_raw = _cross(*k, *nrm)
-    ls2 = _dot(*s_raw, *s_raw)
-    tol = degeneracy_tolerance(ls2)
-    deg = ls2 < tol * tol
-    inv = 1.0 / be.where(deg, be.ones_like(ls2), ls2) ** 0.5
-    s_frame = _cross(*k, *e)
-    s = tuple(
-        be.where(deg, sf, sr * inv) for sf, sr in zip(s_frame, s_raw, strict=True)
-    )
-    p_in = _cross(*s, *k)
-    c2, s2 = rotation_2psi(e, p_in, k)
-    c2 = be.where(deg, be.ones_like(c2), c2)
-    s2 = be.where(deg, be.zeros_like(s2), s2)
-    q, u = rotate(rays.pol_q, rays.pol_u, c2, s2)
-    v = rays.pol_v
+    s, q, u, v = incidence_frame(rays, dirs, normals)
 
     zero = be.zeros_like(R_used)
     if coating is None:
@@ -909,6 +976,91 @@ def fresnel_stokes(
         )
         m_t = InterfaceMueller(T_used, zero, T_used, zero)
     return FresnelStokes(s, q, u, v, m_r, m_t)
+
+
+# ---------------------------------------------------------------------------
+# The Stokes event at a mirror (build item 6)
+# ---------------------------------------------------------------------------
+
+
+class MirrorStokes:
+    """One mirror reflection in Stokes mode.
+
+    ``g = M00 + M01 q'`` is the flux factor (``q'`` the state in the plane of
+    incidence); with an unpolarized state it is the scalar reflectance the
+    mirror already applies, bit for bit. :meth:`finish` sets the outgoing
+    state and the axis ``e = s x k_out`` once the new direction is on the
+    bundle.
+    """
+
+    def __init__(self, s, q, u, v, m: InterfaceMueller):
+        self.s = s
+        self.q, self.u, self.v = q, u, v
+        self.m = m
+        self.R_eff = m.m00 + m.m01 * q
+
+    def finish(self, rays, hit_mask, k_out) -> None:
+        """Write the reflected state and axis of the hit rays; the others keep theirs.
+
+        Args:
+            rays: The bundle.
+            hit_mask: Per-ray mask of the rays the mirror reflected.
+            k_out: ``(x, y, z)`` of the specular direction, per ray (a ray a
+                scatter lobe takes is then carried from it by
+                :func:`scatter_state`).
+        """
+        _, q, u, v = apply_interface(self.q, self.u, self.v, self.m)
+        e = _cross(*self.s, *k_out)
+        rays.pol_q = be.where(hit_mask, q, rays.pol_q)
+        rays.pol_u = be.where(hit_mask, u, rays.pol_u)
+        rays.pol_v = be.where(hit_mask, v, rays.pol_v)
+        rays.pol_ex = be.where(hit_mask, e[0], rays.pol_ex)
+        rays.pol_ey = be.where(hit_mask, e[1], rays.pol_ey)
+        rays.pol_ez = be.where(hit_mask, e[2], rays.pol_ez)
+
+
+def mirror_stokes(rays, dirs, normals, R_used, stack=None, wavelength=None,
+                  cos_i=None) -> MirrorStokes:
+    """The Stokes half of a mirror reflection, before the flux is weighted.
+
+    Two kinds of mirror, each with ``M00`` the scalar reflectance ``R`` the
+    mirror applies in scalar mode, exactly (R-06-6):
+
+    * **A reflectance with no s and p split** (a constant, a
+      ``callable(wavelength)``, a ``SimpleCoating``): the ideal
+      non-polarizing mirror ``R diag(1, 1, -1, -1)``. It keeps the degree of
+      polarization and flips the handedness: ``(q, u, v) -> (q, -u, -v)`` in
+      the plane-of-incidence frame, which is the limit of the Fresnel
+      reflection at normal incidence (``r_p = -r_s`` there, so
+      ``m22 = r_p r_s = -R``).
+    * **A thin-film stack** (``UnpolarizedThinFilmCoating`` as the mirror's
+      reflectance): a dielectric or metal mirror, a layered stack or a bare
+      absorbing substrate. The s and p reflectances and the relative phase
+      ``r_p r_s*`` come from :func:`thin_film_sp`, in this module's
+      convention: ``M01 = (R_p - R_s) / 2``, ``(M22, M23) = (Re, Im)(r_p
+      r_s*)``. A lane the adapter flags in ``phase_valid`` (a coated face
+      beyond its substrate's critical angle) carries the module's phase as it
+      is; the power terms are right there.
+
+    Args:
+        rays: The bundle (reads its state and reference axis).
+        dirs, normals: ``(N, 3)`` incident directions and surface normals.
+        R_used: The scalar reflectance the mirror applies, per ray.
+        stack: The mirror's ``ThinFilmStack``, or ``None``.
+        wavelength: Per-ray wavelength [um] (for a stack).
+        cos_i: Per-ray ``|cos theta_i|`` (for a stack).
+
+    Returns:
+        A :class:`MirrorStokes`.
+    """
+    s, q, u, v = incidence_frame(rays, dirs, normals)
+    if stack is None:
+        zero = be.zeros_like(R_used)
+        m = InterfaceMueller(R_used, zero, -R_used, zero)
+    else:
+        sp = thin_film_sp(stack, wavelength, cos_i)
+        m = InterfaceMueller(R_used, 0.5 * (sp.Rp - sp.Rs), sp.xr_re, sp.xr_im)
+    return MirrorStokes(s, q, u, v, m)
 
 
 # ---------------------------------------------------------------------------
