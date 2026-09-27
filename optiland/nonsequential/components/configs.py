@@ -199,6 +199,11 @@ class MirrorConfig:
             entry ``i`` multiplies ``r^(2 (i + 1))``, or ``r^(i + 1)`` when
             ``odd`` is set.
         odd: The polynomial is odd.
+        nurbs: A NURBS surface for the mirror (KronosNSRT issue 66): the
+            geometry library's array contract, its ``PatchSet.to_dict()``
+            form, or a ``PatchSet``, in the mirror's own frame. When given, the
+            surface is a :class:`NurbsGeometry` and ``radius``, ``conic``,
+            ``aperture_radius`` and ``coefficients`` are not used.
     """
 
     radius: float
@@ -208,6 +213,7 @@ class MirrorConfig:
     surface: SurfaceConfig | None = None
     coefficients: tuple = ()
     odd: bool = False
+    nurbs: object = None
 
 
 @dataclass

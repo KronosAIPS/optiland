@@ -42,6 +42,20 @@ def _asphere_fields(config: Any, suffix: str) -> dict:
     }
 
 
+def _nurbs_field(config: Any) -> dict:
+    """A mirror's NURBS surface as the array contract in lists, written only
+    when the mirror has one, so a conic mirror's JSON is what it always was."""
+    value = getattr(config, "nurbs", None)
+    if value is None:
+        return {}
+    from optiland.nonsequential.components.geometry.nurbs.geometry import (  # noqa: PLC0415
+        arrays_from_json,
+        arrays_to_json,
+    )
+
+    return {"nurbs": arrays_to_json(arrays_from_json(value))}
+
+
 def _material_out(mat: Any) -> Any:
     from optiland.nonsequential.serialization import (  # noqa: PLC0415
         _serialize_material,
@@ -1035,6 +1049,7 @@ def _register_components() -> None:
             "conic": _to_float(config.conic),
             "aperture_radius": _to_float(config.aperture_radius),
             **_asphere_fields(config, ""),
+            **_nurbs_field(config),
         }
 
     kinds.register_component(
@@ -1050,6 +1065,7 @@ def _register_components() -> None:
             aperture_radius=cfg["aperture_radius"],
             coefficients=tuple(cfg.get("coefficients", ())),
             odd=bool(cfg.get("odd", False)),
+            nurbs=cfg.get("nurbs"),
         ),
         attached="*",
     )

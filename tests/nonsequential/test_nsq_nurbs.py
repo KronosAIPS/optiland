@@ -660,3 +660,73 @@ class TestRegistration:
             cp.mul_(1.1)  # an optimiser's in-place step: the sphere is now 11 mm
         t1 = float(g.ray_intersect(o, d)[0].detach()[0])
         assert t0 == pytest.approx(20.0, abs=1e-12) and t1 == pytest.approx(19.0, abs=1e-12)
+
+
+class TestMirrorFace:
+    """A NURBS mirror placed in a scene through the builder and its JSON form."""
+
+    F = 50.0
+
+    def _paraboloid(self, h=10.0):
+        # z = r^2 / (4 f) exactly: the parabola is a polynomial quadratic
+        # Bezier arc (0, 0), (h / 2, 0), (h, h^2 / (4 f)), revolved
+        return contract([revolved([0, 0, 0, 1, 1, 1], [[0, 0], [h / 2, 0], [h, h * h / (4 * self.F)]], [1, 1, 1], 2)
+                         + (False,)])
+
+    def _scene(self, mirror_cfg):
+        from optiland.nonsequential import MirrorConfig, RayDatabaseConfig  # noqa: PLC0415, F401
+
+        scene = NSQScene()
+        scene.add_source(
+            "S",
+            CoordinateSystem(z=0.5 * self.F, rx=np.pi),
+            CollimatedSourceConfig(spectrum=Spectrum.monochromatic(0.55), total_flux=1.0, aperture_radius=8.0),
+        )
+        scene.add_mirror("M", CoordinateSystem(), mirror_cfg)
+        scene.add_detector("D", CoordinateSystem(z=self.F), RayDatabaseConfig(width=40.0, height=40.0, absorb=True))
+        return scene
+
+    def test_focuses_as_the_conic_mirror(self):
+        from optiland.nonsequential import MirrorConfig  # noqa: PLC0415
+
+        res_n = self._scene(MirrorConfig(radius=0.0, reflectance=1.0, nurbs=self._paraboloid())).trace(
+            num_rays=2000, seed=3, max_depth=4)
+        res_c = self._scene(MirrorConfig(radius=2 * self.F, conic=-1.0, reflectance=1.0, aperture_radius=10.0)).trace(
+            num_rays=2000, seed=3, max_depth=4)
+        xn, yn = _np(res_n.detectors["D"].x), _np(res_n.detectors["D"].y)
+        xc, yc = _np(res_c.detectors["D"].x), _np(res_c.detectors["D"].y)
+        assert xn.size == xc.size and xn.size > 1000
+        # every reflected ray passes through the focus to within the two
+        # kinds' root and normal accuracy (1e-9 mm at 50 mm)
+        assert np.max(np.hypot(xn, yn)) < 1e-9
+        assert np.max(np.abs(xn - xc)) < 1e-9 and np.max(np.abs(yn - yc)) < 1e-9
+
+    def test_json_round_trip(self):
+        from optiland.nonsequential import MirrorConfig  # noqa: PLC0415
+        from optiland.nonsequential.serialization import scene_from_dict, scene_to_dict  # noqa: PLC0415
+
+        d = scene_to_dict(self._scene(MirrorConfig(radius=0.0, reflectance=1.0, nurbs=self._paraboloid())))
+        mirror = next(c for c in d["components"] if c["name"] == "M")["config"]
+        assert mirror["nurbs"]["patch_degree"] == [[2, 2]]
+        back = scene_from_dict(d)
+        geom = back.component_registry._registry["M"].surfaces[0].geometry
+        assert isinstance(geom, NurbsGeometry)
+        assert scene_to_dict(back) == d
+
+    def test_library_json_form_and_conic_json_unchanged(self):
+        from optiland.nonsequential import MirrorConfig  # noqa: PLC0415
+        from optiland.nonsequential.components.geometry.nurbs.geometry import (  # noqa: PLC0415
+            contract_from_patch_set_dict,
+        )
+        from optiland.nonsequential.serialization import scene_to_dict  # noqa: PLC0415
+
+        p, q, U, V, P, W, _ = sphere_surface(10.0)
+        lib = {"kind": "patch_set", "unit": "mm", "patches": [{"surface": {
+            "degree_u": p, "degree_v": q, "knots_u": U, "knots_v": V, "control_points": P.tolist(),
+            "weights": W.tolist()}, "loops": [], "reversed": False}]}
+        a = contract_from_patch_set_dict(lib)
+        mine = _arrays(sphere_surface(10.0))
+        for key in ("ctrl_points", "ctrl_weights", "knots_u", "knots_v", "patch_domain", "patch_degree"):
+            assert np.array_equal(a[key], mine[key]), key
+        d = scene_to_dict(self._scene(MirrorConfig(radius=-100.0, reflectance=1.0)))
+        assert "nurbs" not in next(c for c in d["components"] if c["name"] == "M")["config"]

@@ -448,3 +448,98 @@ class NurbsGeometry(ComponentGeometry):
             "n_ambiguous_2": self.n_ambiguous_2,
             "second_round_share": self.second_round_share,
         }
+
+
+# ---------------------------------------------------------------------------
+# The JSON forms
+# ---------------------------------------------------------------------------
+
+
+def arrays_to_json(arrays: Mapping[str, Any]) -> dict:
+    """The array contract as JSON-ready lists (the derived ``bezier_*`` keys
+    dropped: the build recomputes them)."""
+    out = {}
+    for k, v in arrays.items():
+        if k.startswith("bezier_") or k == "patch_bezier_offset":
+            continue
+        out[k] = v.detach().cpu().numpy().tolist() if is_tensor(v) else np.asarray(v).tolist()
+    return out
+
+
+def _offsets(counts) -> np.ndarray:
+    return np.concatenate([[0], np.cumsum(np.asarray(counts, dtype=np.int64))]).astype(np.int64)
+
+
+def contract_from_patch_set_dict(d: Mapping[str, Any]) -> dict[str, np.ndarray]:
+    """The array contract from the geometry library's JSON form of a patch set
+    (``kgeom.nurbs.PatchSet.to_dict()``: ``{"kind": "patch_set", "unit", "patches":
+    [{"surface": {...}, "loops": [...], "reversed", "uv_bounds", ...}]}``),
+    without importing the library. Face keys are not carried (the kind does
+    not read them)."""
+    patches = list(d.get("patches", ()))
+    if not patches:
+        raise ValueError("a NURBS patch set needs at least one patch")
+    deg, nctrl, cps, ws, ku, kv, dom, uvb, rev = [], [], [], [], [], [], [], [], []
+    loops_per, outer, curves_per, c_deg, c_pts, c_w, c_knots = [], [], [], [], [], [], []
+    for p in patches:
+        s = p["surface"]
+        P = np.asarray(s["control_points"], dtype=np.float64)
+        nu, nv = P.shape[:2]
+        W = np.ones((nu, nv)) if s.get("weights") is None else np.asarray(s["weights"], dtype=np.float64)
+        U = np.asarray(s["knots_u"], dtype=np.float64)
+        V = np.asarray(s["knots_v"], dtype=np.float64)
+        pu, qv = int(s["degree_u"]), int(s["degree_v"])
+        deg.append((pu, qv))
+        nctrl.append((nu, nv))
+        cps.append(P.reshape(-1, 3))
+        ws.append(W.reshape(-1))
+        ku.append(U)
+        kv.append(V)
+        domain = (U[pu], U[nu], V[qv], V[nv])
+        dom.append(domain)
+        uvb.append(tuple(p.get("uv_bounds") or domain))
+        rev.append(bool(p.get("reversed", False)))
+        loops = list(p.get("loops", ()))
+        loops_per.append(len(loops))
+        for lp in loops:
+            outer.append(bool(lp.get("outer", True)))
+            curves_per.append(len(lp["curves"]))
+            for c in lp["curves"]:
+                pts = np.asarray(c["control_points"], dtype=np.float64).reshape(-1, 2)
+                c_deg.append(int(c["degree"]))
+                c_pts.append(pts)
+                c_w.append(np.ones(len(pts)) if c.get("weights") is None else np.asarray(c["weights"], dtype=np.float64))
+                c_knots.append(np.asarray(c["knots"], dtype=np.float64))
+    return {
+        "format": np.array(1), "unit": np.array(str(d.get("unit", "mm"))),
+        "provenance": np.array(str(d.get("provenance", ""))),
+        "patch_degree": np.array(deg, dtype=np.int32), "patch_n_ctrl": np.array(nctrl, dtype=np.int32),
+        "patch_ctrl_offset": _offsets([len(w) for w in ws]), "ctrl_points": np.concatenate(cps),
+        "ctrl_weights": np.concatenate(ws),
+        "patch_knot_u_offset": _offsets([len(k) for k in ku]), "knots_u": np.concatenate(ku),
+        "patch_knot_v_offset": _offsets([len(k) for k in kv]), "knots_v": np.concatenate(kv),
+        "patch_domain": np.array(dom), "patch_uv_bounds": np.array(uvb), "patch_reversed": np.array(rev, dtype=bool),
+        "patch_loop_offset": _offsets(loops_per), "loop_outer": np.array(outer, dtype=bool),
+        "loop_curve_offset": _offsets(curves_per), "curve_degree": np.array(c_deg, dtype=np.int32),
+        "curve_ctrl_offset": _offsets([len(w) for w in c_w]),
+        "curve_ctrl_points": np.concatenate(c_pts) if c_pts else np.zeros((0, 2)),
+        "curve_weights": np.concatenate(c_w) if c_w else np.zeros(0),
+        "curve_knot_offset": _offsets([len(k) for k in c_knots]),
+        "curve_knots": np.concatenate(c_knots) if c_knots else np.zeros(0),
+    }
+
+
+def arrays_from_json(value: Any) -> dict[str, np.ndarray]:
+    """The array contract from any form a scene may carry: the contract itself
+    (arrays or lists, as :func:`arrays_to_json` writes it), the library's
+    ``PatchSet.to_dict()`` form, or a ``PatchSet`` (anything with
+    ``to_arrays``)."""
+    if not isinstance(value, Mapping) and hasattr(value, "to_arrays"):
+        return dict(value.to_arrays(bezier=True))
+    if not isinstance(value, Mapping):
+        raise TypeError(f"a NURBS surface is a mapping or a patch set, got {type(value).__name__}")
+    if value.get("kind") == "patch_set":
+        return contract_from_patch_set_dict(value)
+    if "patch_degree" not in value:
+        raise ValueError("a NURBS mapping is either the array contract or a patch set's to_dict form")
+    return {k: np.asarray(v) for k, v in value.items()}
