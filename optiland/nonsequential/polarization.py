@@ -33,8 +33,8 @@ Conventions (stated here once, at the API boundary; R-06-1)
   perpendicular to ``k``) by the angle ``psi`` measured about ``k`` applies
   ``M_rot(psi)`` of chapter 06 section 6.5: ``q' = cos2psi q + sin2psi u``,
   ``u' = -sin2psi q + cos2psi u``, ``v' = v``. The doubled angle is formed
-  algebraically from ``cos psi = e . a`` and ``sin psi = (e x a) . k``; no
-  trigonometric function is called.
+  algebraically from ``e . a`` and ``(e x a) . k``, normalised by their sum
+  of squares (:func:`rotation_2psi`); no trigonometric function is called.
 * **Interface form.** Every element this module builds is, in its own frame,
   ``[[m00, m01, 0, 0], [m01, m00, 0, 0], [0, 0, m22, m23], [0, 0, -m23, m22]]``
   (:class:`InterfaceMueller`): a Fresnel reflection or transmission, a linear
@@ -180,18 +180,35 @@ def degeneracy_tolerance(like):
 def rotation_2psi(e, a, k):
     """``(cos 2psi, sin 2psi)`` of the rotation taking reference axis ``e`` to ``a``.
 
-    ``psi`` is measured about ``k``: ``cos psi = e . a``,
-    ``sin psi = (e x a) . k``; then ``cos 2psi = c^2 - s^2`` and
-    ``sin 2psi = 2 c s``. All three vectors are given as ``(x, y, z)`` tuples
-    of per-ray component arrays; ``e`` and ``a`` are unit vectors
-    perpendicular to the unit ``k``.
+    ``psi`` is measured about ``k``: ``c = e . a`` and ``s = (e x a) . k``
+    are ``|e| |a|`` times ``cos psi`` and ``sin psi``; then
+    ``cos 2psi = (c^2 - s^2) / (c^2 + s^2)`` and
+    ``sin 2psi = 2 c s / (c^2 + s^2)``. All three vectors are given as
+    ``(x, y, z)`` tuples of per-ray component arrays; ``e`` and ``a`` are
+    unit vectors perpendicular to the unit ``k``.
+
+    Why the division by ``c^2 + s^2 = |e|^2 |a|^2``: the two axes are unit
+    vectors only to the rounding of their normalisation, and without it the
+    doubled-angle pair has length ``|e|^2 |a|^2`` instead of one, so the
+    rotation scales ``(q, u)`` by up to ``1 + 4 u`` and can take a pure
+    state past a degree of polarization of one (R-06-7). With it the pair is
+    a rotation to its own rounding, and a rotation between two axes that are
+    the same line (``s = 0``) is exactly ``(1, 0)``: ``c^2 / c^2``. Where
+    ``c^2 + s^2`` vanishes (a zero axis, which no caller passes) the pair is
+    ``(1, 0)``, the identity, behind a double ``where``.
 
     Returns:
         ``(c2, s2)``, per-ray arrays.
     """
     c = _dot(*e, *a)
     s = _dot(*_cross(*e, *a), *k)
-    return c * c - s * s, 2.0 * c * s
+    cc, ss = c * c, s * s
+    den = cc + ss
+    nonzero = den > 0
+    safe = be.where(nonzero, den, be.ones_like(den))
+    c2 = be.where(nonzero, (cc - ss) / safe, be.ones_like(den))
+    s2 = be.where(nonzero, (2.0 * c * s) / safe, be.zeros_like(den))
+    return c2, s2
 
 
 def rotate(q, u, c2, s2):
