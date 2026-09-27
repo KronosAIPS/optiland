@@ -217,6 +217,8 @@ class DeviceLeaves:
     prange: Any  # (L, 4)
     uvb: Any  # (L, 4) the leaf's patch's uv_bounds
     orient: Any  # (L, 3)
+    pivot: Any  # (L, 3) the point the net is stored relative to
+    poff: Any  # (L, 3) frame @ (pivot - centre): box-frame coordinates of the pivot
     P: int
     Q: int
     n: int
@@ -227,8 +229,8 @@ def upload(leaves, to_array, pad_ulps: float = 8.0, u: float = 2.0**-53) -> Devi
 
     Boxes are padded outward by ``pad_ulps`` units of the working dtype at the
     box's coordinate scale, so rounding the box never culls a root; nets are
-    stored relative to the leaf's centre, so the residual lives at the leaf's
-    scale, not the scene's.
+    stored relative to the leaf's pivot (its centre, or its collapsed edge's
+    point), so the residual lives at the leaf's scale, not the scene's.
 
     Args:
         leaves: The host leaf set.
@@ -238,7 +240,10 @@ def upload(leaves, to_array, pad_ulps: float = 8.0, u: float = 2.0**-53) -> Devi
     """
     lv = leaves
     net = lv.net.copy()
-    net[..., :3] = net[..., :3] - lv.centre[:, None, None, :] * net[..., 3:4]
+    # relative to the pivot: w x - w p, the same product as the host's, so a
+    # collapsed edge snapped to the pivot stores exact zeros
+    net[..., :3] = net[..., :3] - lv.pivot[:, None, None, :] * net[..., 3:4]
+    poff = np.einsum("lij,lj->li", lv.frame, lv.pivot - lv.centre)
     coord = np.abs(lv.centre).max(axis=1) + np.abs(lv.half).max(axis=1)
     half = lv.half + (pad_ulps * u * 2.0 * coord + 1e-300)[:, None]
     scale = np.abs(lv.half).max(axis=1) * 2.0 * 1.8
@@ -246,7 +251,8 @@ def upload(leaves, to_array, pad_ulps: float = 8.0, u: float = 2.0**-53) -> Devi
     return DeviceLeaves(
         to_array(net), to_array(lv.centre), to_array(lv.frame), to_array(half), to_array(scale),
         to_array(np.sin(lv.cone)), to_array(lv.uvmap), to_array(lv.sub), to_array(lv.prange),
-        to_array(uvb), to_array(lv.orient), lv.degree[0], lv.degree[1], lv.n,
+        to_array(uvb), to_array(lv.orient), to_array(lv.pivot), to_array(poff),
+        lv.degree[0], lv.degree[1], lv.n,
     )
 
 
@@ -300,7 +306,19 @@ def unit_normal(ops: _Ops, net, s, r, P: int, Q: int, scale, orient, u: float):
     to agree with the leaf's centre normal (the leaf's normal cone is within
     15 degrees, so the sign is unambiguous). This is the limit of ``S_s x S_r``
     at the edge, exact for any surface with a tangent plane there.
+
+    The tangents are evaluated on the net re-centred at the point itself
+    (``w (P - S)``; a translation leaves every derivative unchanged). Near a
+    pole ``S_s`` is of the order of the distance to the pole, and the quotient
+    rule on a net centred elsewhere subtracts numbers of the leaf's size to
+    form it: 1e-12 mm from a pole the normal was off by 1.5e-3 rad at float64
+    (measured). On the re-centred net every term is of the order of ``S_s``
+    itself.
     """
+    S0, _, _ = eval_leaf(ops, net, s, r, P, Q)
+    if ops.torch is not None:
+        S0 = S0.detach()
+    net = ops.cat([net[..., :3] - S0[:, None, None, :] * net[..., 3:4], net[..., 3:4]], -1)
     _, Ss, Sr = eval_leaf(ops, net, s, r, P, Q)
     n = ops.cross(Ss, Sr)
     ns = ops.norm(Ss)
@@ -430,18 +448,19 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
     dd = d[lane_ray]
     cen = dl.centre[lane_leaf]
     frm = dl.frame[lane_leaf]
-    oo = od + tpre[:, None] * dd - cen
+    poff = dl.poff[lane_leaf]
+    oo = od + tpre[:, None] * dd - dl.pivot[lane_leaf]
     tol = k_tol * ops.u * ops.maximum(dl.scale[lane_leaf], ops.amax_abs(od) + ops.amax_abs(cen))
     # starts
     tl0 = lane_frac * tspan
     tl0 = ops.where(defl & (tl0 <= 0.0), 0.05 * tspan, tl0)
-    pl3 = (frm[:, 2] * oo).sum(-1)
+    pl3 = (frm[:, 2] * oo).sum(-1) + poff[:, 2]
     dl3 = (frm[:, 2] * dd).sum(-1)
     tm = -pl3 / dl3
     use_tm = lane_mid & ops.isfinite(tm) & (tm >= 0.0) & (tm <= tspan)
     tl0 = ops.where(use_tm, tm, tl0)
     pt = oo + tl0[:, None] * dd
-    y = ops.einsum("pij,pj->pi", frm, pt)
+    y = ops.einsum("pij,pj->pi", frm, pt) + poff
     Am = dl.uvmap[lane_leaf]
     s0 = ops.clip(Am[:, 0, 0] * y[:, 0] + Am[:, 0, 1] * y[:, 1] + Am[:, 0, 2], 0.0, 1.0)
     r0 = ops.clip(Am[:, 1, 0] * y[:, 0] + Am[:, 1, 1] * y[:, 1] + Am[:, 1, 2], 0.0, 1.0)

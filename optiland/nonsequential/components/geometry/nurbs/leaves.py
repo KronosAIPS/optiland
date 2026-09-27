@@ -83,6 +83,8 @@ class LeafSet:
     cone: np.ndarray  # (L,) normal-cone half-angle about frame[:, 2] [rad]
     uvmap: np.ndarray  # (L, 2, 3) (y1, y2, 1) in the box frame -> (s, r)
     orient: np.ndarray  # (L, 3) unit S_s x S_r at the leaf's centre
+    pivot: np.ndarray  # (L, 3) the origin the device stores the net relative to: a collapsed
+    #                    edge's point when the leaf has one, else the box centre
     patch: np.ndarray  # (L,) int64 patch index
     piece: np.ndarray  # (L,) int64 Bezier piece index (over the whole set)
     depth: np.ndarray  # (L,) int64
@@ -290,6 +292,29 @@ def _uvmap(net: np.ndarray, centre: np.ndarray, R: np.ndarray) -> np.ndarray:
     return coef.T
 
 
+def _snap_collapsed(net: np.ndarray):
+    """Make a collapsed edge exactly collapsed; return its point, or None.
+
+    A pole of a surface of revolution is an edge of control points that
+    coincide in exact arithmetic; after extraction and subdivision in float64
+    they differ by a few ulps, and near the pole those ulps are the whole
+    tangent ``S_s`` (a point 1e-12 mm from the pole has ``|S_s|`` of that
+    order). The edge's points are set to its first one, so the device can
+    store the net relative to that point and the edge's entries are exact
+    zeros there.
+    """
+    X = net[..., :3] / net[..., 3:4]
+    tol = 1e-12 * max(1.0, float(np.abs(X).max()))
+    point = None
+    for sl in ((slice(None), 0), (slice(None), -1), (0, slice(None)), (-1, slice(None))):
+        edge = X[sl]
+        if np.abs(edge - edge[0]).max() <= tol:
+            X[sl] = edge[0]
+            net[sl + (slice(0, 3),)] = X[sl] * net[sl + (slice(3, 4),)]
+            point = edge[0].copy() if point is None else point
+    return point
+
+
 def _centre_normal(net: np.ndarray, frame_n: np.ndarray) -> np.ndarray:
     """Unit ``S_s x S_r`` at the leaf's centre (the box normal's sign if degenerate)."""
     _, Ss, Sr = eval_net(net, np.array([0.5]), np.array([0.5]))
@@ -390,7 +415,7 @@ def build_leaves(
 
     out: dict[str, list] = {k: [] for k in (
         "net", "mu", "mv", "block", "prange", "sub", "centre", "frame", "half", "cone",
-        "uvmap", "orient", "patch", "piece", "depth",
+        "uvmap", "orient", "pivot", "patch", "piece", "depth",
     )}
     piece_id = 0
     for i in range(n_p):
@@ -453,6 +478,7 @@ def build_leaves(
                 while stack:
                     Mu, Mv, (s0, s1, r0, r1), depth = stack.pop()
                     net = np.einsum("ai,bj,ijc->abc", Mu, Mv, pw_blk)
+                    pole = _snap_collapsed(net)
                     if np.any(net[..., 3] <= 0):
                         raise ValueError("non-positive weight in a leaf: the convex-hull bound does not hold")
                     X = net[..., :3] / net[..., 3:4]
@@ -475,6 +501,7 @@ def build_leaves(
                         out["cone"].append(cone)
                         out["uvmap"].append(_uvmap(net, centre, R))
                         out["orient"].append(_centre_normal(net, R[2]))
+                        out["pivot"].append(centre if pole is None else pole)
                         out["patch"].append(i)
                         out["piece"].append(piece_id)
                         out["depth"].append(depth)
@@ -501,7 +528,8 @@ def build_leaves(
         block=np.array(out["block"], dtype=np.int64), prange=np.array(out["prange"]),
         sub=np.array(out["sub"]), centre=np.array(out["centre"]), frame=np.array(out["frame"]),
         half=np.array(out["half"]), cone=np.array(out["cone"]), uvmap=np.array(out["uvmap"]),
-        orient=np.array(out["orient"]), patch=np.array(out["patch"], dtype=np.int64),
+        orient=np.array(out["orient"]), pivot=np.array(out["pivot"]),
+        patch=np.array(out["patch"], dtype=np.int64),
         piece=np.array(out["piece"], dtype=np.int64), depth=np.array(out["depth"], dtype=np.int64),
         patch_sign=np.where(reversed_, -1.0, 1.0), patch_uv_bounds=uvb, n_pieces=piece_id,
     )

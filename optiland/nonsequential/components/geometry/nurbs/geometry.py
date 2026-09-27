@@ -95,7 +95,14 @@ _NET_KEYS = ("ctrl_points", "ctrl_weights")
 
 
 def _requires_grad(value) -> bool:
-    return is_tensor(value) and bool(value.requires_grad)
+    """A tensor that carries a derivative: reverse mode, or a forward-mode tangent."""
+    if not is_tensor(value):
+        return False
+    if bool(value.requires_grad):
+        return True
+    from optiland.nonsequential.parameter_register import _has_tangent  # noqa: PLC0415
+
+    return _has_tangent(value)
 
 
 def _host(value) -> np.ndarray:
@@ -234,10 +241,15 @@ class NurbsGeometry(ComponentGeometry):
         """
         key = self._key()
         if key != self._leaf_key:
+            cp, w = _host(self.control_points), _host(self.weights)
+            # the contract's Bezier pieces describe its own net: compare only against that
+            own = np.array_equal(cp, self._arrays["ctrl_points"].reshape(-1, 3)) and np.array_equal(
+                w, self._arrays["ctrl_weights"].reshape(-1)
+            )
             self.leaves = build_leaves(
-                self._arrays, _host(self.control_points), _host(self.weights),
+                self._arrays, cp, w,
                 cone_deg=self.cone_deg, tangent_deg=self.tangent_deg, max_depth=self.max_depth,
-                check_pieces=self._generation == 0,
+                check_pieces=own,
             )
             self._leaf_key = key
             self._generation += 1
@@ -339,7 +351,9 @@ class NurbsGeometry(ComponentGeometry):
     def _needs_adjoint(self, origins, directions) -> bool:
         import torch  # noqa: PLC0415
 
-        if not torch.is_grad_enabled():
+        from torch.autograd import forward_ad  # noqa: PLC0415
+
+        if not torch.is_grad_enabled() and forward_ad._current_level < 0:
             return False
         return (
             _requires_grad(origins)
@@ -362,7 +376,7 @@ class NurbsGeometry(ComponentGeometry):
         blk = adj["block"][leaf]
         pw_blk = pw[blk]
         net = torch.einsum("nai,nbj,nijc->nabc", adj["mu"][leaf], adj["mv"][leaf], pw_blk)
-        cen = dl.centre[leaf]
+        cen = dl.pivot[leaf]
         net = torch.cat([net[..., :3] - cen[:, None, None, :] * net[..., 3:4], net[..., 3:4]], dim=-1)
         s0 = out["s"].detach()
         r0 = out["r"].detach()
