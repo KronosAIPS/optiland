@@ -18,9 +18,17 @@ the boxes and the leaf choice are topology and are detached,
    largest degree of the set by Bernstein degree elevation (exact, linear), so
    the device arrays have one shape.
 3. **Leaves.** Each piece is split at parameter midpoints (de Casteljau, again
-   a matrix) until its sampled normal cone is at most ``cone_deg`` (15 degrees)
-   and the spread of each tangent direction at most ``tangent_deg`` (45
-   degrees), or ``max_depth`` splits. The tangent rule exists because an
+   a matrix) until its sampled normal cone is at most ``cone_deg`` (15 degrees),
+   the spread of each tangent direction at most ``tangent_deg`` (45 degrees)
+   and the leaf fills at least ``fill_min`` (0.3) of its box's footprint, or
+   ``max_depth`` splits. A split goes across the parameter along which the
+   tangents turn most, when the cone holds and the tangent or fill rule does
+   not; across the longer side otherwise. The fill rule exists because a
+   thin annular sector (a ring of a densely sampled revolved profile) fills
+   a sliver of its box, the boxes of its neighbours overlap it, and a ray
+   meets dozens of them: on a 200-sample revolved asphere, 1,592 leaves
+   without the rule left 3,951 of 15,735 rays without their hit (flagged
+   overflow); with 0.3, 5,248 leaves and none (measured, N2 of 2026-09-27). The tangent rule exists because an
    annular sector near a pole has a small normal cone but a tangent that
    turns by 90 degrees, and an affine start guess is then poor (the CAD study
    N1 of 2026-09-25, section 5).
@@ -51,6 +59,8 @@ import numpy as np
 DEFAULT_CONE_DEG = 15.0
 #: Largest spread of a leaf's tangent directions [degrees].
 DEFAULT_TANGENT_DEG = 45.0
+#: Smallest share of its box's footprint a leaf must fill.
+DEFAULT_FILL_MIN = 0.3
 #: Largest number of midpoint splits of one Bezier piece.
 DEFAULT_MAX_DEPTH = 10
 #: Samples per direction of the cone, spread and start-map fits.
@@ -280,7 +290,12 @@ def _cone_and_spread(net: np.ndarray, axis: np.ndarray):
             A = np.moveaxis(G, axis_, 0)  # lines along parameter k
             c = np.einsum("aic,bic->iab", A, A)
             turn[k] = max(turn[k], float(np.arccos(np.clip(np.nanmin(c), -1.0, 1.0))))
-    return cone, spreads[0], spreads[1], turn[0], turn[1]
+    # the leaf's area, trapezoidal on the grid of |S_s x S_r| (the parameter square is [0, 1]^2)
+    wts = np.ones(_GRID)
+    wts[0] = wts[-1] = 0.5
+    wts /= _GRID - 1
+    area = float(np.einsum("i,j,ij->", wts, wts, mag.reshape(_GRID, _GRID)))
+    return cone, spreads[0], spreads[1], turn[0], turn[1], area
 
 
 def _uvmap(net: np.ndarray, centre: np.ndarray, R: np.ndarray) -> np.ndarray:
@@ -367,6 +382,7 @@ def build_leaves(
     cone_deg: float = DEFAULT_CONE_DEG,
     tangent_deg: float = DEFAULT_TANGENT_DEG,
     max_depth: int = DEFAULT_MAX_DEPTH,
+    fill_min: float = DEFAULT_FILL_MIN,
     check_pieces: bool = True,
 ) -> LeafSet:
     """The leaves of a patch set given as the library's array contract.
@@ -378,7 +394,7 @@ def build_leaves(
         control_points: ``(K, 3)`` float64 to use instead of the contract's
             ``ctrl_points`` (a geometry whose net has been moved), or ``None``.
         weights: ``(K,)`` likewise.
-        cone_deg, tangent_deg, max_depth: The leaf rule (module docstring).
+        cone_deg, tangent_deg, max_depth, fill_min: The leaf rule (module docstring).
         check_pieces: Compare the Bezier pieces with the contract's.
 
     Returns:
@@ -483,9 +499,14 @@ def build_leaves(
                         raise ValueError("non-positive weight in a leaf: the convex-hull bound does not hold")
                     X = net[..., :3] / net[..., 3:4]
                     centre, R, half = _obb(X)
-                    cone, spread_s, spread_r, turn_s, turn_r = _cone_and_spread(net, R[2])
+                    cone, spread_s, spread_r, turn_s, turn_r, area = _cone_and_spread(net, R[2])
                     # 1e-9 rad of slack: a quarter-turn piece halved is 45 degrees to rounding
                     tan_ok = max(spread_s, spread_r) <= math.radians(tangent_deg) + _ANGLE_SLACK
+                    # the box's footprint filled by the leaf: a thin annular sector (a ring of a
+                    # densely sampled revolved profile) fills a sliver of its box, and its box
+                    # then covers its neighbours' and a ray meets many of them
+                    fill_ok = area >= fill_min * 4.0 * half[0] * half[1]
+                    tan_ok = tan_ok and fill_ok
                     final = cone <= math.radians(cone_deg) + _ANGLE_SLACK and tan_ok
                     if final or depth >= max_depth:
                         out["net"].append(net)

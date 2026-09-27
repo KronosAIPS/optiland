@@ -83,6 +83,7 @@ from optiland.nonsequential.components.geometry.base import AABB, ComponentGeome
 from optiland.nonsequential.components.geometry.nurbs import kernel as K
 from optiland.nonsequential.components.geometry.nurbs.leaves import (
     DEFAULT_CONE_DEG,
+    DEFAULT_FILL_MIN,
     DEFAULT_MAX_DEPTH,
     DEFAULT_TANGENT_DEG,
     LeafSet,
@@ -146,6 +147,7 @@ class NurbsGeometry(ComponentGeometry):
         cone_deg: float = DEFAULT_CONE_DEG,
         tangent_deg: float = DEFAULT_TANGENT_DEG,
         max_depth: int = DEFAULT_MAX_DEPTH,
+        fill_min: float = DEFAULT_FILL_MIN,
         n_iter: int = K.DEFAULT_N_ITER,
         k_tol: float = K.DEFAULT_K_TOL,
         n_candidates: int = K.DEFAULT_N_CANDIDATES,
@@ -162,7 +164,7 @@ class NurbsGeometry(ComponentGeometry):
             control_points: ``(K, 3)`` to use instead of the contract's
                 ``ctrl_points``; a tensor with ``requires_grad`` stays attached.
             weights: ``(K,)`` likewise for ``ctrl_weights``.
-            cone_deg, tangent_deg, max_depth: The leaf rule.
+            cone_deg, tangent_deg, max_depth, fill_min: The leaf rule.
             n_iter: Fixed Newton iteration count.
             k_tol: Residual tolerance in units of the working dtype.
             n_candidates, n_ambiguous: Boxes solved per ray in the first round
@@ -190,6 +192,7 @@ class NurbsGeometry(ComponentGeometry):
         self.cone_deg = float(cone_deg)
         self.tangent_deg = float(tangent_deg)
         self.max_depth = int(max_depth)
+        self.fill_min = float(fill_min)
         self.n_iter = int(n_iter)
         self.k_tol = float(k_tol)
         self.n_candidates = int(n_candidates)
@@ -249,7 +252,7 @@ class NurbsGeometry(ComponentGeometry):
             self.leaves = build_leaves(
                 self._arrays, cp, w,
                 cone_deg=self.cone_deg, tangent_deg=self.tangent_deg, max_depth=self.max_depth,
-                check_pieces=own,
+                fill_min=self.fill_min, check_pieces=own,
             )
             self._leaf_key = key
             self._generation += 1
@@ -418,7 +421,7 @@ class NurbsGeometry(ComponentGeometry):
         """A copy whose net is plain float64 arrays."""
         return NurbsGeometry(
             self.arrays, cone_deg=self.cone_deg, tangent_deg=self.tangent_deg,
-            max_depth=self.max_depth, n_iter=self.n_iter, k_tol=self.k_tol,
+            max_depth=self.max_depth, fill_min=self.fill_min, n_iter=self.n_iter, k_tol=self.k_tol,
             n_candidates=self.n_candidates, n_ambiguous=self.n_ambiguous,
             n_candidates_2=self.n_candidates_2, n_ambiguous_2=self.n_ambiguous_2,
             second_round_share=self.second_round_share,
@@ -440,6 +443,7 @@ class NurbsGeometry(ComponentGeometry):
             "cone_deg": self.cone_deg,
             "tangent_deg": self.tangent_deg,
             "max_depth": self.max_depth,
+            "fill_min": self.fill_min,
             "n_iter": self.n_iter,
             "k_tol": self.k_tol,
             "n_candidates": self.n_candidates,
