@@ -716,7 +716,9 @@ class ArrayBackend(TracerBackend):
             research repository: the top 24 bits times 2**-24, so no draw is
             1.0). At float64 the key is absent: the uniform is the whole
             32-bit output times 2**-32, as in every record made before the
-            key existed.
+            key existed. In a Stokes trace also ``polarization: "stokes"``;
+            a scalar trace has no ``polarization`` key (absent means off;
+            see ``SimulationResult.environment``).
         """
         try:
             device = str(be.get_device())
@@ -731,7 +733,9 @@ class ArrayBackend(TracerBackend):
         if be.get_precision() == 32:
             env["uniform_bits"] = uniform_bits(32)
         # R-06-10: a Stokes trace says so. Absent means the scalar trace, as
-        # in every record made before the mode existed.
+        # in every record made before the mode existed (the maintainer's
+        # ruling of 2026-09-27: the key comes for every trace with the
+        # scalar-equivalence conditions of T-06-19; see SimulationResult).
         if self.polarization != "off":
             env["polarization"] = self.polarization
         return env

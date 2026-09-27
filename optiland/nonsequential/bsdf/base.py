@@ -57,9 +57,21 @@ class BaseBSDF(ABC):
             identity closes either way -- the two terms sum to the same
             ``1 - weight`` -- so this changes which bin the flux is
             attributed to, not whether the ledger balances.
+        preserves_polarization: What a Stokes trace (the research
+            repository's issue 5) does with the state of a ray this lobe
+            scatters. ``False`` (the default, and the value of every lobe
+            that sends a ray in a new direction: Lambertian, Harvey-Shack,
+            tabulated) depolarizes it completely: the minimal polarization
+            carries no Mueller scatter model, so a scattered ray leaves
+            unpolarized (``kappa = 0``, chapter 06 R-06-8) whatever its
+            angle. ``True`` keeps the state: only the specular lobe, whose
+            direction is the mirror direction the surface's own Stokes event
+            already gave the state for. The reference axis is carried to the
+            new direction either way. Scalar traces never read it.
     """
 
     weight_is_albedo: bool = True
+    preserves_polarization: bool = False
 
     @abstractmethod
     def sample(

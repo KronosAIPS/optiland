@@ -23,8 +23,12 @@ class SpecularBRDF(BaseBSDF):
     """Perfect specular reflector (mirror).
 
     The scattered direction is the specular reflection of the incident ray.
-    Flux weight is always 1.0 (no energy loss at the surface itself).
+    Flux weight is always 1.0 (no energy loss at the surface itself). In a
+    Stokes trace it keeps the state the surface's reflection gave the ray
+    (``preserves_polarization``): its direction is that reflection's.
     """
+
+    preserves_polarization = True
 
     def sample(
         self,

@@ -165,21 +165,36 @@ def evaluate_transmissive_coating(
 def resolve_reflectance(
     reflectance: float | Callable[[be.ndarray], be.ndarray] | BaseCoating,
     wavelength: be.ndarray,
+    cos_theta_i: be.ndarray | None = None,
 ) -> be.ndarray:
     """Turn a mirror's ``reflectance`` spec into a per-ray array.
 
     Args:
         reflectance: A constant, a ``callable(wavelength_um) -> reflectance``,
-            or an unpolarized ``optiland.coatings.BaseCoating`` (read via its
-            ``.reflectance`` attribute, e.g. ``SimpleCoating``).
+            an unpolarized ``optiland.coatings.BaseCoating`` (read via its
+            ``.reflectance`` attribute, e.g. ``SimpleCoating``), or an
+            :class:`UnpolarizedThinFilmCoating` -- a dielectric or metal
+            mirror as a thin-film stack (a bare absorbing substrate is a
+            stack with no layers), evaluated at each ray's wavelength and
+            angle of incidence as ``(R_s + R_p) / 2``.
         wavelength: Per-ray wavelength [µm], shape (N,); used only to build
             the broadcast shape for a constant/coating reflectance.
+        cos_theta_i: Per-ray ``|cos theta_i|``; read only for a thin-film
+            stack, which needs it.
 
     Returns:
         Per-ray reflectance, shape (N,).
     """
     from optiland.coatings import BaseCoating  # noqa: PLC0415
 
+    evaluate = getattr(reflectance, "evaluate", None)
+    if callable(evaluate):
+        if cos_theta_i is None:
+            raise ValueError(
+                "a thin-film mirror is evaluated at each ray's angle of incidence; "
+                "pass cos_theta_i"
+            )
+        return evaluate(wavelength, cos_theta_i)[0]
     if isinstance(reflectance, BaseCoating):
         return be.ones_like(wavelength) * float(reflectance.reflectance)
     if callable(reflectance):

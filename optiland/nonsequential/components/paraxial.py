@@ -29,6 +29,7 @@ from optiland.nonsequential.components.geometry.analytic.plane import (
     FinitePlaneGeometry,
 )
 from optiland.nonsequential.materials.nsq_material import VACUUM
+from optiland.nonsequential.polarization import transport_state
 
 if TYPE_CHECKING:
     from optiland.coordinate_system import CoordinateSystem
@@ -147,6 +148,11 @@ class ParaxialLensComponent(BaseComponent):
         rays.L = be.where(crossing, out_g[:, 0], rays.L)
         rays.M = be.where(crossing, out_g[:, 1], rays.M)
         rays.N = be.where(crossing, out_g[:, 2], rays.N)
+        if rays.pol_q is not None:
+            # Stokes mode (the research repository's issue 5): an ideal lens
+            # does not act on the polarization; the state is kept and the
+            # reference axis carried to the new direction.
+            transport_state(rays, crossing)
         rays.bounce = be.where(hit_mask, rays.bounce + 1, rays.bounce)
 
         # R-07-6: leave the plane on the side the ray is heading for.

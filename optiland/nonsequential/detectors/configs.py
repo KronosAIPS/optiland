@@ -31,6 +31,10 @@ class IrradianceDetectorConfig:
             reflection count: this many exact bins (0 .. K-1) and one
             overflow bin, read with ``SimulationResult
             .reflection_histograms[name]``. 0 (default) keeps none.
+        stokes: Also tally the Stokes Q, U and V per pixel in the detector's
+            frame (the research repository's issue 5), read from the result's
+            ``stokes``; needs a trace with ``polarization="stokes"``. False
+            (default) keeps none.
     """
 
     width: float
@@ -42,6 +46,7 @@ class IrradianceDetectorConfig:
     absorb: bool = True
     side: Literal["both", "front", "back"] = "both"
     reflection_bins: int = 0
+    stokes: bool = False
 
 
 @dataclass

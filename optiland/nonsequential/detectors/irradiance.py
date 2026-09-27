@@ -31,7 +31,7 @@ from optiland.nonsequential.detectors.base import (
     _new_bin_accumulator,
     bin_values,
 )
-from optiland.nonsequential.results.irradiance_map import IrradianceMap
+from optiland.nonsequential.results.irradiance_map import IrradianceMap, StokesMaps
 
 if TYPE_CHECKING:
     from optiland.coordinate_system import CoordinateSystem
@@ -66,6 +66,7 @@ class IrradianceDetector(BaseDetector):
         absorb: bool = True,
         side: str = "both",
         reflection_bins: int = 0,
+        stokes: bool = False,
     ) -> None:
         """Initialize IrradianceDetector.
 
@@ -91,6 +92,13 @@ class IrradianceDetector(BaseDetector):
                 reflection count, in this many exact bins and one overflow
                 bin (0, the default, keeps no histogram). See
                 :meth:`BaseDetector.record_reflections`.
+            stokes: Also tally the Stokes ``Q``, ``U`` and ``V`` of every
+                arriving ray, per pixel, in the detector's own frame (the
+                research repository's issue 5): see :meth:`_stokes_in_frame`.
+                Read with the result's ``stokes`` attribute
+                (:class:`~optiland.nonsequential.results.irradiance_map
+                .StokesMaps`). A scalar trace carries no state, and the
+                result then has none.
         """
         geometry = FinitePlaneGeometry(width=width, height=height)
         super().__init__(
@@ -117,6 +125,12 @@ class IrradianceDetector(BaseDetector):
         # so a bounce never reallocates the pixel buffer.
         self._data = _new_bin_accumulator(num_pixels_y * num_pixels_x)
         self._num_rays_hit: int = 0
+        # The Stokes Q, U, V tallies: accumulators of the same kind as the
+        # flux's (float64 rows where the device has it, R-08-1), allocated
+        # with it and added into in place, never rebound (the replay's
+        # static buffers).
+        self.stokes = bool(stokes)
+        self._new_stokes_buffers()
 
         # Pixel bin edges (NumPy, used for index arithmetic -- always detached)
         w_f = as_float(width)
@@ -159,6 +173,20 @@ class IrradianceDetector(BaseDetector):
         # Zero out non-hit ray contributions while keeping graph attached
         flux_masked = be.where(hit_mask, rays.flux, be.zeros_like(rays.flux))
 
+        # The Stokes channels: I q', I u', I v' of each ray in the detector's
+        # frame, splatted with the flux's own weights.
+        channels = ()
+        if self.stokes:
+            if rays.pol_q is None:
+                self._stokes_scalar = True
+            else:
+                q, u, v = self._stokes_in_frame(rays, R_arr)
+                channels = (
+                    (self._stokes_q, flux_masked * q),
+                    (self._stokes_u, flux_masked * u),
+                    (self._stokes_v, flux_masked * v),
+                )
+
         nx = self.num_pixels_x
         ny = self.num_pixels_y
         dx = self.width / nx
@@ -172,11 +200,15 @@ class IrradianceDetector(BaseDetector):
         # without asking whether any ray hit it.
         key = getattr(rays, "ray_id", None)
         if self.splat == "bilinear":
-            self._record_bilinear(hx_l, hy_l, flux_masked, nx, ny, dx, dy, key=key)
+            self._record_bilinear(
+                hx_l, hy_l, flux_masked, nx, ny, dx, dy, key=key, channels=channels
+            )
         elif self.splat == "gaussian":
-            self._record_gaussian(hx_l, hy_l, flux_masked, nx, ny, dx, dy, key=key)
+            self._record_gaussian(
+                hx_l, hy_l, flux_masked, nx, ny, dx, dy, key=key, channels=channels
+            )
         else:
-            self._record_hard(hx_l, hy_l, flux_masked, nx, ny, key=key)
+            self._record_hard(hx_l, hy_l, flux_masked, nx, ny, key=key, channels=channels)
 
         self._num_rays_hit = accumulate(self._num_rays_hit, masked_count(hit_mask))
 
@@ -188,6 +220,7 @@ class IrradianceDetector(BaseDetector):
         nx: int,
         ny: int,
         key=None,
+        channels=(),
     ) -> None:
         """Hard-bin accumulation: each ray's whole flux into one pixel.
 
@@ -211,6 +244,8 @@ class IrradianceDetector(BaseDetector):
         ix = clamp_int(be.searchsorted(x_edges, hx_l, side="right") - 1, 0, nx - 1)
         iy = clamp_int(be.searchsorted(y_edges, hy_l, side="right") - 1, 0, ny - 1)
         _accumulate_into(self._data, iy * nx + ix, flux_masked, key=key)
+        for buffer, values in channels:
+            _accumulate_into(buffer, iy * nx + ix, values, key=key)
 
     def _record_bilinear(
         self,
@@ -222,6 +257,7 @@ class IrradianceDetector(BaseDetector):
         dx: float,
         dy: float,
         key=None,
+        channels=(),
     ) -> None:
         """Bilinear splat — differentiable w.r.t. landing position and flux.
 
@@ -268,6 +304,8 @@ class IrradianceDetector(BaseDetector):
 
             contrib = flux_masked * wx * wy  # attached
             _accumulate_into(self._data, flat, contrib, key=key)
+            for buffer, values in channels:
+                _accumulate_into(buffer, flat, values * wx * wy, key=key)
 
     def _record_gaussian(
         self,
@@ -279,6 +317,7 @@ class IrradianceDetector(BaseDetector):
         dx: float,
         dy: float,
         key=None,
+        channels=(),
     ) -> None:
         """Gaussian splat — differentiable, energy-conserving.
 
@@ -303,7 +342,7 @@ class IrradianceDetector(BaseDetector):
         """
         sigma = self.splat_sigma
         if sigma <= 0.0:
-            self._record_hard(hx_l, hy_l, flux_masked, nx, ny, key=key)
+            self._record_hard(hx_l, hy_l, flux_masked, nx, ny, key=key, channels=channels)
             return
 
         radius = max(1, int(np.ceil(3.0 * sigma)))
@@ -339,6 +378,47 @@ class IrradianceDetector(BaseDetector):
                 weight = (gx[dix] * gy[diy]) / norm
                 contrib = flux_masked * weight
                 _accumulate_into(self._data, iy * nx + ix, contrib, key=key)
+                for buffer, values in channels:
+                    _accumulate_into(buffer, iy * nx + ix, values * weight, key=key)
+
+    def _new_stokes_buffers(self) -> None:
+        size = self.num_pixels_y * self.num_pixels_x
+        self._stokes_scalar = False
+        if self.stokes:
+            self._stokes_q = _new_bin_accumulator(size)
+            self._stokes_u = _new_bin_accumulator(size)
+            self._stokes_v = _new_bin_accumulator(size)
+
+    def _stokes_in_frame(self, rays: NSQRayBundle, R_arr):
+        """Each ray's reduced state in the detector's frame: ``(q', u', v')``.
+
+        The detector's reference axis for a ray is its local ``x`` axis
+        projected perpendicular to the ray's direction ``k``
+        (:func:`~optiland.nonsequential.polarization.perpendicular_axis`): the
+        axis itself for a ray arriving along the normal. The ray's state is
+        rotated from its own reference axis to that one about ``k``
+        (:func:`~optiland.nonsequential.polarization.rotation_2psi`), so
+        ``Q > 0`` is polarization along the detector's x axis and ``U > 0``
+        along the direction 45 degrees from it towards ``k x x``. ``V`` does
+        not depend on the frame.
+
+        Args:
+            rays: The bundle (reads its state, axis and direction).
+            R_arr: The detector's rotation (local -> global columns).
+
+        Returns:
+            ``(q', u', v')``, per ray.
+        """
+        from optiland.nonsequential import polarization as pol  # noqa: PLC0415
+
+        k = (rays.L, rays.M, rays.N)
+        one = be.ones_like(rays.L)
+        x_axis = (one * R_arr[0, 0], one * R_arr[1, 0], one * R_arr[2, 0])
+        a, _ = pol.perpendicular_axis(x_axis, k)
+        e = pol.transport_axis((rays.pol_ex, rays.pol_ey, rays.pol_ez), k)
+        c2, s2 = pol.rotation_2psi(e, a, k)
+        q, u = pol.rotate(rays.pol_q, rays.pol_u, c2, s2)
+        return q, u, rays.pol_v
 
     def get_result(self) -> IrradianceMap:
         """Return the accumulated irradiance map.
@@ -357,7 +437,17 @@ class IrradianceDetector(BaseDetector):
         x_centres = 0.5 * (self._x_edges[:-1] + self._x_edges[1:])
         y_centres = 0.5 * (self._y_edges[:-1] + self._y_edges[1:])
 
+        stokes = None
+        if self.stokes and not self._stokes_scalar:
+            stokes = StokesMaps(
+                i=data,
+                q=bin_values(self._stokes_q),
+                u=bin_values(self._stokes_u),
+                v=bin_values(self._stokes_v),
+                shape=(ny, nx),
+            )
         return IrradianceMap(
+            stokes=stokes,
             data=data,
             irradiance=to_numpy(data_2d),
             x_coords=x_centres,
@@ -377,5 +467,6 @@ class IrradianceDetector(BaseDetector):
         """
         self._data = _new_bin_accumulator(self.num_pixels_y * self.num_pixels_x)
         self._num_rays_hit = 0
+        self._new_stokes_buffers()
         self.reset_reflection_tally()
         self.invalidate_frame()

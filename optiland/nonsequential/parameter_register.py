@@ -125,6 +125,10 @@ CONTRACT: dict[str, tuple[str, str]] = {
     "radius": (INTERIOR_BOUNDARY, "the intersection and the normal (sag, curvature)"),
     "conic": (INTERIOR_BOUNDARY, "the intersection and the normal (sag)"),
     "focal_length": (INTERIOR_BOUNDARY, "the paraxial deflection"),
+    # the polarizing elements (issue 5): the Mueller element's weight and state
+    "axis_deg": (INTERIOR, "the polarizing element's frame rotation"),
+    "extinction": (INTERIOR, "the polarizer's blocked-axis transmittance"),
+    "retardance_waves": (INTERIOR, "the retarder's phase"),
     "pitch_x": (INTERIOR_BOUNDARY, "the lenslet cell frame"),
     "pitch_y": (INTERIOR_BOUNDARY, "the lenslet cell frame"),
     "z_offset": (INTERIOR_BOUNDARY, "the intersection"),

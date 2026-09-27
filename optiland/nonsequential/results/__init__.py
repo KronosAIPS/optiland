@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .far_field_pattern import FarFieldPattern
-from .irradiance_map import IrradianceMap
+from .irradiance_map import IrradianceMap, StokesMaps
 from .ray_database import RayDatabase
 from .reflection_histogram import ReflectionHistogram
 from .spectral_result import SpectralResult
@@ -11,6 +11,7 @@ from .spectral_result import SpectralResult
 __all__ = [
     "FarFieldPattern",
     "IrradianceMap",
+    "StokesMaps",
     "RayDatabase",
     "ReflectionHistogram",
     "SpectralResult",

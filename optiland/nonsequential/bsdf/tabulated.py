@@ -46,6 +46,11 @@ class TabulatedBSDF(BaseBSDF):
             behaviour before D-5. The tabulated data itself is treated as
             hemisphere-relative (``theta_s`` measured from whichever normal
             the draw lands on), not as a combined BRDF+BTDF table.
+
+    Polarization: in a Stokes trace (the research repository's issue 5) a ray
+    this lobe scatters leaves depolarized (``preserves_polarization`` is
+    False: the minimal version has no Mueller scatter model, chapter 06
+    R-06-8), with its reference axis carried to the scattered direction.
     """
 
     weight_is_albedo = False

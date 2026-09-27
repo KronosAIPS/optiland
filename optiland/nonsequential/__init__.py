@@ -260,10 +260,15 @@ from optiland.nonsequential.components import (
     ParaxialLens,
     ParaxialLensComponent,
     ParaxialLensConfig,
+    PolarizerConfig,
+    Polarizer,
+    PolarizingComponent,
     Prism,
     PrismConfig,
     ReflectiveComponent,
     RefractiveComponent,
+    Retarder,
+    RetarderConfig,
     SurfaceConfig,
     Volume,
 )
@@ -317,6 +322,7 @@ from optiland.nonsequential.materials import VACUUM, NSQMaterial
 from optiland.nonsequential.results import (
     FarFieldPattern,
     IrradianceMap,
+    StokesMaps,
     RayDatabase,
     ReflectionHistogram,
     SpectralResult,
@@ -386,6 +392,7 @@ __all__ = [
     # Components -- raw
     "AbsorbingComponent",
     "ParaxialLensComponent",
+    "PolarizingComponent",
     "RefractiveComponent",
     "ReflectiveComponent",
     # Components -- compound
@@ -401,8 +408,12 @@ __all__ = [
     "NonWatertightVolumeError",
     "ParaxialLens",
     "ParaxialLensConfig",
+    "Polarizer",
+    "PolarizerConfig",
     "Prism",
     "PrismConfig",
+    "Retarder",
+    "RetarderConfig",
     "SurfaceConfig",
     "Volume",
     # Geometry
@@ -446,6 +457,7 @@ __all__ = [
     # Results
     "FarFieldPattern",
     "IrradianceMap",
+    "StokesMaps",
     "RayDatabase",
     "ReflectionHistogram",
     "SpectralResult",

@@ -30,6 +30,9 @@ class IrradianceMap:
             propagates a gradient. Use :attr:`total_flux_float` for
             printing or any consumer that expects a plain Python float.
         num_rays_hit: Number of rays recorded on this detector.
+        stokes: The Stokes tallies (:class:`StokesMaps`) of a detector built
+            with ``stokes=True`` and traced with ``polarization="stokes"``;
+            ``None`` otherwise.
     """
 
     def __init__(
@@ -40,6 +43,7 @@ class IrradianceMap:
         total_flux,
         num_rays_hit: int,
         data=None,
+        stokes: StokesMaps | None = None,
     ) -> None:
         """Initialize IrradianceMap.
 
@@ -53,6 +57,7 @@ class IrradianceMap:
             data: Flat accumulated flux be-array (shape ny*nx), optional.
                 When provided, this is the attached differentiable buffer
                 from which irradiance was computed. Defaults to None.
+            stokes: Optional :class:`StokesMaps`.
         """
         self.data = data  # attached tensor or numpy array (flat, ny*nx)
         self.irradiance = irradiance
@@ -60,6 +65,7 @@ class IrradianceMap:
         self.y_coords = y_coords
         self.total_flux = total_flux
         self.num_rays_hit = int(num_rays_hit)
+        self.stokes = stokes
 
     @property
     def total_flux_float(self) -> float:
@@ -133,3 +139,69 @@ class IrradianceMap:
             The irradiance array, shape (ny, nx).
         """
         return np.asarray(self.irradiance)
+
+
+class StokesMaps:
+    """The Stokes tallies of a polarization-resolving detector (the research repository's issue 5).
+
+    Per pixel, the sums over the arriving rays of ``I``, ``Q = I q'``,
+    ``U = I u'`` and ``V = I v'``, with ``(q', u', v')`` each ray's reduced
+    state in the detector's frame: ``Q > 0`` is polarization along the
+    detector's local x axis, ``U > 0`` along the direction 45 degrees from it
+    towards ``k x x``, and ``V`` has the sign of chapter 06 (a quarter-wave
+    retarder with its fast axis at +45 degrees takes ``(1, 1, 0, 0)`` to
+    ``(1, 0, 0, -1)``). The sums are accumulated as the flux is, in float64
+    where the device has it. The degree and the angle of polarization are
+    derived on read, never accumulated: a ratio of sums, not a sum of ratios.
+
+    Attributes:
+        i, q, u, v: Flat per-pixel sums [W], shape ``ny * nx``; backend
+            arrays, attached to the trace's graph where the flux is.
+        shape: ``(ny, nx)``.
+    """
+
+    def __init__(self, i, q, u, v, shape: tuple[int, int]) -> None:
+        self.i, self.q, self.u, self.v = i, q, u, v
+        self.shape = tuple(shape)
+
+    def totals(self) -> tuple:
+        """``(I, Q, U, V)`` summed over the detector, as backend scalars (attached)."""
+        import optiland.backend as be  # noqa: PLC0415
+
+        return tuple(be.sum(x) for x in (self.i, self.q, self.u, self.v))
+
+    def totals_float(self) -> tuple[float, float, float, float]:
+        """``(I, Q, U, V)`` summed over the detector, as Python floats."""
+        from optiland.backend.utils import to_numpy  # noqa: PLC0415
+
+        return tuple(float(to_numpy(x)) for x in self.totals())
+
+    def reduced(self) -> tuple[float, float, float]:
+        """``(Q/I, U/I, V/I)`` of the whole detector (zero where nothing arrived)."""
+        i, q, u, v = self.totals_float()
+        if i == 0.0:
+            return 0.0, 0.0, 0.0
+        return q / i, u / i, v / i
+
+    def degree_of_polarization(self) -> float:
+        """``sqrt(Q^2 + U^2 + V^2) / I`` of the whole detector."""
+        q, u, v = self.reduced()
+        return float(np.sqrt(q * q + u * u + v * v))
+
+    def angle_of_polarization_deg(self) -> float:
+        """``atan2(U, Q) / 2`` of the whole detector, in degrees from the local x axis."""
+        q, u, _ = self.reduced()
+        return float(np.degrees(0.5 * np.arctan2(u, q)))
+
+    def maps(self) -> dict[str, np.ndarray]:
+        """The per-pixel ``I``, ``Q``, ``U``, ``V`` [W] and ``dop`` as NumPy arrays of ``shape``."""
+        from optiland.backend.utils import to_numpy  # noqa: PLC0415
+
+        out = {
+            name: np.asarray(to_numpy(x), dtype=np.float64).reshape(self.shape)
+            for name, x in (("I", self.i), ("Q", self.q), ("U", self.u), ("V", self.v))
+        }
+        pol = np.sqrt(out["Q"] ** 2 + out["U"] ** 2 + out["V"] ** 2)
+        safe = np.where(out["I"] > 0, out["I"], 1.0)
+        out["dop"] = np.where(out["I"] > 0, pol / safe, 0.0)
+        return out
