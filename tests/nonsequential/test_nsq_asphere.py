@@ -17,6 +17,8 @@ What each class pins, and the route it uses:
   the step count; float64 and float32) and
   T-07-6 (the tangent guard fires at cos 1e-4 and not at 0.5) of
   ``docs/theory/07_geometry.md`` in the research repository.
+- ``TestCompactedPasses``: the NumPy backend's refinement on the active lanes
+  only returns the fixed-width passes' bits.
 - ``TestMissReasons``: every miss reason is reachable and recorded, and a
   miss never reports a distance.
 - ``TestFirstCrossing``: on a strongly aspheric surface the nearest crossing
@@ -374,6 +376,27 @@ class TestTheoryChapter7:
             )
         assert int(st[0]) == A.DOMAIN
         assert np.all(np.isfinite([t[0], fp[0], gn[0], tol[0]]))
+
+
+class TestCompactedPasses:
+    """On the NumPy backend the refinement runs each pass on the active lanes
+    only; the fixed-width passes give the same bits (every output, every
+    surface of the fan, float64 and float32)."""
+
+    @pytest.mark.parametrize("precision", ["float64", "float32"])
+    @pytest.mark.parametrize("surface", ["prolate", "hyperboloid_concave", "flat_base", "oblate"])
+    @pytest.mark.parametrize("cls", [EvenAsphereGeometry, OddAsphereGeometry])
+    def test_same_bits_as_fixed_width(self, surface, cls, precision, monkeypatch):
+        _set("numpy", precision)
+        o, d = _fan(3000, 14.0)
+        coeffs = [1e-3, -2e-5, 1e-7] if cls is EvenAsphereGeometry else [2e-3, 1e-4, -1e-6]
+        g = cls(*SURFACES[surface], coefficients=coeffs)
+        compact = [g.ray_intersect(be.array(o), be.array(d)), g.last_status, g.last_steps]
+        monkeypatch.setattr(A, "_COMPACT_ON_HOST", False)
+        full = [g.ray_intersect(be.array(o), be.array(d)), g.last_status, g.last_steps]
+        for a, b in zip(list(compact[0]) + compact[1:], list(full[0]) + full[1:]):
+            a, b = np.asarray(a), np.asarray(b)
+            assert a.dtype == b.dtype and a.tobytes() == b.tobytes()
 
 
 class TestMissReasons:

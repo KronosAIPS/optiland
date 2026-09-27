@@ -36,14 +36,21 @@ The intersection
       Two crossings closer together than one sample interval are left to the
       conic seeds.
 
-   A candidate without a seed is a miss with reason ``no_seed``.
+   A candidate without a seed is a miss with reason ``no_seed``. The scan
+   evaluates only the residual and the domain at its samples (the slope and
+   the gradient norm only at the first sample, for its on-surface test) and
+   takes the first sign change by one reduction over the samples.
 2. **Newton on** ``f(t) = z(t) - sag(r(t))``, ``f'(t) = d_z - sigma (x d_x +
    y d_y)`` with ``sigma = (d sag / d r) / r``, run from each seed for a fixed
-   number of masked iterations (``max_iterations``, default 16). No lane is
-   read to the host and no loop exits early: a converged lane is frozen by
-   ``where`` and rides along, so the iteration count is a constant a CUDA
-   graph can record (the graph-replay contract of
-   ``backends/graph_replay.py``).
+   number of masked iterations (``max_iterations``, default 16). On the torch
+   backend no lane is read to the host and no loop exits early: a converged
+   lane is frozen by ``where`` and rides along, so the iteration count is a
+   constant a CUDA graph can record (the graph-replay contract of
+   ``backends/graph_replay.py``). On the NumPy backend, whose arrays are host
+   memory already, each pass runs on the lanes still active only (and the
+   loop ends when none is): a frozen lane's pass changes none of its values,
+   so the results are the fixed-width ones bit for bit, at the cost of the
+   active lanes.
 3. **The residual at a base-conic seed is the polynomial alone.** The seed
    solves the base conic exactly in exact arithmetic, so the first residual is
    taken as ``-P(r)``; the conic part's rounding residual is not re-evaluated
@@ -165,6 +172,11 @@ DEFAULT_GUARD_ETA = 1e-3
 #: Residual tolerance in ulps of the coordinate scale (times |grad G|).
 DEFAULT_RESIDUAL_K = 32
 
+#: On the NumPy backend, run each refinement pass on the active lanes only
+#: (module docstring, item 2). Off gives the fixed-width passes of the torch
+#: backend; the results are the same bit for bit (tested).
+_COMPACT_ON_HOST = True
+
 #: Intervals of the first-crossing scan along the ray (module docstring, item
 #: 1): two crossings closer together than the ray's segment in the scan region
 #: over this count can escape the scan and are then left to the conic seeds.
@@ -182,6 +194,27 @@ def _no_grad():
 
 def _requires_grad(value) -> bool:
     return is_tensor(value) and bool(value.requires_grad)
+
+
+def _first_true(mask):
+    """``(any, index)`` along axis 0 of a boolean ``(m, n)`` array: whether a
+    column has a true entry and the row of its first one (0 where none). One
+    reduction, no host read."""
+    if is_tensor(mask):
+        import torch  # noqa: PLC0415
+
+        # argmax returns the first of equal maxima (documented).
+        return mask.any(dim=0), torch.argmax(mask.to(torch.uint8), dim=0)
+    return mask.any(axis=0), np.argmax(mask, axis=0)
+
+
+def _take_rows(a, j):
+    """``a[j[k], k]`` for every column ``k`` of an ``(m, n)`` array."""
+    if is_tensor(a):
+        import torch  # noqa: PLC0415
+
+        return torch.gather(a, 0, j[None, :])[0]
+    return np.take_along_axis(a, j[None, :], axis=0)[0]
 
 
 class _AsphereGeometry(AnalyticGeometry):
@@ -306,17 +339,25 @@ class _AsphereGeometry(AnalyticGeometry):
 
     # -- the surface ---------------------------------------------------------
 
-    def _poly(self, r2):
-        """``P`` and ``sigma_P = (dP/dr) / r`` at ``r^2 = r2`` (Horner)."""
+    def _poly(self, r2, slope: bool = True):
+        """``P`` and ``sigma_P = (dP/dr) / r`` at ``r^2 = r2`` (Horner).
+
+        With ``slope=False`` only ``P`` is formed (the same operations, so the
+        same value) and ``sigma_P`` is ``None``.
+        """
         n = self.num_coefficients
         ones = be.ones_like(r2)
         if n == 0:
             zeros = be.zeros_like(r2)
-            return zeros, zeros
+            return zeros, (zeros if slope else None)
         a = self.coefficients
         if not self._odd:
             # P = r2 (a0 + r2 (a1 + ...)); dP/dr = 2 r sum (i+1) a_i r2^i.
             p = a[n - 1] * ones
+            if not slope:
+                for i in range(n - 2, -1, -1):
+                    p = a[i] + r2 * p
+                return r2 * p, None
             d = (n * a[n - 1]) * ones
             for i in range(n - 2, -1, -1):
                 p = a[i] + r2 * p
@@ -328,6 +369,10 @@ class _AsphereGeometry(AnalyticGeometry):
         pos = r2 > 0.0
         r = be.where(pos, be.where(pos, r2, ones) ** 0.5, be.zeros_like(r2))
         p = a[n - 1] * ones
+        if not slope:
+            for i in range(n - 2, -1, -1):
+                p = a[i] + r * p
+            return r * p, None
         d = (n * a[n - 1]) * ones
         for i in range(n - 2, -1, -1):
             p = a[i] + r * p
@@ -366,6 +411,19 @@ class _AsphereGeometry(AnalyticGeometry):
         gnorm = (sigma * sigma * r2 + 1.0) ** 0.5
         return f, fp, gnorm, poly, dom
 
+    def _residual(self, x, y, z, rmin):
+        """``(f, dom)`` at the points: the residual and the domain mask of
+        :meth:`_evaluate`, by its operations, without the slope and the
+        gradient norm (the scan's samples need no more)."""
+        r2 = x**2 + y**2
+        c = self._curvature()
+        under = 1.0 - (1.0 + self.conic) * c**2 * r2
+        dom = under > rmin
+        w = be.where(dom, under, be.ones_like(under)) ** 0.5
+        poly, _ = self._poly(r2, slope=False)
+        sag = c * r2 / (1.0 + w) + poly
+        return z - sag, dom
+
     def _normal_local(self, x, y):
         """Unnormalised normal ``(-s_x, -s_y, 1)``: the conic kind's, minus
         the polynomial slope (exactly the conic's when every coefficient is
@@ -402,99 +460,148 @@ class _AsphereGeometry(AnalyticGeometry):
             number of steps taken, and ``f'``, ``|grad G|`` and the residual
             tolerance at the final evaluation.
         """
-        ox, oy, oz = o[:, 0], o[:, 1], o[:, 2]
-        dx, dy, dz = d[:, 0], d[:, 1], d[:, 2]
         ones = be.ones_like(t0)
         zeros = be.zeros_like(t0)
-        rmin = _tol.radicand_min(t0)
-        eta = self.guard_eta
         none = ~(ones > 0.0)
-
+        lane = {
+            "ox": o[:, 0], "oy": o[:, 1], "oz": o[:, 2],
+            "dx": d[:, 0], "dy": d[:, 1], "dz": d[:, 2],
+            "conic_seed": conic_seed,
+        }
         t = be.where(seed_ok, t0, zeros)
-        active = seed_ok
-        status = be.where(
-            seed_ok, self._code(NOT_CONVERGED, t0), self._code(NO_SEED, t0)
-        )
-        steps = zeros
-        if bracket0 is None:
-            t_neg, t_pos, has_neg, has_pos = zeros, zeros, none, none
-        else:
-            t_neg, t_pos, has_neg, has_pos = t_neg0, t_pos0, bracket0, bracket0
-        t_prev = t
-        has_prev = none
-        fp_last = ones
-        gn_last = ones
-        tol_last = ones
-
+        st = {
+            "t": t,
+            "active": seed_ok,
+            "status": be.where(
+                seed_ok, self._code(NOT_CONVERGED, t0), self._code(NO_SEED, t0)
+            ),
+            "steps": zeros,
+            "t_neg": zeros if bracket0 is None else t_neg0,
+            "t_pos": zeros if bracket0 is None else t_pos0,
+            "has_neg": none if bracket0 is None else bracket0,
+            "has_pos": none if bracket0 is None else bracket0,
+            "t_prev": t,
+            "has_prev": none,
+            "fp_last": ones,
+            "gn_last": ones,
+            "tol_last": ones,
+        }
+        rmin = _tol.radicand_min(t0)
+        # NumPy: host arrays, so each pass runs on the active lanes alone (a
+        # frozen lane's pass is the identity on every value it carries).
+        compact = _COMPACT_ON_HOST and be.get_backend() == "numpy"
+        if compact:
+            # Own copies: several entries start as one array (and the bracket
+            # may be the caller's), and the passes below write into them.
+            st = {k: np.array(v, copy=True) for k, v in st.items()}
         for it in range(self.max_iterations + 1):
-            x = ox + t * dx
-            y = oy + t * dy
-            z = oz + t * dz
-            f, fp, gn, poly, dom = self._evaluate(x, y, z, dx, dy, dz, rmin)
-            if it == 0:
-                # A base-conic seed solves the base conic: its residual is -P
-                # alone (module docstring, item 3).
-                f = be.where(conic_seed, -poly, f)
-            scale = be.maximum(
-                be.maximum(be.abs(x), be.abs(y)), be.maximum(be.abs(z), ones)
-            )
-            tol = self.residual_k * _tol.ulp(scale) * gn
-            conv = be.abs(f) <= tol
-            conv = conv & (dom | conic_seed) if it == 0 else conv & dom
-            fp_last = be.where(active, fp, fp_last)
-            gn_last = be.where(active, gn, gn_last)
-            tol_last = be.where(active, tol, tol_last)
-            guard = be.abs(fp) >= eta * gn
-            safe_fp = be.where(guard, fp, ones)
-            t_newton = t - f / safe_fp
-            done = active & conv
-            # Polish: a lane that has just converged takes one more Newton
-            # step (quadratic convergence puts it at the rounding floor), then
-            # freezes. With a residual of exactly zero -- a base-conic seed
-            # and zero coefficients -- the step is zero and t is unchanged.
-            polish = done & guard & be.isfinite(t_newton)
-            t = be.where(polish, t_newton, t)
-            status = be.where(done, self._code(HIT, t0), status)
-            active = active & ~conv
-            if it == self.max_iterations:
-                break
+            if compact:
+                idx = np.flatnonzero(st["active"])
+                if idx.size == 0:
+                    break
+                if idx.size < st["active"].shape[0]:
+                    sub_lane = {k: v[idx] for k, v in lane.items()}
+                    sub_st = {k: v[idx] for k, v in st.items()}
+                    sub_st = self._refine_pass(it, sub_lane, sub_st, rmin)
+                    for k, v in sub_st.items():
+                        # A full-width pass rebinds each entry to where()'s
+                        # promoted dtype; the write-back promotes the same way.
+                        dt = np.result_type(st[k], v)
+                        if st[k].dtype != dt:
+                            st[k] = st[k].astype(dt)
+                        st[k][idx] = v
+                    continue
+            st = self._refine_pass(it, lane, st, rmin)
+        return st["t"], st["status"], st["steps"], st["fp_last"], st["gn_last"], st["tol_last"]
 
-            # Bracket ends from every evaluated iterate inside the domain.
-            neg = active & dom & (f < 0.0)
-            pos = active & dom & (f > 0.0)
-            t_neg = be.where(neg, t, t_neg)
-            t_pos = be.where(pos, t, t_pos)
-            has_neg = has_neg | neg
-            has_pos = has_pos | pos
-            bracket = has_neg & has_pos
-            lo = be.minimum(t_neg, t_pos)
-            hi = be.maximum(t_neg, t_pos)
+    def _refine_pass(self, it: int, lane: dict, st: dict, rmin) -> dict:
+        """One evaluation of :meth:`_refine` and, before the last, one step.
 
-            # Inside a bracket a Newton step is safe whatever the slope: it is
-            # taken when it lands strictly inside, and bisection replaces it
-            # otherwise. Without a bracket the tangent guard decides.
-            inside = (t_newton > lo) & (t_newton < hi)
-            newton_ok = (
-                dom
-                & be.isfinite(t_newton)
-                & ((bracket & inside) | (~bracket & guard))
-            )
-            t_mid = 0.5 * (t_neg + t_pos)
-            t_back = 0.5 * (t_prev + t)
+        ``lane`` holds the rays (``ox`` .. ``dz``) and the conic-seed mask,
+        ``st`` the state; the new state is returned (NumPy arrays of a full
+        pass may be the caller's own, updated by rebinding only).
+        """
+        ox, oy, oz = lane["ox"], lane["oy"], lane["oz"]
+        dx, dy, dz = lane["dx"], lane["dy"], lane["dz"]
+        t = st["t"]
+        active = st["active"]
+        status = st["status"]
+        ones = be.ones_like(t)
+        eta = self.guard_eta
 
-            # Lanes that can neither step nor fall back end here.
-            stuck = active & ~newton_ok & ~bracket & (dom | ~has_prev)
-            status = be.where(stuck & dom, self._code(GRAZING, t0), status)
-            status = be.where(stuck & ~dom, self._code(DOMAIN, t0), status)
-            active = active & ~stuck
+        x = ox + t * dx
+        y = oy + t * dy
+        z = oz + t * dz
+        f, fp, gn, poly, dom = self._evaluate(x, y, z, dx, dy, dz, rmin)
+        if it == 0:
+            # A base-conic seed solves the base conic: its residual is -P
+            # alone (module docstring, item 3).
+            f = be.where(lane["conic_seed"], -poly, f)
+        scale = be.maximum(
+            be.maximum(be.abs(x), be.abs(y)), be.maximum(be.abs(z), ones)
+        )
+        tol = self.residual_k * _tol.ulp(scale) * gn
+        conv = be.abs(f) <= tol
+        conv = conv & (dom | lane["conic_seed"]) if it == 0 else conv & dom
+        out = dict(st)
+        out["fp_last"] = be.where(active, fp, st["fp_last"])
+        out["gn_last"] = be.where(active, gn, st["gn_last"])
+        out["tol_last"] = be.where(active, tol, st["tol_last"])
+        guard = be.abs(fp) >= eta * gn
+        safe_fp = be.where(guard, fp, ones)
+        t_newton = t - f / safe_fp
+        done = active & conv
+        # Polish: a lane that has just converged takes one more Newton
+        # step (quadratic convergence puts it at the rounding floor), then
+        # freezes. With a residual of exactly zero -- a base-conic seed
+        # and zero coefficients -- the step is zero and t is unchanged.
+        polish = done & guard & be.isfinite(t_newton)
+        t = be.where(polish, t_newton, t)
+        status = be.where(done, self._code(HIT, t), status)
+        active = active & ~conv
+        if it == self.max_iterations:
+            out.update(t=t, status=status, active=active)
+            return out
 
-            t_new = be.where(newton_ok, t_newton, be.where(bracket, t_mid, t_back))
-            t_prev = be.where(active & dom, t, t_prev)
-            has_prev = has_prev | (active & dom)
-            t = be.where(active, t_new, t)
-            steps = steps + be.where(active, ones, zeros)
+        # Bracket ends from every evaluated iterate inside the domain.
+        neg = active & dom & (f < 0.0)
+        pos = active & dom & (f > 0.0)
+        t_neg = be.where(neg, t, st["t_neg"])
+        t_pos = be.where(pos, t, st["t_pos"])
+        has_neg = st["has_neg"] | neg
+        has_pos = st["has_pos"] | pos
+        bracket = has_neg & has_pos
+        lo = be.minimum(t_neg, t_pos)
+        hi = be.maximum(t_neg, t_pos)
 
-        return t, status, steps, fp_last, gn_last, tol_last
+        # Inside a bracket a Newton step is safe whatever the slope: it is
+        # taken when it lands strictly inside, and bisection replaces it
+        # otherwise. Without a bracket the tangent guard decides.
+        inside = (t_newton > lo) & (t_newton < hi)
+        newton_ok = (
+            dom
+            & be.isfinite(t_newton)
+            & ((bracket & inside) | (~bracket & guard))
+        )
+        t_mid = 0.5 * (t_neg + t_pos)
+        t_back = 0.5 * (st["t_prev"] + t)
+
+        # Lanes that can neither step nor fall back end here.
+        stuck = active & ~newton_ok & ~bracket & (dom | ~st["has_prev"])
+        status = be.where(stuck & dom, self._code(GRAZING, t), status)
+        status = be.where(stuck & ~dom, self._code(DOMAIN, t), status)
+        active = active & ~stuck
+
+        t_new = be.where(newton_ok, t_newton, be.where(bracket, t_mid, t_back))
+        out["t_prev"] = be.where(active & dom, t, st["t_prev"])
+        out["has_prev"] = st["has_prev"] | (active & dom)
+        out["t"] = be.where(active, t_new, t)
+        out["steps"] = st["steps"] + be.where(active, ones, be.zeros_like(t))
+        out.update(
+            status=status, active=active, t_neg=t_neg, t_pos=t_pos,
+            has_neg=has_neg, has_pos=has_pos,
+        )
+        return out
 
     def _scan_region(self) -> tuple[float, float, float]:
         """Detached ``(a, z_lo, z_hi)`` of the scan region, cached on the
@@ -563,41 +670,35 @@ class _AsphereGeometry(AnalyticGeometry):
         span = be.where(seg_ok, t_end - t_start, zeros)
 
         m = self.scan_samples
-        n = ox.shape[0]
-        ts = be.concatenate([t_start + span * (j / m) for j in range(m + 1)], axis=0)
-        o_rep = be.concatenate([o] * (m + 1), axis=0)
-        d_rep = be.concatenate([d] * (m + 1), axis=0)
-        x = o_rep[:, 0] + ts * d_rep[:, 0]
-        y = o_rep[:, 1] + ts * d_rep[:, 1]
-        z = o_rep[:, 2] + ts * d_rep[:, 2]
+        # The samples as rows, (m + 1, n): row j is t_start + span j / m, the
+        # same operations per sample as a concatenation of the rows.
+        ts = be.stack([t_start + span * (j / m) for j in range(m + 1)], axis=0)
+        x = ox[None, :] + ts * dx[None, :]
+        y = oy[None, :] + ts * dy[None, :]
+        z = oz[None, :] + ts * dz[None, :]
         rmin = _tol.radicand_min(ts)
-        f, _, gn, _, dom = self._evaluate(
-            x, y, z, d_rep[:, 0], d_rep[:, 1], d_rep[:, 2], rmin
+        f, dom = self._residual(x, y, z, rmin)
+        # The on-surface test is needed at the first sample only.
+        _, _, gn0, _, _ = self._evaluate(x[0], y[0], z[0], dx, dy, dz, rmin)
+        scale0 = be.maximum(
+            be.maximum(be.abs(x[0]), be.abs(y[0])), be.maximum(be.abs(z[0]), ones)
         )
-        scale = be.maximum(
-            be.maximum(be.abs(x), be.abs(y)), be.maximum(be.abs(z), be.ones_like(x))
-        )
-        on_surface = be.abs(f) <= self.residual_k * _tol.ulp(scale) * gn
+        on_surface0 = be.abs(f[0]) <= self.residual_k * _tol.ulp(scale0) * gn0
         positive = f > 0.0
 
-        found = ~(ones > 0.0)
-        t_neg = zeros
-        t_pos = zeros
-        f_neg = zeros
-        f_pos = zeros
-        # Descending, so the earliest sign change is the one that remains.
-        for j in range(m - 1, -1, -1):
-            s0 = slice(j * n, (j + 1) * n)
-            s1 = slice((j + 1) * n, (j + 2) * n)
-            change = seg_ok & dom[s0] & dom[s1] & (positive[s0] != positive[s1])
-            if j == 0:
-                change = change & ~on_surface[s0]
-            neg_is_0 = ~positive[s0]
-            t_neg = be.where(change, be.where(neg_is_0, ts[s0], ts[s1]), t_neg)
-            t_pos = be.where(change, be.where(neg_is_0, ts[s1], ts[s0]), t_pos)
-            f_neg = be.where(change, be.where(neg_is_0, f[s0], f[s1]), f_neg)
-            f_pos = be.where(change, be.where(neg_is_0, f[s1], f[s0]), f_pos)
-            found = found | change
+        # Sign changes between consecutive samples, (m, n); the first one
+        # along the ray is kept.
+        change = seg_ok[None, :] & dom[:-1] & dom[1:] & (positive[:-1] != positive[1:])
+        first_row = change[0] & ~on_surface0
+        change = be.concatenate([first_row[None, :], change[1:]], axis=0)
+        found, j = _first_true(change)
+        t_a, t_b = _take_rows(ts, j), _take_rows(ts, j + 1)
+        f_a, f_b = _take_rows(f, j), _take_rows(f, j + 1)
+        neg_is_a = ~(f_a > 0.0)
+        t_neg = be.where(found, be.where(neg_is_a, t_a, t_b), zeros)
+        t_pos = be.where(found, be.where(neg_is_a, t_b, t_a), zeros)
+        f_neg = be.where(found, be.where(neg_is_a, f_a, f_b), zeros)
+        f_pos = be.where(found, be.where(neg_is_a, f_b, f_a), zeros)
         # Regula falsi inside the bracket (f_pos - f_neg > 0 where found).
         den = be.where(found, f_pos - f_neg, ones)
         t_seed = t_neg + (t_pos - t_neg) * (-f_neg) / den
