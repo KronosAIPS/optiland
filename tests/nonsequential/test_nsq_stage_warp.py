@@ -281,6 +281,12 @@ def test_the_stage_is_bit_identical_at_every_width(torch_backend_state, device, 
 
 
 def test_components_the_kernels_do_not_cover_keep_their_own_intersect(torch_backend_state):
+    """A geometry that overrides ``ray_intersect`` is not covered; a lens's faces and edge are.
+
+    (Until the kernels covered every analytic kind the lens edge, a frustum,
+    was the uncovered example here; test_nsq_stage_warp_kinds.py checks the
+    routing of an uncovered kind through a whole select.)
+    """
     stage = _stage()
     scene = NSQScene()
     scene.add_lens(
@@ -289,7 +295,14 @@ def test_components_the_kernels_do_not_cover_keep_their_own_intersect(torch_back
     )
     kinds = [stage.kind_of(c) for c in scene.surfaces]
     assert kinds.count("conic") == 2
-    assert None in kinds  # the lens edge, a frustum
+    assert kinds.count("frustum") == 1
+
+    class OwnCavity(SphericalCavityGeometry):
+        def ray_intersect(self, origins, directions, eps=None):
+            return super().ray_intersect(origins, directions, eps)
+
+    comp = ReflectiveComponent(CoordinateSystem(), OwnCavity(10.0), reflectance=0.9)
+    assert stage.kind_of(comp) is None
 
 
 # ---------------------------------------------------------------------------
@@ -478,18 +491,11 @@ def test_a_trace_is_bit_identical_with_the_kernels(
         )
 
     reference = trace(TorchBackend(seed=11))
-    calls = {"kernel": 0}
-    real = stage.intersect_component
-
-    def counted(*args, **kwargs):
-        calls["kernel"] += 1
-        return real(*args, **kwargs)
-
     backend = TorchBackend(seed=11, intersect_kernel="warp")
-    with monkeypatch.context() as spy:
-        spy.setattr(stage, "intersect_component", counted)
-        fused = trace(backend)
-    assert calls["kernel"] > 0
+    fused = trace(backend)
+    # Every covered component went through its kernel (counted when the
+    # launch is issued; reset at the start of the trace).
+    assert sum(stage.launch_counts().values()) > 0
     assert fused.environment["intersect_kernel"] == "warp"
     assert fused.environment["intersect_kernel_requested"] == "warp"
     assert "intersect_kernel_note" not in fused.environment

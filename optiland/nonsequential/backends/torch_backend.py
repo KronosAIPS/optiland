@@ -31,10 +31,11 @@ to running it on torch tensors on a device:
   the limb path is kept without a warning, and the result's
   ``environment`` says which kernel drew the trace and why.
 - **intersection kernels** (opt-in prototype): ``TorchBackend(intersect_kernel=
-  "warp")`` computes each ported-cavity and conic component's intersection in
-  one Warp kernel per component instead of its some 160 to 200 torch
-  operations (:mod:`optiland.nonsequential.stage_warp`), on CUDA with Warp
-  only, else the torch stage; recorded in the result's ``environment``.
+  "warp")`` computes the component-intersection stage with one Warp kernel
+  per component of every analytic kind, the nearest-hit select fused into
+  each, instead of some 150 to 600 torch operations per component
+  (:mod:`optiland.nonsequential.stage_warp`), on CUDA with Warp only, else
+  the torch stage; recorded in the result's ``environment``.
 - **compiled bounce step** (opt-in): ``TorchBackend(compile_step="mps")``
   runs each bounce through ``torch.compile`` of the bounce body, as a few
   generated kernels instead of some 2,500 launches; forward only, meant for
@@ -352,14 +353,18 @@ class TorchBackend(ArrayBackend):
         intersect_kernel: Which implementation of the component-intersection
             stage is asked for: ``"torch"`` (the default: every component's
             own ``intersect``) or ``"warp"`` (a prototype: one Warp kernel per
-            ported-cavity or conic component, :mod:`optiland.nonsequential
-            .stage_warp`; other kinds keep their own ``intersect``). Used only
-            when ``warp`` imports and the device is CUDA, like
-            ``rng_kernel``; otherwise the torch stage runs, silently. With
-            the default nothing in the trace changes and the environment
-            block carries no key for it; with ``"warp"`` it records
-            ``intersect_kernel`` (what ran), ``intersect_kernel_requested``
-            and, on a fallback, ``intersect_kernel_note``.
+            component of an analytic kind with the nearest-hit select fused
+            into it, :mod:`optiland.nonsequential.stage_warp`; other kinds,
+            and gradients the kernels do not carry, keep the component's own
+            ``intersect``). Used only when ``warp`` imports and the device is
+            CUDA, like ``rng_kernel``; otherwise the torch stage runs,
+            silently. With the default nothing in the trace changes and the
+            environment block carries no key for it; with ``"warp"`` it
+            records ``intersect_kernel`` (what ran),
+            ``intersect_kernel_requested``, on a fallback
+            ``intersect_kernel_note``, and ``intersect_kernel_routed`` (the
+            component intersections handed to torch, by reason) when any
+            were.
         compile_step: Run each bounce through ``torch.compile`` of the
             bounce body (:func:`compiled_bounce_body`) instead of eagerly:
             True on every device, a device type (``"mps"``) on that device
@@ -684,6 +689,7 @@ class TorchBackend(ArrayBackend):
         note = stage_warp.availability(be.get_device())
         if note is None:
             self.intersect_kernel_in_use = "warp"
+            stage_warp.reset_routed()
         else:
             self._intersect_kernel_note = note
 
@@ -730,6 +736,15 @@ class TorchBackend(ArrayBackend):
             env["intersect_kernel_requested"] = self.intersect_kernel
             if self._intersect_kernel_note is not None:
                 env["intersect_kernel_note"] = self._intersect_kernel_note
+            if self.intersect_kernel_in_use == "warp":
+                from optiland.nonsequential import stage_warp  # noqa: PLC0415
+
+                routed = stage_warp.routed_counts()
+                if routed:
+                    # Component intersections the kernels handed to the
+                    # component's own intersect, by reason (host-side
+                    # counts; a CUDA-graph replay repeats without counting).
+                    env["intersect_kernel_routed"] = routed
         if self.graph_replay:
             mode = "emulate" if self.graph_replay == "emulate" else "cuda"
             env["graph_replay"] = mode if self.graph_replay_batches else "none"
