@@ -81,9 +81,17 @@ class Mirror(CompoundComponent):
         cfg = self._config
         from optiland.nonsequential.components.lens import face_geometry  # noqa: PLC0415
 
-        geom = face_geometry(
-            cfg.radius, cfg.conic, cfg.aperture_radius, cfg.coefficients, cfg.odd
-        )
+        if cfg.nurbs is not None:
+            from optiland.nonsequential.components.geometry.nurbs.geometry import (  # noqa: PLC0415
+                NurbsGeometry,
+                arrays_from_json,
+            )
+
+            geom = NurbsGeometry(arrays_from_json(cfg.nurbs))
+        else:
+            geom = face_geometry(
+                cfg.radius, cfg.conic, cfg.aperture_radius, cfg.coefficients, cfg.odd
+            )
         interaction = _resolve_interaction(cfg.surface, InteractionType.REFLECTIVE)
         return [
             _make_surface(

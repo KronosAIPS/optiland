@@ -136,6 +136,9 @@ CONTRACT: dict[str, tuple[str, str]] = {
     "z_back": (INTERIOR_BOUNDARY, "the intersection"),
     "r_front": (INTERIOR_BOUNDARY, "the intersection and the normal"),
     "r_back": (INTERIOR_BOUNDARY, "the intersection and the normal"),
+    # a NURBS net (KronosNSRT issue 66): through the attached Newton step at the root
+    "control_points": (INTERIOR_BOUNDARY, "the intersection and the normal (the NURBS net)"),
+    "weights": (INTERIOR_BOUNDARY, "the intersection and the normal (the NURBS weights)"),
     # clear apertures and finite extents: an in-or-out test only
     "aperture_radius": (BOUNDARY_ONLY, "the clear-aperture test (a boolean)"),
     "inner_radius": (BOUNDARY_ONLY, "the annulus test (a boolean)"),

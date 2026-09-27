@@ -16,6 +16,7 @@ from .analytic import (
 )
 from .base import AABB, AnalyticGeometry, ComponentGeometry
 from .mesh import MeshGeometry
+from .nurbs import NurbsGeometry
 
 __all__ = [
     "AABB",
@@ -26,6 +27,7 @@ __all__ = [
     "FinitePlaneGeometry",
     "LensletArrayGeometry",
     "MeshGeometry",
+    "NurbsGeometry",
     "OddAsphereGeometry",
     "ParaboloidGeometry",
     "PlaneGeometry",
