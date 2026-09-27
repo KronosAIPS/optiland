@@ -668,8 +668,10 @@ def _mm_probe_rows(dtype, device, form: int, n: int, trials: int, rng) -> torch.
         # Unit normal entries: products of one size, so the orders' roundings
         # differ on 15 to 45 percent of the entries (a spread of magnitudes
         # hides the smaller terms' rounding and discriminates less).
-        a = torch.tensor(rng.standard_normal((n, 3)), dtype=dtype, device=device)
-        r = torch.tensor(rng.standard_normal((3, 3)), dtype=dtype, device=device)
+        # Drawn on the device into fresh (aligned) tensors, as the stage's
+        # own operands are: no host copy per trial.
+        a = torch.randn((n, 3), generator=rng, dtype=dtype, device=device)
+        r = torch.randn((3, 3), generator=rng, dtype=dtype, device=device)
         got = a @ (r.T if form else r)
         rk = (r.T if form else r).contiguous()
         cand = torch.empty((n, 3, 24), dtype=dtype, device=device)
@@ -713,8 +715,10 @@ def _mm_regime(widths, matches):
 def _mm_follows(regime, dtype, device, form, n0, rng) -> bool:
     """Whether widths ``n0`` to ``n0 + 15`` round every row as ``regime`` says."""
     main, block, tail = regime
-    for n in range(n0, n0 + 16):
-        m = _mm_probe_rows(dtype, device, form, n, 6, rng).cpu().numpy()
+    widths = list(range(n0, n0 + 16))
+    probes = [_mm_probe_rows(dtype, device, form, n, 6, rng) for n in widths]
+    parts = np.split(torch.cat(probes).cpu().numpy(), np.cumsum(widths)[:-1])
+    for n, m in zip(widths, parts, strict=True):
         base = n - n % block
         codes = [main] * base + [int(tail[n % block, j]) for j in range(n - base)]
         if not all(m[i, c] for i, c in enumerate(codes)):
@@ -761,19 +765,21 @@ def matmul_orders(dtype: torch.dtype, device: Any) -> MatmulOrders:
     if cached is not None:
         return cached
     _init()
-    rng = np.random.default_rng(20260927)
+    rng = torch.Generator(device=tdev)
+    rng.manual_seed(20260927)
     small = np.full((2, MM_SMALL, MM_SMALL - 1), -1, dtype=np.int32)
     meta = np.zeros((2, 5), dtype=np.int32)
     tail = np.full((4, 16, 16), -1, dtype=np.int32)
     refusal = None
     with torch.no_grad():
         for form in (0, 1):
-            rows = [_mm_probe_rows(dtype, tdev, form, n, 48, rng) for n in range(1, MM_SMALL)]
-            mid = [_mm_probe_rows(dtype, tdev, form, n, 48, rng) for n in _MM_MID]
+            rows = [_mm_probe_rows(dtype, tdev, form, n, 24, rng) for n in range(1, MM_SMALL)]
+            mid = [_mm_probe_rows(dtype, tdev, form, n, 24, rng) for n in _MM_MID]
             large = [_mm_probe_rows(dtype, tdev, form, n, 8 if n < 65536 else 2, rng) for n in _MM_LARGE]
-            rows = [r.cpu().numpy() for r in rows]
-            mid = [m.cpu().numpy() for m in mid]
-            large = [m.cpu().numpy() for m in large]
+            sizes = [m.shape[0] for m in rows + mid + large]
+            flat = torch.cat(rows + mid + large).cpu().numpy()
+            parts = np.split(flat, np.cumsum(sizes)[:-1])
+            rows, mid, large = parts[: len(rows)], parts[len(rows): len(rows) + len(mid)], parts[len(rows) + len(mid):]
             for n, m in zip(range(1, MM_SMALL), rows, strict=True):
                 small[form, n, :n] = [_mm_choose(row) for row in m]
             regime_mid = _mm_regime(_MM_MID, mid)
