@@ -12,15 +12,15 @@ from typing import TYPE_CHECKING
 
 from optiland.nonsequential.components.compound import CompoundComponent
 from optiland.nonsequential.components.configs import DoubletConfig, InteractionType
-from optiland.nonsequential.components.geometry.analytic.conic import ConicGeometry
 from optiland.nonsequential.components.geometry.analytic.frustum import (
     CylindricalFrustumGeometry,
 )
 from optiland.nonsequential.components.lens import (
+    _face_rim_sag,
     _make_surface,
     _offset_cs,
     _resolve_material,
-    _sag_at_rim,
+    face_geometry,
 )
 from optiland.nonsequential.components.volume import Volume
 from optiland.nonsequential.materials.nsq_material import VACUUM
@@ -38,6 +38,10 @@ class Doublet(CompoundComponent):
     1. **Front face** -- refractive, conic (crown element).
     2. **Cemented interface** -- refractive, conic (crown->flint).
     3. **Back face** -- refractive, conic (flint element).
+
+    Each of the three may be an even or odd asphere instead
+    (``DoubletConfig.coefficients1/2/3``, ``odd1/2/3``); the edges then meet
+    it at its full rim sag.
     4. **Crown edge** -- cylindrical frustum, absorbing.
     5. **Flint edge** -- cylindrical frustum, absorbing.
 
@@ -123,12 +127,17 @@ class Doublet(CompoundComponent):
         cs_back = _offset_cs(cs_cemented, cfg.thickness2)
 
         surfaces: list[BaseComponent] = []
+        front_geom = face_geometry(cfg.r1, cfg.conic1, r, cfg.coefficients1, cfg.odd1)
+        cemented_geom = face_geometry(
+            cfg.r2, cfg.conic2, r, cfg.coefficients2, cfg.odd2
+        )
+        back_geom = face_geometry(cfg.r3, cfg.conic3, r, cfg.coefficients3, cfg.odd3)
 
         # 1. Front face (vacuum -> crown)
         surfaces.append(
             _make_surface(
                 cs_front,
-                ConicGeometry(cfg.r1, cfg.conic1, r),
+                front_geom,
                 VACUUM,
                 mat1,
                 cfg.front,
@@ -141,7 +150,7 @@ class Doublet(CompoundComponent):
         surfaces.append(
             _make_surface(
                 cs_cemented,
-                ConicGeometry(cfg.r2, cfg.conic2, r),
+                cemented_geom,
                 mat1,
                 mat2,
                 cfg.cemented,
@@ -154,7 +163,7 @@ class Doublet(CompoundComponent):
         surfaces.append(
             _make_surface(
                 cs_back,
-                ConicGeometry(cfg.r3, cfg.conic3, r),
+                back_geom,
                 mat2,
                 VACUUM,
                 cfg.back,
@@ -166,9 +175,9 @@ class Doublet(CompoundComponent):
         # 4. Crown edge (cylindrical frustum, absorbing) -- front face to
         #    the cemented interface, so the crown element's own boundary
         #    closes without the flint element.
-        sag_front = _sag_at_rim(cfg.r1, cfg.conic1, r)
-        sag_cemented = _sag_at_rim(cfg.r2, cfg.conic2, r)
-        sag_back = _sag_at_rim(cfg.r3, cfg.conic3, r)
+        sag_front = _face_rim_sag(front_geom, cfg.r1, cfg.conic1, r)
+        sag_cemented = _face_rim_sag(cemented_geom, cfg.r2, cfg.conic2, r)
+        sag_back = _face_rim_sag(back_geom, cfg.r3, cfg.conic3, r)
         crown_edge_geom = CylindricalFrustumGeometry(
             r_front=r,
             r_back=r,

@@ -12,14 +12,18 @@ What each class pins, and the route it uses:
   the slope.
 - ``TestFloat32``: the float32 hit points against float64 within the dtype
   rule (the float32 tolerance and input rounding, over the slope).
-- ``TestTheoryChapter7``: T-07-5 (aimed rays, error and step count) and
+- ``TestTheoryChapter7``: T-07-5 (aimed rays, error against the exact root at
+  60 digits within max(8 u t*, c ulp(s) / cos) with the chapter's c = 5, and
+  the step count; float64 and float32) and
   T-07-6 (the tangent guard fires at cos 1e-4 and not at 0.5) of
   ``docs/theory/07_geometry.md`` in the research repository.
+- ``TestCompactedPasses``: the NumPy backend's refinement on the active lanes
+  only returns the fixed-width passes' bits.
 - ``TestMissReasons``: every miss reason is reachable and recorded, and a
   miss never reports a distance.
-- ``TestFirstCrossing``: on a strongly aspheric surface the nearest crossing
-  is returned where the base-conic seed alone converges to a farther one;
-  checked against a brute-force sign scan.
+- ``TestFirstCrossing``: on a strongly aspheric surface (an even and an odd
+  gull-wing) the nearest crossing is returned where the base-conic seed alone
+  converges to a farther one; checked against a brute-force sign scan.
 - ``TestAdjoint``: dt and the normal with respect to the curvature, the conic
   constant, every coefficient and the placement, against fourth-order central
   differences of the primal root.
@@ -28,6 +32,8 @@ What each class pins, and the route it uses:
   with an asphere equals the eager fixed-width trace bit for bit and transfers
   nothing to or from the host.
 - ``TestRegistration``: the kinds, their IR lowering and the volume helpers.
+- ``TestCompounds``, ``TestDoubletFaces``: lens, mirror and doublet faces as
+  aspheres, their volumes, a trace's ledger and the JSON form.
 """
 
 from __future__ import annotations
@@ -273,23 +279,78 @@ def _aimed_ray(g, r_point: float, cos_i: float, sign: float = -1.0, length=8.0):
     return (s - length * d)[None, :], d[None, :], s
 
 
-class TestTheoryChapter7:
-    """T-07-5 and T-07-6 on the chapter's own surface (float64)."""
+#: T-07-5's constant (docs/theory/07_geometry.md section 7.6, "The attainable
+#: accuracy of the root", amended 2026-09-27 on the maintainer's ruling 4): the
+#: residual's evaluation error on the chapter's surface sums to 3.754 ulp(s)
+#: (forming the point, r^2, the conic term, the polynomial, the sum), so
+#: max(8 u t*, c ulp(s) / cos) covers the root for c >= 4.29; the chapter
+#: states c = 5.
+T07_5_C = 5
 
-    @pytest.mark.parametrize("cos_i", [1.0, 0.5, 0.1])
-    def test_t07_5_aimed_rays(self, cos_i):
+
+def _exact_root(o, d, t0, coeffs=THEORY_COEFFS, radius=25.0, conic=-0.5):
+    """The root of the ray as given (its float origin and direction, exactly)
+    on the surface as specified (c = 1/R and the coefficients' decimal
+    values), by Newton at 60 significant digits."""
+    from decimal import Decimal, localcontext
+
+    with localcontext() as ctx:
+        ctx.prec = 60
+        c = Decimal(1) / Decimal(repr(radius))
+        kp = 1 + Decimal(repr(conic))
+        a = [Decimal(repr(float(v))) for v in coeffs]
+        o = [Decimal(float(v)) for v in o]
+        d = [Decimal(float(v)) for v in d]
+        t = Decimal(float(t0))
+        for _ in range(60):
+            x, y, z = (o[i] + t * d[i] for i in range(3))
+            r2 = x * x + y * y
+            w = (1 - kp * c * c * r2).sqrt()
+            p = a[-1]
+            dp = len(a) * a[-1]
+            for i in range(len(a) - 2, -1, -1):
+                p = a[i] + r2 * p
+                dp = (i + 1) * a[i] + r2 * dp
+            f = z - (c * r2 / (1 + w) + r2 * p)
+            fp = d[2] - (c / w + 2 * dp) * (x * d[0] + y * d[1])
+            step = f / fp
+            t -= step
+            if abs(step) < Decimal(10) ** -50:
+                break
+        return t
+
+
+class TestTheoryChapter7:
+    """T-07-5 and T-07-6 on the chapter's own surface."""
+
+    @pytest.mark.parametrize("precision", ["float64", "float32"])
+    @pytest.mark.parametrize("cos_i", [1.0, 0.5, 0.1, 0.01])
+    def test_t07_5_aimed_rays(self, cos_i, precision):
+        from decimal import Decimal
+
+        o, d, s = _aimed_ray(
+            EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS), 12.0, cos_i
+        )
+        if precision == "float64":
+            _set("numpy", "float64")
+            u, dt = U64, np.float64
+        else:
+            _set("torch", "float32")
+            u, dt = 2.0**-24, np.float32
+        # The ray as the engine holds it, rounded to the working dtype.
+        o_w, d_w = o.astype(dt), d.astype(dt)
         g = EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS)
-        o, d, s = _aimed_ray(g, 12.0, cos_i)
-        t, _, hit, _ = g.ray_intersect(o, d)
-        assert hit[0]
-        # T-07-5's bound, 8 u t*, and the conditioning floor of any root
-        # evaluated in the working dtype: a few ulps of the coordinate scale
-        # in the residual are ulp/cos along the ray. The chapter's bound
-        # alone omits the second term; its own table measured 4e-14 mm (45 u
-        # relative) at cos 0.5, above it.
-        floor = 4 * np.spacing(12.0) / cos_i
-        assert abs(t[0] - 8.0) <= max(8 * U64 * 8.0, floor)
-        assert g.last_steps[0] <= 8
+        t, _, hit, _ = g.ray_intersect(be.array(o_w), be.array(d_w))
+        assert bool(_np(hit)[0])
+        t_hat = float(_np(t)[0])
+        t_star = _exact_root(o_w[0], d_w[0], 8.0)
+        err = abs(float(Decimal(t_hat) - t_star))
+        # T-07-5 as amended: max(8 u t*, c ulp(s) / cos), s = max(|p*|_inf, t*).
+        scale = max(float(np.max(np.abs(s))), float(t_star))
+        ulp_s = float(np.spacing(dt(scale)))
+        assert err <= max(8 * u * float(t_star), T07_5_C * ulp_s / cos_i)
+        if cos_i >= 0.1:
+            assert int(_np(g.last_steps)[0]) <= 8
 
     def test_t07_6_guard_fires_at_1e_4(self):
         g = EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS)
@@ -317,6 +378,27 @@ class TestTheoryChapter7:
             )
         assert int(st[0]) == A.DOMAIN
         assert np.all(np.isfinite([t[0], fp[0], gn[0], tol[0]]))
+
+
+class TestCompactedPasses:
+    """On the NumPy backend the refinement runs each pass on the active lanes
+    only; the fixed-width passes give the same bits (every output, every
+    surface of the fan, float64 and float32)."""
+
+    @pytest.mark.parametrize("precision", ["float64", "float32"])
+    @pytest.mark.parametrize("surface", ["prolate", "hyperboloid_concave", "flat_base", "oblate"])
+    @pytest.mark.parametrize("cls", [EvenAsphereGeometry, OddAsphereGeometry])
+    def test_same_bits_as_fixed_width(self, surface, cls, precision, monkeypatch):
+        _set("numpy", precision)
+        o, d = _fan(3000, 14.0)
+        coeffs = [1e-3, -2e-5, 1e-7] if cls is EvenAsphereGeometry else [2e-3, 1e-4, -1e-6]
+        g = cls(*SURFACES[surface], coefficients=coeffs)
+        compact = [g.ray_intersect(be.array(o), be.array(d)), g.last_status, g.last_steps]
+        monkeypatch.setattr(A, "_COMPACT_ON_HOST", False)
+        full = [g.ray_intersect(be.array(o), be.array(d)), g.last_status, g.last_steps]
+        for a, b in zip(list(compact[0]) + compact[1:], list(full[0]) + full[1:]):
+            a, b = np.asarray(a), np.asarray(b)
+            assert a.dtype == b.dtype and a.tobytes() == b.tobytes()
 
 
 class TestMissReasons:
@@ -358,10 +440,20 @@ class TestMissReasons:
 
 
 class TestFirstCrossing:
-    """A strongly aspheric (non-monotone) surface: the nearest crossing."""
+    """A strongly aspheric (non-monotone) surface: the nearest crossing.
 
-    def test_against_brute_force(self):
-        g = EvenAsphereGeometry(25.0, 0.0, 12.0, [0.0, -3e-4, 2e-6])
+    The even gull-wing (conic base, r^4 and r^6) and an odd one (the R = 25 mm
+    sphere minus 1.5e-3 r^3: the sag rises to 0.59 mm near r = 8.9 mm and
+    falls toward the 12 mm rim; without the scan candidate 110 of its 716
+    hits on this fan are lost).
+    """
+
+    @pytest.mark.parametrize("cls,base,coeffs", [
+        (EvenAsphereGeometry, (25.0, 0.0, 12.0), [0.0, -3e-4, 2e-6]),
+        (OddAsphereGeometry, (25.0, 0.0, 12.0), [0.0, 0.0, -1.5e-3]),
+    ], ids=["even", "odd"])
+    def test_against_brute_force(self, cls, base, coeffs):
+        g = cls(*base, coeffs)
         o, d = _fan(1500, 12.0, z0=-5.0, seed=2)
         t, _, hit, _ = g.ray_intersect(o, d)
 
@@ -403,12 +495,19 @@ class TestAdjoint:
 
     PARAMS = ["radius", "conic", "a1", "a4", "a6", "a8", "shift_z", "shift_x"]
 
+    #: Base coefficients per kind: even (r^2, r^4, r^6, r^8) and odd (r^1 to
+    #: r^4, the r^1 term a cone point of slope 1e-3 at the vertex).
+    BASE = {"even": [2e-4, 1e-6, 1e-8, 1e-9], "odd": [1e-3, 2e-4, 1e-5, 1e-7]}
+    POWERS = {"even": [2, 4, 6, 8], "odd": [1, 2, 3, 4]}
+
     @staticmethod
-    def _outputs(name: str, value, o, d):
+    def _outputs(name: str, value, o, d, kind: str = "even"):
         """t and the normal's x and z at every ray, as functions of one
         parameter (a torch scalar), others at the theory's values."""
         radius, conic = 25.0, -0.5
-        coeffs = [torch.tensor(v, dtype=torch.float64) for v in [2e-4, 1e-6, 1e-8, 1e-9]]
+        coeffs = [
+            torch.tensor(v, dtype=torch.float64) for v in TestAdjoint.BASE[kind]
+        ]
         shift = [torch.tensor(0.0, dtype=torch.float64) for _ in range(2)]
         if name == "radius":
             radius = value
@@ -418,7 +517,8 @@ class TestAdjoint:
             coeffs[["a1", "a4", "a6", "a8"].index(name)] = value
         else:
             shift[["shift_z", "shift_x"].index(name)] = value
-        g = EvenAsphereGeometry(radius, conic, 12.5, coeffs)
+        cls = EvenAsphereGeometry if kind == "even" else OddAsphereGeometry
+        g = cls(radius, conic, 12.5, coeffs)
         O = torch.tensor(o, dtype=torch.float64)
         offset = torch.stack(
             [shift[1], torch.zeros((), dtype=torch.float64), shift[0]]
@@ -426,21 +526,22 @@ class TestAdjoint:
         t, _, hit, n = g.ray_intersect(O + offset, torch.tensor(d, dtype=torch.float64))
         return t, n, hit
 
+    @pytest.mark.parametrize("kind", ["even", "odd"])
     @pytest.mark.parametrize("name", PARAMS)
-    def test_matches_finite_differences(self, name):
+    def test_matches_finite_differences(self, name, kind):
         _set("torch", "float64")
+        coeff_names = ["a1", "a4", "a6", "a8"]
         base = {
-            "radius": 25.0, "conic": -0.5, "a1": 2e-4, "a4": 1e-6, "a6": 1e-8,
-            "a8": 1e-9, "shift_z": 0.0, "shift_x": 0.0,
+            "radius": 25.0, "conic": -0.5, "shift_z": 0.0, "shift_x": 0.0,
+            **dict(zip(coeff_names, self.BASE[kind])),
         }[name]
         # Steps that move the sag at the rim by about 1e-3 mm: the primal root
         # is accurate to ~1e-14 mm (tolerance and polish), so the rounding
         # term of the difference is ~1e-14 / 1e-3 relative to the derivative,
         # and the h^4 truncation term is below it.
         h = {
-            "radius": 25.0 * 1e-4, "conic": 1e-3, "a1": 1e-3 / 12.5**2,
-            "a4": 1e-3 / 12.5**4, "a6": 1e-3 / 12.5**6, "a8": 1e-3 / 12.5**8,
-            "shift_z": 1e-3, "shift_x": 1e-3,
+            "radius": 25.0 * 1e-4, "conic": 1e-3, "shift_z": 1e-3, "shift_x": 1e-3,
+            **{k: 1e-3 / 12.5**p for k, p in zip(coeff_names, self.POWERS[kind])},
         }[name]
         # Origins in a 16 mm square 8 mm below the vertex, directions within
         # about 17 degrees of the axis: most rays hit the 12.5 mm aperture.
@@ -454,7 +555,7 @@ class TestAdjoint:
         d /= np.linalg.norm(d, axis=1, keepdims=True)
 
         p = torch.tensor(base, dtype=torch.float64, requires_grad=True)
-        t, n, hit = self._outputs(name, p, o, d)
+        t, n, hit = self._outputs(name, p, o, d, kind)
         hit_np = _np(hit)
         assert hit_np.sum() >= 30
         rows = np.where(hit_np)[0]
@@ -467,7 +568,9 @@ class TestAdjoint:
 
         def value(x):
             with torch.no_grad():
-                tt, nn, hh = self._outputs(name, torch.tensor(x, dtype=torch.float64), o, d)
+                tt, nn, hh = self._outputs(
+                    name, torch.tensor(x, dtype=torch.float64), o, d, kind
+                )
                 assert np.array_equal(_np(hh), hit_np)
                 return np.stack([_np(tt)[rows], _np(nn[:, 0])[rows], _np(nn[:, 2])[rows]])
 
@@ -484,7 +587,7 @@ class TestTraced:
 
     FOCAL = 50.0
 
-    def _scene(self, detector):
+    def _scene(self, detector, kind: str = "even"):
         # A concave paraboloid opening toward +z, built as a flat base plus
         # r^2 / (4 f): exact, so every reflected ray passes through (0, 0, f).
         # The source sits below the focal plane and fires down, so the only
@@ -503,7 +606,10 @@ class TestTraced:
             "M",
             ReflectiveComponent(
                 CoordinateSystem(),
-                EvenAsphereGeometry(0.0, 0.0, 10.0, [1.0 / (4 * f)]),
+                EvenAsphereGeometry(0.0, 0.0, 10.0, [1.0 / (4 * f)])
+                if kind == "even"
+                # the odd kind's entry 1 multiplies r^2
+                else OddAsphereGeometry(0.0, 0.0, 10.0, [0.0, 1.0 / (4 * f)]),
                 reflectance=1.0,
                 name="M",
             ),
@@ -511,10 +617,13 @@ class TestTraced:
         scene.add_detector("D", CoordinateSystem(z=f), detector)
         return scene
 
+    @pytest.mark.parametrize("kind", ["even", "odd"])
     @pytest.mark.parametrize("backend", ["numpy", "torch"])
-    def test_paraboloid_focuses_to_a_point(self, backend):
+    def test_paraboloid_focuses_to_a_point(self, backend, kind):
         _set(backend, "float64")
-        scene = self._scene(RayDatabaseConfig(width=40.0, height=40.0, absorb=True))
+        scene = self._scene(
+            RayDatabaseConfig(width=40.0, height=40.0, absorb=True), kind
+        )
         res = scene.trace(num_rays=2000, seed=3, max_depth=4)
         db = res.detectors["D"]
         x = np.asarray(_np(db.x), float)
@@ -655,6 +764,80 @@ class TestCompounds:
             assert not any(k.startswith(("coefficients", "odd")) for k in comp["config"])
         scene = self._scene(*self._configs(c1=(), cm=()))
         assert type(scene.component_registry._registry["L"].surfaces[0].geometry) is ConicGeometry
+
+
+class TestDoubletFaces:
+    """Doublet faces as aspheres: builder, both volumes, JSON form, a trace."""
+
+    @staticmethod
+    def _scene(c1=(0.0, -3e-6), c2=(0.0, 2e-6), c3=(1e-4, 5e-6), odd3=True):
+        from optiland.nonsequential import DoubletConfig  # noqa: PLC0415
+
+        scene = NSQScene()
+        scene.add_source(
+            "S",
+            CoordinateSystem(z=-20.0),
+            CollimatedSourceConfig(
+                spectrum=Spectrum.monochromatic(0.55), total_flux=1.0, aperture_radius=6.0
+            ),
+        )
+        scene.add_doublet(
+            "D2",
+            CoordinateSystem(),
+            DoubletConfig(
+                r1=60.0, r2=-45.0, r3=-150.0, thickness1=6.0, thickness2=3.0,
+                material1="N-BK7", material2="N-SF5", aperture_radius=8.0,
+                coefficients1=c1, coefficients2=c2, coefficients3=c3, odd3=odd3,
+            ),
+        )
+        scene.add_detector(
+            "D",
+            CoordinateSystem(z=80.0),
+            IrradianceDetectorConfig(width=40, height=40, num_pixels_x=10, num_pixels_y=10),
+        )
+        return scene
+
+    def test_faces_are_aspheres_and_both_elements_close(self):
+        scene = self._scene()
+        comp = scene.component_registry._registry["D2"]
+        front, cemented, back, edge_crown, edge_flint = comp.surfaces
+        assert type(front.geometry) is EvenAsphereGeometry
+        assert type(cemented.geometry) is EvenAsphereGeometry
+        assert type(back.geometry) is OddAsphereGeometry
+        # The two barrels meet each face at its full rim sag, not the conic's.
+        assert edge_crown.geometry.z_front == pytest.approx(front.geometry.rim_sag(), abs=1e-12)
+        assert edge_crown.geometry.z_back == pytest.approx(
+            6.0 + cemented.geometry.rim_sag(), abs=1e-12
+        )
+        assert edge_flint.geometry.z_back == pytest.approx(
+            9.0 + back.geometry.rim_sag(), abs=1e-12
+        )
+        # Both volumes validated at construction; a trace closes its ledger.
+        res = scene.trace(num_rays=2000, seed=1, max_depth=12)
+        assert res.flux_conservation_error < 1e-12
+
+    def test_json_round_trip(self):
+        from optiland.nonsequential.serialization import (  # noqa: PLC0415
+            scene_from_dict,
+            scene_to_dict,
+        )
+
+        d = scene_to_dict(self._scene())
+        cfg = next(c for c in d["components"] if c["name"] == "D2")["config"]
+        assert cfg["coefficients1"] == [0.0, -3e-6] and cfg["odd1"] is False
+        assert cfg["coefficients3"] == [1e-4, 5e-6] and cfg["odd3"] is True
+        assert scene_to_dict(scene_from_dict(d)) == d
+
+    def test_conic_doublet_is_unchanged(self):
+        from optiland.nonsequential.serialization import scene_to_dict  # noqa: PLC0415
+
+        scene = self._scene(c1=(), c2=(), c3=(), odd3=False)
+        cfg = next(
+            c for c in scene_to_dict(scene)["components"] if c["name"] == "D2"
+        )["config"]
+        assert not any(k.startswith(("coefficients", "odd")) for k in cfg)
+        for surface in scene.component_registry._registry["D2"].surfaces[:3]:
+            assert type(surface.geometry) is ConicGeometry
 
 
 def as_float_edge(edge) -> float:

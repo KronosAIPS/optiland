@@ -1063,6 +1063,9 @@ def _register_components() -> None:
             "conic1": _to_float(c._config.conic1),
             "conic2": _to_float(c._config.conic2),
             "conic3": _to_float(c._config.conic3),
+            **_asphere_fields(c._config, "1"),
+            **_asphere_fields(c._config, "2"),
+            **_asphere_fields(c._config, "3"),
         },
         from_dict=lambda cfg: DoubletConfig(
             r1=cfg["r1"],
@@ -1076,6 +1079,12 @@ def _register_components() -> None:
             conic1=cfg.get("conic1", 0.0),
             conic2=cfg.get("conic2", 0.0),
             conic3=cfg.get("conic3", 0.0),
+            coefficients1=tuple(cfg.get("coefficients1", ())),
+            coefficients2=tuple(cfg.get("coefficients2", ())),
+            coefficients3=tuple(cfg.get("coefficients3", ())),
+            odd1=bool(cfg.get("odd1", False)),
+            odd2=bool(cfg.get("odd2", False)),
+            odd3=bool(cfg.get("odd3", False)),
         ),
         attached="*",
     )
