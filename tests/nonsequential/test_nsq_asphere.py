@@ -12,7 +12,9 @@ What each class pins, and the route it uses:
   the slope.
 - ``TestFloat32``: the float32 hit points against float64 within the dtype
   rule (the float32 tolerance and input rounding, over the slope).
-- ``TestTheoryChapter7``: T-07-5 (aimed rays, error and step count) and
+- ``TestTheoryChapter7``: T-07-5 (aimed rays, error against the exact root at
+  60 digits within max(8 u t*, c ulp(s) / cos) with the chapter's c = 5, and
+  the step count; float64 and float32) and
   T-07-6 (the tangent guard fires at cos 1e-4 and not at 0.5) of
   ``docs/theory/07_geometry.md`` in the research repository.
 - ``TestMissReasons``: every miss reason is reachable and recorded, and a
@@ -273,23 +275,78 @@ def _aimed_ray(g, r_point: float, cos_i: float, sign: float = -1.0, length=8.0):
     return (s - length * d)[None, :], d[None, :], s
 
 
-class TestTheoryChapter7:
-    """T-07-5 and T-07-6 on the chapter's own surface (float64)."""
+#: T-07-5's constant (docs/theory/07_geometry.md section 7.6, "The attainable
+#: accuracy of the root", amended 2026-09-27 on the maintainer's ruling 4): the
+#: residual's evaluation error on the chapter's surface sums to 3.754 ulp(s)
+#: (forming the point, r^2, the conic term, the polynomial, the sum), so
+#: max(8 u t*, c ulp(s) / cos) covers the root for c >= 4.29; the chapter
+#: states c = 5.
+T07_5_C = 5
 
-    @pytest.mark.parametrize("cos_i", [1.0, 0.5, 0.1])
-    def test_t07_5_aimed_rays(self, cos_i):
+
+def _exact_root(o, d, t0, coeffs=THEORY_COEFFS, radius=25.0, conic=-0.5):
+    """The root of the ray as given (its float origin and direction, exactly)
+    on the surface as specified (c = 1/R and the coefficients' decimal
+    values), by Newton at 60 significant digits."""
+    from decimal import Decimal, localcontext
+
+    with localcontext() as ctx:
+        ctx.prec = 60
+        c = Decimal(1) / Decimal(repr(radius))
+        kp = 1 + Decimal(repr(conic))
+        a = [Decimal(repr(float(v))) for v in coeffs]
+        o = [Decimal(float(v)) for v in o]
+        d = [Decimal(float(v)) for v in d]
+        t = Decimal(float(t0))
+        for _ in range(60):
+            x, y, z = (o[i] + t * d[i] for i in range(3))
+            r2 = x * x + y * y
+            w = (1 - kp * c * c * r2).sqrt()
+            p = a[-1]
+            dp = len(a) * a[-1]
+            for i in range(len(a) - 2, -1, -1):
+                p = a[i] + r2 * p
+                dp = (i + 1) * a[i] + r2 * dp
+            f = z - (c * r2 / (1 + w) + r2 * p)
+            fp = d[2] - (c / w + 2 * dp) * (x * d[0] + y * d[1])
+            step = f / fp
+            t -= step
+            if abs(step) < Decimal(10) ** -50:
+                break
+        return t
+
+
+class TestTheoryChapter7:
+    """T-07-5 and T-07-6 on the chapter's own surface."""
+
+    @pytest.mark.parametrize("precision", ["float64", "float32"])
+    @pytest.mark.parametrize("cos_i", [1.0, 0.5, 0.1, 0.01])
+    def test_t07_5_aimed_rays(self, cos_i, precision):
+        from decimal import Decimal
+
+        o, d, s = _aimed_ray(
+            EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS), 12.0, cos_i
+        )
+        if precision == "float64":
+            _set("numpy", "float64")
+            u, dt = U64, np.float64
+        else:
+            _set("torch", "float32")
+            u, dt = 2.0**-24, np.float32
+        # The ray as the engine holds it, rounded to the working dtype.
+        o_w, d_w = o.astype(dt), d.astype(dt)
         g = EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS)
-        o, d, s = _aimed_ray(g, 12.0, cos_i)
-        t, _, hit, _ = g.ray_intersect(o, d)
-        assert hit[0]
-        # T-07-5's bound, 8 u t*, and the conditioning floor of any root
-        # evaluated in the working dtype: a few ulps of the coordinate scale
-        # in the residual are ulp/cos along the ray. The chapter's bound
-        # alone omits the second term; its own table measured 4e-14 mm (45 u
-        # relative) at cos 0.5, above it.
-        floor = 4 * np.spacing(12.0) / cos_i
-        assert abs(t[0] - 8.0) <= max(8 * U64 * 8.0, floor)
-        assert g.last_steps[0] <= 8
+        t, _, hit, _ = g.ray_intersect(be.array(o_w), be.array(d_w))
+        assert bool(_np(hit)[0])
+        t_hat = float(_np(t)[0])
+        t_star = _exact_root(o_w[0], d_w[0], 8.0)
+        err = abs(float(Decimal(t_hat) - t_star))
+        # T-07-5 as amended: max(8 u t*, c ulp(s) / cos), s = max(|p*|_inf, t*).
+        scale = max(float(np.max(np.abs(s))), float(t_star))
+        ulp_s = float(np.spacing(dt(scale)))
+        assert err <= max(8 * u * float(t_star), T07_5_C * ulp_s / cos_i)
+        if cos_i >= 0.1:
+            assert int(_np(g.last_steps)[0]) <= 8
 
     def test_t07_6_guard_fires_at_1e_4(self):
         g = EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS)
