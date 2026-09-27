@@ -361,6 +361,11 @@ def _register_spectra() -> None:
 # ---------------------------------------------------------------------------
 
 _SOURCE_ATTACHED = ("total_flux", "total_flux_lumens")
+# Source geometry attached by the change of variables of chapter 09 section
+# 9.7 (R-09-4; parameter_register.attach_source_geometry), per kind.
+_POINT_ATTACHED = (*_SOURCE_ATTACHED, "half_angle_deg")
+_COLLIMATED_ATTACHED = (*_SOURCE_ATTACHED, "aperture_radius")
+_EXTENDED_ATTACHED = (*_SOURCE_ATTACHED, "width", "height", "aperture_radius", "half_angle_deg")
 
 
 def _register_sources() -> None:
@@ -391,7 +396,7 @@ def _register_sources() -> None:
             medium=medium,
         ),
         lower=lambda s: {"half_angle_deg": s.half_angle_deg},
-        attached=_SOURCE_ATTACHED,
+        attached=_POINT_ATTACHED,
         description="a point emitting into a cone or the full sphere",
     )
 
@@ -419,7 +424,7 @@ def _register_sources() -> None:
             "profile": s.profile,
             "gaussian_sigma": s.gaussian_sigma,
         },
-        attached=_SOURCE_ATTACHED,
+        attached=_COLLIMATED_ATTACHED,
         description="a parallel beam, top-hat or truncated Gaussian",
     )
 
@@ -452,7 +457,7 @@ def _register_sources() -> None:
             "aperture_radius": s.aperture_radius,
             "half_angle_deg": s.half_angle_deg,
         },
-        attached=_SOURCE_ATTACHED,
+        attached=_EXTENDED_ATTACHED,
         description="a rectangle or disc emitting into a cone or Lambertian",
     )
 

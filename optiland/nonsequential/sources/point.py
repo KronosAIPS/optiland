@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from optiland.backend.utils import to_numpy
-from optiland.nonsequential._utils import as_detached_param
+from optiland.nonsequential._utils import as_attachable_param, host_float
 from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.ray_bundle import NSQRayBundle
 from optiland.nonsequential.rng import EventSlot
@@ -56,9 +56,9 @@ class PointSource(BaseNSQSource):
             medium: Medium the source is embedded in (default: vacuum).
         """
         super().__init__(cs, spectrum, total_flux)
-        self.half_angle_deg = as_detached_param(
-            half_angle_deg, "half_angle_deg", "PointSource"
-        )
+        # May carry a derivative: the trace attaches the emission directions
+        # to it by the change of variables (chapter 09 section 9.7, R-09-4).
+        self.half_angle_deg = as_attachable_param(half_angle_deg)
         self.medium = medium
 
     def generate(self, ray_id: np.ndarray, rng: NSQRng) -> NSQRayBundle:
@@ -80,7 +80,7 @@ class PointSource(BaseNSQSource):
         translation, rot = _get_transform(self.cs)
 
         # Sample directions in local frame (cone around +z)
-        cos_max = np.cos(np.radians(self.half_angle_deg))
+        cos_max = np.cos(np.radians(host_float(self.half_angle_deg)))
         # Uniform sampling on spherical cap
         u1 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1))
         u2 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2))

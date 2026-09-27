@@ -13,7 +13,11 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.backend.utils import to_numpy
-from optiland.nonsequential._utils import as_detached_param
+from optiland.nonsequential._utils import (
+    as_attachable_param,
+    as_detached_param,
+    host_float,
+)
 from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.ray_bundle import NSQRayBundle
 from optiland.nonsequential.rng import EventSlot
@@ -71,14 +75,26 @@ class CollimatedSource(BaseNSQSource):
             medium: Medium the source is embedded in (default: vacuum).
         """
         super().__init__(cs, spectrum, total_flux)
-        self.aperture_radius = as_detached_param(
-            aperture_radius, "aperture_radius", "CollimatedSource"
-        )
+        # The aperture radius of a top-hat beam may carry a derivative: the
+        # trace attaches the emission points to it by the change of variables
+        # (chapter 09 section 9.7, R-09-4). A truncated Gaussian's radius is
+        # its truncation edge, which moves accepted samples across it (a
+        # boundary term the change of variables does not carry), so it stays
+        # detached there.
+        if profile == "gaussian":
+            self.aperture_radius = as_detached_param(
+                aperture_radius,
+                "aperture_radius",
+                "CollimatedSource",
+                reason="it truncates the Gaussian profile (a boundary term)",
+            )
+        else:
+            self.aperture_radius = as_attachable_param(aperture_radius)
         self.profile = profile
         self.gaussian_sigma = (
             as_detached_param(gaussian_sigma, "gaussian_sigma", "CollimatedSource")
             if gaussian_sigma is not None
-            else self.aperture_radius / 2.0
+            else host_float(self.aperture_radius) / 2.0
         )
         self.medium = medium
 
@@ -106,7 +122,7 @@ class CollimatedSource(BaseNSQSource):
             # Uniform disk sampling
             u1 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1))
             u2 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2))
-            r = self.aperture_radius * np.sqrt(u1)
+            r = host_float(self.aperture_radius) * np.sqrt(u1)
             phi = 2.0 * np.pi * u2
             lx = r * np.cos(phi)
             ly = r * np.sin(phi)
@@ -179,7 +195,7 @@ class CollimatedSource(BaseNSQSource):
             Tuple (x, y) of position arrays, each shape (N,).
         """
         num_rays = len(ray_id)
-        max_r2 = self.aperture_radius**2
+        max_r2 = host_float(self.aperture_radius) ** 2
         lx = np.zeros(num_rays)
         ly = np.zeros(num_rays)
         pending = np.ones(num_rays, dtype=bool)
@@ -214,7 +230,7 @@ class CollimatedSource(BaseNSQSource):
                 )
             )
             theta_fallback = 2.0 * np.pi * u_fallback
-            r_fallback = self.aperture_radius
+            r_fallback = host_float(self.aperture_radius)
             lx = np.where(pending, r_fallback * np.cos(theta_fallback), lx)
             ly = np.where(pending, r_fallback * np.sin(theta_fallback), ly)
 

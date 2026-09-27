@@ -48,6 +48,7 @@ from optiland.nonsequential.ir.interpreter import apply_primitive_interactions
 from optiland.nonsequential.ir.lower import lower
 from optiland.nonsequential.parameter_register import (
     ParameterRegister,
+    attach_source_geometry,
     attach_source_placement,
     check_after_trace,
     refuse_without_autograd,
@@ -1025,6 +1026,7 @@ class ArrayBackend(TracerBackend):
                 if register:
                     # A source placement that carries a gradient, attached on
                     # the device (values unchanged to the bit).
+                    rays = attach_source_geometry(rays, source)
                     rays = attach_source_placement(rays, source)
                 if self.polarization != "off":
                     _polarization.prepare_bundle(rays, source)

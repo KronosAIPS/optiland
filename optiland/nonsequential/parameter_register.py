@@ -160,16 +160,26 @@ _DETECTOR_CONTRACT: dict[str, tuple[str, str]] = {
 #: Parameters of a surface geometry whose finite extent is only an edge.
 _GEOMETRY_EXTENT = {"width", "height"}
 
-#: Source-geometry parameters: detached by contract until the change of
-#: variables of chapter 09 section 9.7 lands (R-09-4). Their constructors
-#: refuse a gradient-carrying value; the table is here so the register can
-#: name the reason if one ever arrives.
+#: Source-geometry parameters. The aperture radius of a top-hat beam or a
+#: disc, a rectangle's width and height and a cone's half-angle are attached
+#: by the change of variables of chapter 09 section 9.7 (R-09-4,
+#: :func:`attach_source_geometry`): the pathwise gradient through the emission
+#: points and directions is exact on the interior, and moving the emitted rays
+#: moves them across every downstream edge as a placement does (the boundary
+#: term, absent). A truncated Gaussian's sigma (and its radius, the truncation
+#: edge) stays detached: its constructor refuses a gradient-carrying value.
 _SOURCE_CONTRACT: dict[str, tuple[str, str]] = {
-    "aperture_radius": (DETACHED, "source sampling on the host (R-09-4 pending)"),
-    "gaussian_sigma": (DETACHED, "source sampling on the host (R-09-4 pending)"),
-    "half_angle_deg": (DETACHED, "source sampling on the host (R-09-4 pending)"),
-    "width": (DETACHED, "source sampling on the host (R-09-4 pending)"),
-    "height": (DETACHED, "source sampling on the host (R-09-4 pending)"),
+    "aperture_radius": (
+        INTERIOR_BOUNDARY,
+        "the source's change of variables (emission points, R-09-4)",
+    ),
+    "gaussian_sigma": (DETACHED, "the truncated Gaussian's rejection sampling on the host"),
+    "half_angle_deg": (
+        INTERIOR_BOUNDARY,
+        "the source's change of variables (emission directions, R-09-4)",
+    ),
+    "width": (INTERIOR_BOUNDARY, "the source's change of variables (emission points, R-09-4)"),
+    "height": (INTERIOR_BOUNDARY, "the source's change of variables (emission points, R-09-4)"),
 }
 
 #: Attribute names never walked for parameters: back references and scene
@@ -443,6 +453,137 @@ def attach_source_placement(rays: NSQRayBundle, source) -> NSQRayBundle:
     d_local = d @ R0
     p_new = p + p_local @ dR.T + dt
     d_new = d + d_local @ dR.T
+    rays.x, rays.y, rays.z = p_new[:, 0], p_new[:, 1], p_new[:, 2]
+    rays.L, rays.M, rays.N = d_new[:, 0], d_new[:, 1], d_new[:, 2]
+    return rays
+
+
+#: The source-geometry fields :func:`attach_source_geometry` attaches.
+SOURCE_GEOMETRY_FIELDS = ("aperture_radius", "width", "height", "half_angle_deg")
+
+
+def source_geometry_is_attached(source) -> bool:
+    """True when any source-geometry field of ``source`` carries a derivative."""
+    return any(_requires_grad(getattr(source, f, None)) for f in SOURCE_GEOMETRY_FIELDS)
+
+
+def attach_source_geometry(rays: NSQRayBundle, source) -> NSQRayBundle:
+    """Attach a source's emission points and directions to its geometry (R-09-4, T-09-8).
+
+    The change of variables of chapter 09 section 9.7: the source draws a
+    fixed reference sample (the uniforms of its keyed generator) and maps it
+    through its geometry, so an emitted point or direction is a smooth
+    function of the geometry with the draws held fixed. The maps the sources
+    use, with ``p_l`` and ``d_l`` the local point and direction the host
+    placed (recovered as ``R0^T (p - t0)`` and ``R0^T d``, like
+    :func:`attach_source_placement`):
+
+    - a disc of radius ``a`` (a top-hat collimated beam, an extended disc):
+      ``p_l = a sqrt(u1) (cos 2 pi u2, sin 2 pi u2)``, so
+      ``dp_l = p_l da / a``;
+    - a rectangle ``w x h`` (an extended source without a radius):
+      ``x_l = (u1 - 1/2) w``, ``y_l = (u2 - 1/2) h``, so
+      ``dx_l = x_l dw / w``, ``dy_l = y_l dh / h``;
+    - a cone of half-angle ``alpha`` (a point source; an extended source below
+      90 degrees; at 90 and above an extended source is Lambertian and the
+      half-angle does not enter): ``cos theta = 1 - u1 (1 - cos alpha)``, so
+      ``d cos theta = u1 d cos alpha`` with
+      ``u1 = (1 - cos theta) / (1 - cos alpha)``, and the direction's
+      transverse part scales with ``sin theta``:
+      ``d d_l,xy = -d_l,xy cos theta d cos alpha / ((1 - cos alpha)(1 + cos theta))``
+      (``sin^2 theta = u1 (1 - cos alpha)(1 + cos theta)`` removes the
+      apparent singularity at the axis).
+
+    The tangents are formed on the device from the attached parameter in the
+    working dtype (``d a`` is ``a_dev - sg(a_dev)``, zero in value) and added
+    to the host's values, so every emitted value is the host's to the bit.
+
+    **The Jacobian in the weight.** The weight of a sample drawn from the
+    reference measure is ``(dPhi / dA)(theta) |det J(theta)| A_ref / N``. Every
+    source of the engine is specified by its total flux ``Phi`` spread
+    uniformly over its area (or solid angle) ``A(theta)``, so
+    ``dPhi / dA = Phi / A(theta)``; the maps above are uniform, so
+    ``|det J(theta)| = A(theta) / A_ref`` for every sample, and the weight is
+    ``Phi / N`` identically in ``theta``. The factor and the exitance's
+    ``1 / A`` cancel exactly: the attached weight has no derivative in the
+    geometry, which is what the birth weight already is. A source specified
+    by its exitance or radiance (none today) would keep ``|det J|`` and gain
+    the derivative ``dA / A``; the test of T-09-8 holds the total detected
+    flux's derivative to zero, which fails if the factor enters
+    unnormalised.
+
+    Args:
+        rays: The batch as the backend prepared it (tensors on the device).
+        source: The source that emitted it.
+
+    Returns:
+        The same bundle, attached to the source's geometry where a field
+        carries a derivative; untouched otherwise.
+    """
+    if be.get_backend() != "torch" or not source_geometry_is_attached(source):
+        return rays
+    import torch  # noqa: PLC0415
+
+    from optiland.nonsequential._utils import host_float  # noqa: PLC0415
+    from optiland.nonsequential.components.base import _get_transform  # noqa: PLC0415
+
+    t_host, R_host = _get_transform(source.cs)
+    R0 = be.array(R_host)
+    t0 = be.array(t_host)
+    p = be.stack([rays.x, rays.y, rays.z], axis=1)
+    d = be.stack([rays.L, rays.M, rays.N], axis=1)
+    p_local = ((p - t0) @ R0).detach()
+    d_local = (d @ R0).detach()
+    dp = torch.zeros_like(p_local)
+    dd = torch.zeros_like(d_local)
+    touched = False
+
+    def rel_tangent(name):
+        value = getattr(source, name, None)
+        if not _requires_grad(value):
+            return None
+        return _tangent_only(_scalar_like(value, p_local)) / host_float(value)
+
+    radius = getattr(source, "aperture_radius", None)
+    if radius is not None:
+        da = rel_tangent("aperture_radius")
+        if da is not None:
+            dp = dp + p_local * torch.stack([da, da, torch.zeros_like(da)])
+            touched = True
+    elif hasattr(source, "width"):
+        dw, dh = rel_tangent("width"), rel_tangent("height")
+        zero = torch.zeros((), dtype=p_local.dtype, device=p_local.device)
+        if dw is not None or dh is not None:
+            scale = torch.stack(
+                [zero if dw is None else dw, zero if dh is None else dh, zero]
+            )
+            dp = dp + p_local * scale
+            touched = True
+
+    alpha = getattr(source, "half_angle_deg", None)
+    lambertian = hasattr(source, "width") and host_float(alpha) >= 90.0
+    if alpha is not None and _requires_grad(alpha) and not lambertian:
+        cos_a_host = float(np.cos(np.radians(host_float(alpha))))
+        cos_a = torch.cos(_scalar_like(alpha, p_local) * (np.pi / 180.0))
+        dcos_a = _tangent_only(cos_a)
+        c = d_local[:, 2]
+        one_minus = 1.0 - cos_a_host
+        one_plus = 1.0 + c
+        positive = one_plus > 0
+        safe = torch.where(positive, one_plus, torch.ones_like(one_plus))
+        transverse = torch.where(
+            positive, -c * dcos_a / (one_minus * safe), torch.zeros_like(c)
+        )
+        dd = dd + torch.stack(
+            [d_local[:, 0] * transverse, d_local[:, 1] * transverse, (1.0 - c) * dcos_a / one_minus],
+            dim=1,
+        )
+        touched = True
+
+    if not touched:
+        return rays
+    p_new = p + dp @ R0.T
+    d_new = d + dd @ R0.T
     rays.x, rays.y, rays.z = p_new[:, 0], p_new[:, 1], p_new[:, 2]
     rays.L, rays.M, rays.N = d_new[:, 0], d_new[:, 1], d_new[:, 2]
     return rays

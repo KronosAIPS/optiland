@@ -95,6 +95,49 @@ def as_detached_param(
     return float(value)
 
 
+def _carries_derivative(value: Any) -> bool:
+    """True for a tensor with ``requires_grad`` or a forward-mode tangent."""
+    if not is_tensor(value):
+        return False
+    if value.requires_grad:
+        return True
+    try:
+        from torch.autograd import forward_ad  # noqa: PLC0415
+
+        return forward_ad.unpack_dual(value).tangent is not None
+    except Exception:  # noqa: BLE001 - outside a dual level
+        return False
+
+
+def as_attachable_param(value: ScalarOrArrayT) -> Any:
+    """A source-geometry parameter: the tensor itself when it carries a derivative, else a float.
+
+    Source geometry (an aperture radius, a rectangle's width and height, a
+    cone's half-angle) is sampled on the host from its float value; a tensor
+    that carries a derivative (``requires_grad``, or a forward-mode tangent)
+    is kept as given so that the trace can attach the emission points and
+    directions to it by the change of variables of chapter 09 section 9.7
+    (:func:`~optiland.nonsequential.parameter_register
+    .attach_source_geometry`). Read the host value with :func:`host_float`.
+
+    Args:
+        value: Scalar parameter.
+
+    Returns:
+        ``value`` when it carries a derivative, ``float(value)`` otherwise.
+    """
+    if _carries_derivative(value):
+        return value
+    return float(value)
+
+
+def host_float(value: Any) -> float:
+    """The float value of a parameter that :func:`as_attachable_param` may have kept as a tensor."""
+    if is_tensor(value):
+        return float(value.detach().reshape(()).item())
+    return float(value)
+
+
 def distribute_ray_budget(num_rays_total: int, source_fluxes: list[float]) -> list[int]:
     """Split a total ray budget across sources proportional to flux.
 
