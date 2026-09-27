@@ -222,7 +222,7 @@ def test_the_stage_is_the_components_own_intersect(torch_backend_state, device, 
     division by a host scalar as a product with the reciprocal, the sums over
     the last axis, and the placement product's per-row order (research
     repository issue 77; before that the rotated cavity's normals were up to
-    3,209 ulp apart on the A100).
+    3,209 ulp apart on CUDA).
     """
     stage = _stage()
     _use_device(device)
@@ -254,7 +254,7 @@ def test_the_stage_is_bit_identical_at_every_width(torch_backend_state, device, 
     """Every output bit equal to the component's own intersect at widths 1 to 69 and a few odd large ones.
 
     torch's placement product rounds its rows in an order that depends on the
-    width (a small-width cuBLAS kernel on the A100, a tail loop on the Apple
+    width (a small-width cuBLAS kernel on CUDA, a tail loop on the Apple
     silicon CPU; research repository issue 77); the kernels follow the order
     probed at load, row by row, and a width no order matches runs the torch
     stage. The test also requires that the kernels ran at every width.

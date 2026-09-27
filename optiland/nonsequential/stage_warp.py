@@ -47,7 +47,7 @@ CPU, row by row (:func:`matmul_orders`; mostly a chain of fused multiply-adds,
 written with an explicit ``fma``); a sum over the last axis of an (N, 3)
 array, ordered by the device's reduction (:func:`sum_order`); and a division
 by a Python number, which torch's CUDA kernel takes as a product with the
-rounded reciprocal (:func:`scalar_division`). Measured on the A100
+rounded reciprocal (:func:`scalar_division`). Measured on CUDA
 (2026-09-27, research repository issue 77): the first CUDA run's differences
 (one ulp in the cavity's normals, up to 3,209 ulp in a rotated one's) were the
 division alone, and cuBLAS rounds the product as the CPU does from 17 rows up
@@ -150,7 +150,7 @@ MM_ORDERS: tuple[tuple[tuple[int, int, int], int, int], ...] = tuple(
     for f2 in (0, 1)
 )
 #: The fused multiply-add chain ``fma(a2, r2, fma(a1, r1, a0 r0))``: torch's
-#: product on the Apple silicon CPU and cuBLAS's on the A100 for most widths.
+#: product on the Apple silicon CPU and cuBLAS's on CUDA for most widths.
 MM_FMA_CHAIN = wp.constant(3)
 #: The same chain from a +0 accumulator, ``fma(a2, r2, fma(a1, r1, fma(a0,
 #: r0, +0)))``, which differs from it only in the sign of a zero result (a
@@ -1666,8 +1666,8 @@ def matmul_orders(dtype: torch.dtype, device: Any) -> MatmulOrders:
     the normals back with ``n @ R.T``: (N, 3) @ (3, 3) products that torch
     hands to its matrix library, which picks a kernel by the shapes, and the
     kernel fixes the order in which each entry's three products are rounded
-    and summed. Measured (2026-09-27, research repository issue 77): on the
-    A100 cuBLAS gives the fused chain :data:`MM_FMA_CHAIN` from 17 rows up and
+    and summed. Measured (2026-09-27, research repository issue 77): on CUDA
+    cuBLAS gives the fused chain :data:`MM_FMA_CHAIN` from 17 rows up and
     another order at 1 to 16 rows; on the Apple silicon CPU the chain holds
     for every row except the last ``n mod 2`` or ``n mod 4`` rows, which a
     tail loop rounds otherwise, up to a width that depends on the dtype and
@@ -1783,6 +1783,9 @@ def prepare(device: Any) -> None:
         sum_order(dtype, tdev)
         scalar_division(dtype, tdev)
         matmul_orders(dtype, tdev)
+        # The one-element arguments a launch does not use, allocated here
+        # rather than first inside a recorded bounce.
+        _placeholders(torch.empty(0, dtype=dtype, device=tdev))
     _prepared.add(name)
 
 
