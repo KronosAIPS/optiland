@@ -184,6 +184,7 @@ def build_irradiance_detector(cs: Any, config: Any) -> Any:
         absorb=config.absorb,
         side=config.side,
         reflection_bins=config.reflection_bins,
+        stokes=getattr(config, "stokes", False),
     )
 
 
@@ -554,6 +555,8 @@ def _register_detectors() -> None:
             "absorb": bool(det.absorb),
             "side": det.side,
             "reflection_bins": int(det.reflection_bins),
+            # written only when set, so every other detector's JSON is as it was
+            **({"stokes": True} if getattr(det, "stokes", False) else {}),
         },
         from_dict=lambda d: IrradianceDetectorConfig(
             width=d["width"],
@@ -565,6 +568,7 @@ def _register_detectors() -> None:
             absorb=d.get("absorb", True),
             side=d.get("side", "both"),
             reflection_bins=d.get("reflection_bins", 0),
+            stokes=bool(d.get("stokes", False)),
         ),
         lower=lambda det: {
             "width": det.width,
@@ -574,6 +578,7 @@ def _register_detectors() -> None:
             "splat": det.splat,
             "splat_sigma": det.splat_sigma,
             "side": det.side,
+            **({"stokes": True} if getattr(det, "stokes", False) else {}),
         },
         attached=("width", "height"),
         description="a plane of pixels booking flux (W) and irradiance (W/mm^2)",

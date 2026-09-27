@@ -317,6 +317,7 @@ from optiland.nonsequential.materials import VACUUM, NSQMaterial
 from optiland.nonsequential.results import (
     FarFieldPattern,
     IrradianceMap,
+    StokesMaps,
     RayDatabase,
     ReflectionHistogram,
     SpectralResult,
@@ -446,6 +447,7 @@ __all__ = [
     # Results
     "FarFieldPattern",
     "IrradianceMap",
+    "StokesMaps",
     "RayDatabase",
     "ReflectionHistogram",
     "SpectralResult",
