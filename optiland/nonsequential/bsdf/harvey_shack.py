@@ -91,17 +91,26 @@ class HarveyShackBSDF(BaseBSDF):
             transmissive lobe, e.g. a diffuser sheet) instead of the
             specular reflection. Defaults to 0.0: a purely reflective
             blur, identical to this class's behaviour before D-5.
-        weight_is_albedo: Left at the base class's True. The lobe is
+        weight_is_albedo: False (ruling 5 of the research repository's
+            ``docs/build/R3_rulings_2026-09-27.md``). The lobe is
             normalised over the directions reachable from each incidence
             (see :meth:`sample`), so its weight has expectation one; at
-            normal incidence every weight is exactly one and nothing is
-            booked. Off normal incidence a single ray's weight is a sampling
-            weight, and with the flag True the surface books its zero-mean
-            ``1 - weight`` in the coating bin rather than in the sampling
-            residual; the identity (10.1) closes either way. Setting the
-            flag False, which describes this weight, changes an assertion of
-            the fork's suite and waits for the maintainer's ruling.
+            normal incidence every weight is exactly one, so ``1 - weight``
+            is zero and the flag decides nothing there. Off normal
+            incidence a single ray's weight is a sampling weight, not a
+            physical fraction of the incident flux, so the flag is False:
+            the surface books ``1 - reflectance()`` (zero, this lobe is
+            lossless) as coating loss and the rest of ``1 - weight`` as the
+            zero-mean sampling residual of chapter 10 section 10.2, instead
+            of letting that fluctuation land in the coating bin. The
+            identity (10.1) closes either way. This changes the one
+            assertion of the fork's suite that asserted the base class's
+            default for this lobe
+            (``tests/nonsequential/test_nsq_flux_ledger.py``), under
+            ruling 5.
     """
+
+    weight_is_albedo = False
 
     def __init__(
         self, b0: float, l0: float, s: float, transmissive_fraction: float = 0.0

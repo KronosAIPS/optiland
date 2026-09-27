@@ -301,15 +301,25 @@ class TestLobeWeightIsNotAlwaysAnAlbedo:
     """
 
     def test_the_default_says_the_weight_is_an_albedo(self):
-        from optiland.nonsequential import (
-            HarveyShackBSDF,
-            LambertianBSDF,
-            SpecularBRDF,
-        )
+        from optiland.nonsequential import LambertianBSDF, SpecularBRDF
 
         assert LambertianBSDF().weight_is_albedo
         assert SpecularBRDF().weight_is_albedo
-        assert HarveyShackBSDF(b0=1e-3, l0=0.05, s=2.0).weight_is_albedo
+
+    def test_the_harvey_shack_lobe_says_it_is_a_sampling_weight(self):
+        """Changed under ruling 5 of ``docs/build/R3_rulings_2026-09-27.md``
+        (KronosNSRT): off normal incidence the lobe's weight is a sampling
+        weight, not a physical fraction of the incident flux, so its
+        zero-mean fluctuation belongs in the sampling residual rather than
+        the coating bin. Before this ruling the assertion here read
+        ``assert HarveyShackBSDF(...).weight_is_albedo``, the base class's
+        default; the ledger closes either way (``test_the_identity_still_
+        closes`` below), so this is which bin the fluctuation lands in, not
+        whether the trace balances.
+        """
+        from optiland.nonsequential import HarveyShackBSDF
+
+        assert not HarveyShackBSDF(b0=1e-3, l0=0.05, s=2.0).weight_is_albedo
 
     def test_the_tabulated_lobe_says_it_is_a_sampling_weight(self, tmp_path):
         assert not _tabulated_bsdf(tmp_path).weight_is_albedo
