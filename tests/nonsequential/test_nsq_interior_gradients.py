@@ -792,3 +792,42 @@ class TestForwardModeAgainstAbsoluteSum:
             f"{scene} seed {seed}: gap {gap:.3e} is {gap / (_U * absolute):.1f} u of the "
             f"absolute sum {absolute:.6e} (the derivative {reverse:.6e})"
         )
+
+
+# -- T-09-10: attached placements give finite gradients at float32 ------------------
+
+
+_FLOAT32_PLACEMENTS = [c for c in _ALL_PLACEMENTS if c[0] != "lens"]
+
+
+class TestFloat32PlacementGradients:
+    """R-09-10, T-09-10: the gradients of attached placements are finite at float32.
+
+    Over three decades of ray count, at the working precision float32 (the
+    placement tensors float64, the device build of the transform in float32).
+    The lens scenes are not here: at float32 the singlet placed at z = 50 mm
+    is refused at construction by the volume's rim-coincidence check, whose
+    1e-6 mm tolerance is below float32's resolution there (about 3.8e-6 mm at
+    55 mm), with or without a gradient (the research repository's build log
+    B6_gradients_2 files it). Measured on the development machine (Apple
+    silicon, CPU, seed 3): every gradient finite; float32 against float64 at
+    a median 1.5e-7 to 3.2e-7 relative and at worst 5.4e-5 (mirror tilt about
+    x at 20,000 rays), reported, not graded.
+    """
+
+    @pytest.mark.parametrize("num_rays", [200, 2_000, 20_000])
+    @pytest.mark.parametrize(
+        ("owner", "build", "nominal", "key"),
+        _FLOAT32_PLACEMENTS,
+        ids=[f"{c[0]}-{c[3]}" for c in _FLOAT32_PLACEMENTS],
+    )
+    def test_finite(self, owner, build, nominal, key, num_rays):
+        be.set_precision("float32")
+        param = _g(nominal[key])
+        p = dict(nominal)
+        p[key] = param
+        scene, width = build(p)
+        data = scene.trace(num_rays=num_rays, seed=_SEED, max_depth=8).detectors["D1"].data
+        (grad,) = torch.autograd.grad(_centroid(data.double(), width), param)
+        assert torch.isfinite(grad), f"{owner}-{key} at {num_rays} rays: {grad.item()}"
+        assert grad.item() != 0.0
