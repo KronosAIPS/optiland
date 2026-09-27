@@ -32,6 +32,8 @@ What each class pins, and the route it uses:
   with an asphere equals the eager fixed-width trace bit for bit and transfers
   nothing to or from the host.
 - ``TestRegistration``: the kinds, their IR lowering and the volume helpers.
+- ``TestCompounds``, ``TestDoubletFaces``: lens, mirror and doublet faces as
+  aspheres, their volumes, a trace's ledger and the JSON form.
 """
 
 from __future__ import annotations
@@ -735,6 +737,80 @@ class TestCompounds:
             assert not any(k.startswith(("coefficients", "odd")) for k in comp["config"])
         scene = self._scene(*self._configs(c1=(), cm=()))
         assert type(scene.component_registry._registry["L"].surfaces[0].geometry) is ConicGeometry
+
+
+class TestDoubletFaces:
+    """Doublet faces as aspheres: builder, both volumes, JSON form, a trace."""
+
+    @staticmethod
+    def _scene(c1=(0.0, -3e-6), c2=(0.0, 2e-6), c3=(1e-4, 5e-6), odd3=True):
+        from optiland.nonsequential import DoubletConfig  # noqa: PLC0415
+
+        scene = NSQScene()
+        scene.add_source(
+            "S",
+            CoordinateSystem(z=-20.0),
+            CollimatedSourceConfig(
+                spectrum=Spectrum.monochromatic(0.55), total_flux=1.0, aperture_radius=6.0
+            ),
+        )
+        scene.add_doublet(
+            "D2",
+            CoordinateSystem(),
+            DoubletConfig(
+                r1=60.0, r2=-45.0, r3=-150.0, thickness1=6.0, thickness2=3.0,
+                material1="N-BK7", material2="N-SF5", aperture_radius=8.0,
+                coefficients1=c1, coefficients2=c2, coefficients3=c3, odd3=odd3,
+            ),
+        )
+        scene.add_detector(
+            "D",
+            CoordinateSystem(z=80.0),
+            IrradianceDetectorConfig(width=40, height=40, num_pixels_x=10, num_pixels_y=10),
+        )
+        return scene
+
+    def test_faces_are_aspheres_and_both_elements_close(self):
+        scene = self._scene()
+        comp = scene.component_registry._registry["D2"]
+        front, cemented, back, edge_crown, edge_flint = comp.surfaces
+        assert type(front.geometry) is EvenAsphereGeometry
+        assert type(cemented.geometry) is EvenAsphereGeometry
+        assert type(back.geometry) is OddAsphereGeometry
+        # The two barrels meet each face at its full rim sag, not the conic's.
+        assert edge_crown.geometry.z_front == pytest.approx(front.geometry.rim_sag(), abs=1e-12)
+        assert edge_crown.geometry.z_back == pytest.approx(
+            6.0 + cemented.geometry.rim_sag(), abs=1e-12
+        )
+        assert edge_flint.geometry.z_back == pytest.approx(
+            9.0 + back.geometry.rim_sag(), abs=1e-12
+        )
+        # Both volumes validated at construction; a trace closes its ledger.
+        res = scene.trace(num_rays=2000, seed=1, max_depth=12)
+        assert res.flux_conservation_error < 1e-12
+
+    def test_json_round_trip(self):
+        from optiland.nonsequential.serialization import (  # noqa: PLC0415
+            scene_from_dict,
+            scene_to_dict,
+        )
+
+        d = scene_to_dict(self._scene())
+        cfg = next(c for c in d["components"] if c["name"] == "D2")["config"]
+        assert cfg["coefficients1"] == [0.0, -3e-6] and cfg["odd1"] is False
+        assert cfg["coefficients3"] == [1e-4, 5e-6] and cfg["odd3"] is True
+        assert scene_to_dict(scene_from_dict(d)) == d
+
+    def test_conic_doublet_is_unchanged(self):
+        from optiland.nonsequential.serialization import scene_to_dict  # noqa: PLC0415
+
+        scene = self._scene(c1=(), c2=(), c3=(), odd3=False)
+        cfg = next(
+            c for c in scene_to_dict(scene)["components"] if c["name"] == "D2"
+        )["config"]
+        assert not any(k.startswith(("coefficients", "odd")) for k in cfg)
+        for surface in scene.component_registry._registry["D2"].surfaces[:3]:
+            assert type(surface.geometry) is ConicGeometry
 
 
 def as_float_edge(edge) -> float:

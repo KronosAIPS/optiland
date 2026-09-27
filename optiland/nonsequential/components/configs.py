@@ -158,6 +158,16 @@ class DoubletConfig:
         cemented: Per-surface overrides for the cemented interface.
         back: Per-surface overrides for the back face.
         edge: Per-surface overrides for the edge surface.
+        coefficients1: Polynomial coefficients of the front face; empty for
+            a conic face. Non-empty makes the face an asphere (the geometry
+            kinds ``even_asphere``/``odd_asphere``, KronosNSRT issue 30):
+            entry ``i`` multiplies ``r^(2 (i + 1))``, or ``r^(i + 1)`` when
+            ``odd1`` is set.
+        coefficients2: The same for the cemented interface.
+        coefficients3: The same for the back face.
+        odd1: The front face's polynomial is odd.
+        odd2: The cemented interface's polynomial is odd.
+        odd3: The back face's polynomial is odd.
     """
 
     r1: float
@@ -175,6 +185,12 @@ class DoubletConfig:
     cemented: SurfaceConfig | None = None
     back: SurfaceConfig | None = None
     edge: SurfaceConfig | None = None
+    coefficients1: tuple = ()
+    coefficients2: tuple = ()
+    coefficients3: tuple = ()
+    odd1: bool = False
+    odd2: bool = False
+    odd3: bool = False
 
 
 @dataclass
