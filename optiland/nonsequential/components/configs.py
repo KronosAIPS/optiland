@@ -1,7 +1,7 @@
 """Config dataclasses for NSQ compound components.
 
 SurfaceConfig, InteractionType, LensConfig, DoubletConfig, MirrorConfig,
-PrismConfig, ParaxialLensConfig.
+PrismConfig, ParaxialLensConfig, PolarizerConfig, RetarderConfig.
 
 Kramer Harrison, 2026
 """
@@ -283,3 +283,55 @@ class ParaxialLensConfig:
     focal_length: float
     aperture_radius: float
     stop_radius: float | None = None
+
+
+@dataclass
+class PolarizerConfig:
+    """Configuration for an ideal linear polarizer (the research repository's issue 5).
+
+    A disc of no thickness at the placement's local z = 0 that transmits the
+    field component along its axis and blocks the orthogonal one (down to
+    ``extinction``), with no reflection and no change of direction. It acts
+    on the Stokes state in a trace with ``polarization="stokes"``; a scalar
+    trace passes its unpolarized transmittance ``(1 + extinction) / 2``. See
+    :class:`~optiland.nonsequential.components.polarizing.PolarizingComponent`.
+
+    Attributes:
+        axis_deg: The transmission axis, degrees from the placement's local
+            x axis towards its local y axis.
+        aperture_radius: Clear semi-diameter [mm].
+        extinction: Power transmittance of the blocked axis, in [0, 1]; 0
+            (default) is the ideal polarizer.
+    """
+
+    axis_deg: float
+    aperture_radius: float
+    extinction: float = 0.0
+
+
+@dataclass
+class RetarderConfig:
+    """Configuration for an ideal linear retarder (the research repository's issue 5).
+
+    A lossless disc of no thickness at the placement's local z = 0 that
+    delays the field component orthogonal to its fast axis by
+    ``2 pi retardance_waves (design_wavelength_um / lambda)``. It acts on the
+    Stokes state in a trace with ``polarization="stokes"``; a scalar trace
+    passes every ray unchanged. See
+    :class:`~optiland.nonsequential.components.polarizing.PolarizingComponent`.
+
+    Attributes:
+        fast_axis_deg: The fast axis, degrees from the placement's local x
+            axis towards its local y axis.
+        retardance_waves: The retardance in waves (0.25 is a quarter-wave
+            plate) at ``design_wavelength_um``.
+        aperture_radius: Clear semi-diameter [mm].
+        design_wavelength_um: The wavelength the retardance is given at [um];
+            ``None`` (default) keeps the retardance the same at every
+            wavelength.
+    """
+
+    fast_axis_deg: float
+    retardance_waves: float
+    aperture_radius: float
+    design_wavelength_um: float | None = None

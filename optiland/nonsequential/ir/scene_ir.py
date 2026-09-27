@@ -37,7 +37,12 @@ PrimitiveKind = Literal[
 # "paraxial" is the ideal thin lens: a plane that deflects every ray by the
 # thin-lens law in its slopes, with no Fresnel branch; its focal length is
 # carried in PrimitiveIR.params["focal_length"] beside the plane's own.
-ComponentKind = Literal["refractive", "reflective", "absorbing", "paraxial"]
+# "polarizing" is the ideal linear polarizer or retarder of the research
+# repository's issue 5: a disc that changes a ray's polarization and flux
+# only; its element and parameters are carried in PrimitiveIR.params beside
+# the plane's own ("element", "axis_deg" and "extinction", or
+# "retardance_waves" and "design_wavelength_um").
+ComponentKind = Literal["refractive", "reflective", "absorbing", "paraxial", "polarizing"]
 
 EmitterKind = Literal["point", "collimated", "extended"]
 

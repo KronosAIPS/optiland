@@ -260,10 +260,15 @@ from optiland.nonsequential.components import (
     ParaxialLens,
     ParaxialLensComponent,
     ParaxialLensConfig,
+    PolarizerConfig,
+    Polarizer,
+    PolarizingComponent,
     Prism,
     PrismConfig,
     ReflectiveComponent,
     RefractiveComponent,
+    Retarder,
+    RetarderConfig,
     SurfaceConfig,
     Volume,
 )
@@ -387,6 +392,7 @@ __all__ = [
     # Components -- raw
     "AbsorbingComponent",
     "ParaxialLensComponent",
+    "PolarizingComponent",
     "RefractiveComponent",
     "ReflectiveComponent",
     # Components -- compound
@@ -402,8 +408,12 @@ __all__ = [
     "NonWatertightVolumeError",
     "ParaxialLens",
     "ParaxialLensConfig",
+    "Polarizer",
+    "PolarizerConfig",
     "Prism",
     "PrismConfig",
+    "Retarder",
+    "RetarderConfig",
     "SurfaceConfig",
     "Volume",
     # Geometry

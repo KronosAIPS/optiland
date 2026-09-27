@@ -27,7 +27,9 @@ if TYPE_CHECKING:
         LensConfig,
         MirrorConfig,
         ParaxialLensConfig,
+        PolarizerConfig,
         PrismConfig,
+        RetarderConfig,
     )
     from optiland.nonsequential.tracer import SimulationResult
 
@@ -195,6 +197,47 @@ class NSQScene:
         )
 
         self.component_registry.add(name, ParaxialLens(name, cs, config))
+
+    def add_polarizer(
+        self,
+        name: str,
+        cs: CoordinateSystem,
+        config: PolarizerConfig,
+    ) -> None:
+        """Add an ideal linear polarizer (a disc at the placement's local z = 0).
+
+        Args:
+            name: Unique name for the polarizer in the registry.
+            cs: Coordinate system of the disc; the axis angle is measured
+                from its local x axis towards its local y axis.
+            config: PolarizerConfig: axis, aperture, extinction.
+        """
+        from optiland.nonsequential.components.polarizing import (  # noqa: PLC0415
+            Polarizer,
+        )
+
+        self.component_registry.add(name, Polarizer(name, cs, config))
+
+    def add_retarder(
+        self,
+        name: str,
+        cs: CoordinateSystem,
+        config: RetarderConfig,
+    ) -> None:
+        """Add an ideal linear retarder (a disc at the placement's local z = 0).
+
+        Args:
+            name: Unique name for the retarder in the registry.
+            cs: Coordinate system of the disc; the fast-axis angle is
+                measured from its local x axis towards its local y axis.
+            config: RetarderConfig: fast axis, retardance, aperture, design
+                wavelength.
+        """
+        from optiland.nonsequential.components.polarizing import (  # noqa: PLC0415
+            Retarder,
+        )
+
+        self.component_registry.add(name, Retarder(name, cs, config))
 
     def add_component(self, name: str, component: BaseComponent) -> None:
         """Add a raw BaseComponent (advanced use).

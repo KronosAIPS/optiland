@@ -962,13 +962,19 @@ def _register_components() -> None:
         LensConfig,
         MirrorConfig,
         ParaxialLensConfig,
+        PolarizerConfig,
         PrismConfig,
+        RetarderConfig,
     )
     from optiland.nonsequential.components.doublet import Doublet  # noqa: PLC0415
     from optiland.nonsequential.components.lens import Lens  # noqa: PLC0415
     from optiland.nonsequential.components.mirror import Mirror  # noqa: PLC0415
     from optiland.nonsequential.components.paraxial import (  # noqa: PLC0415
         ParaxialLens,
+    )
+    from optiland.nonsequential.components.polarizing import (  # noqa: PLC0415
+        Polarizer,
+        Retarder,
     )
     from optiland.nonsequential.components.prism import Prism  # noqa: PLC0415
 
@@ -1124,6 +1130,53 @@ def _register_components() -> None:
             stop_radius=cfg.get("stop_radius"),
         ),
         attached="*",
+    )
+    _register_polarizing(Polarizer, Retarder, PolarizerConfig, RetarderConfig)
+
+
+def _register_polarizing(Polarizer, Retarder, PolarizerConfig, RetarderConfig) -> None:
+    """The ideal polarizer and retarder (the research repository's issue 5)."""
+    kinds.register_component(
+        "polarizer",
+        Polarizer,
+        PolarizerConfig,
+        build=lambda scene, name, cs, config: scene.add_polarizer(name, cs, config),
+        to_dict=lambda c: {
+            "axis_deg": _to_float(c._config.axis_deg),
+            "aperture_radius": _to_float(c._config.aperture_radius),
+            "extinction": _to_float(c._config.extinction),
+        },
+        from_dict=lambda cfg: PolarizerConfig(
+            axis_deg=cfg["axis_deg"],
+            aperture_radius=cfg["aperture_radius"],
+            extinction=cfg.get("extinction", 0.0),
+        ),
+        attached="*",
+        description="an ideal linear polarizer on a disc (acts in a Stokes trace)",
+    )
+    kinds.register_component(
+        "retarder",
+        Retarder,
+        RetarderConfig,
+        build=lambda scene, name, cs, config: scene.add_retarder(name, cs, config),
+        to_dict=lambda c: {
+            "fast_axis_deg": _to_float(c._config.fast_axis_deg),
+            "retardance_waves": _to_float(c._config.retardance_waves),
+            "aperture_radius": _to_float(c._config.aperture_radius),
+            "design_wavelength_um": (
+                _to_float(c._config.design_wavelength_um)
+                if c._config.design_wavelength_um is not None
+                else None
+            ),
+        },
+        from_dict=lambda cfg: RetarderConfig(
+            fast_axis_deg=cfg["fast_axis_deg"],
+            retardance_waves=cfg["retardance_waves"],
+            aperture_radius=cfg["aperture_radius"],
+            design_wavelength_um=cfg.get("design_wavelength_um"),
+        ),
+        attached="*",
+        description="an ideal linear retarder on a disc (acts in a Stokes trace)",
     )
 
 

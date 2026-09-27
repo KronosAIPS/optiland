@@ -188,7 +188,7 @@ def _component_kind(component: BaseComponent) -> str:
 
     Returns:
         One of ``"refractive"``, ``"reflective"``, ``"absorbing"``,
-        ``"paraxial"``.
+        ``"paraxial"``, ``"polarizing"``.
 
     Raises:
         TypeError: If the component type is not one of the known
@@ -199,6 +199,9 @@ def _component_kind(component: BaseComponent) -> str:
     )
     from optiland.nonsequential.components.paraxial import (
         ParaxialLensComponent,  # noqa: PLC0415
+    )
+    from optiland.nonsequential.components.polarizing import (
+        PolarizingComponent,  # noqa: PLC0415
     )
     from optiland.nonsequential.components.reflective import (
         ReflectiveComponent,  # noqa: PLC0415
@@ -215,10 +218,28 @@ def _component_kind(component: BaseComponent) -> str:
         return "absorbing"
     if isinstance(component, ParaxialLensComponent):
         return "paraxial"
+    if isinstance(component, PolarizingComponent):
+        return "polarizing"
     raise TypeError(
         f"No scene-IR lowering registered for component type "
         f"{type(component).__name__}."
     )
+
+
+def _polarizing_params(component) -> dict[str, Any]:
+    """The element parameters of an ideal polarizer or retarder (issue 5)."""
+    if component.element == "polarizer":
+        return {
+            "element": "polarizer",
+            "axis_deg": component.axis_deg,
+            "extinction": component.extinction,
+        }
+    return {
+        "element": "retarder",
+        "axis_deg": component.axis_deg,
+        "retardance_waves": component.retardance_waves,
+        "design_wavelength_um": component.design_wavelength_um,
+    }
 
 
 def _lower_spectrum(spectrum: object) -> dict[str, Any]:
@@ -357,6 +378,9 @@ def lower(scene: NSQScene, *, strict: bool = True) -> SceneIR:
         if _component_kind(component) == "paraxial":
             # The ideal lens's one parameter of its own, beside the plane's.
             params = {**params, "focal_length": component.focal_length}
+        elif _component_kind(component) == "polarizing":
+            # The ideal polarizer's or retarder's element, beside the plane's.
+            params = {**params, **_polarizing_params(component)}
         primitives.append(
             PrimitiveIR(
                 id=i,
