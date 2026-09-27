@@ -48,6 +48,15 @@ acting on ``flux`` alone, and a trace with polarization off carries no extra
 field and does no extra operation. With an unpolarized state (``q = 0``) the
 flux factor ``g`` is ``m00`` exactly, the scalar coefficient, bit for bit.
 
+The run record. A Stokes trace records ``polarization: "stokes"`` in
+``SimulationResult.environment``; a scalar trace (``"off"``, the default)
+carries no ``polarization`` key at all: absent means off. That is the
+maintainer's ruling of 2026-09-27 on issue 5, for now. The key is to be
+written for every trace, ``"off"`` included, in one change with the
+record's statement of the scalar-equivalence conditions (chapter 06 section
+6.9, test T-06-19): a scalar run's record then says which conditions its
+numbers rely on, which a bare ``"off"`` would not.
+
 Every function works on whatever array library the arguments are (NumPy or
 torch, float32 or float64) through ``optiland.backend``, on real arrays only.
 Guards follow the double-``where`` rule of the theory's chapter 09 (R-09-10):
