@@ -36,10 +36,14 @@ from optiland.nonsequential.components.base import BaseComponent, _get_transform
 if TYPE_CHECKING:
     from optiland.nonsequential.materials.nsq_material import NSQMaterial
 
-# Default rim-coincidence tolerance [mm]. Proposed in the original spec as a
-# starting point; the sag arithmetic in analytic geometries stays well
-# within float64 precision at ordinary lens scales, so this is not tuned
-# further here.
+# The rim-coincidence floor [mm]: two rims closer than one nanometre are one
+# rim. A physical construction tolerance (the original specification's
+# number), dtype-independent by intent (chapter 08, R-08-7's exception for a
+# physical threshold). The numerical part of the tolerance is not this
+# constant: it is the rounding bound of the working precision at the rims'
+# coordinate scale, derived in :func:`_placement_error_bound` and
+# :func:`_check_watertight` (KronosNSRT issue 80). The tolerance used is the
+# larger of the two.
 WATERTIGHT_TOL = 1e-6
 
 _RIM_SAMPLES = 64
@@ -101,6 +105,22 @@ def _rim_points(
 ) -> np.ndarray | None:
     """Sample points along a component's aperture rim, in global coordinates.
 
+    The global points are :func:`_rim_local_points` placed by the
+    component's effective transform. ``None`` when the geometry has no
+    finite rim.
+    """
+    local_pts = _rim_local_points(component, n_samples)
+    if local_pts is None:
+        return None
+    translation, rotation = _get_transform(component.cs)
+    return local_pts @ rotation.T + translation
+
+
+def _rim_local_points(
+    component: BaseComponent, n_samples: int = _RIM_SAMPLES
+) -> np.ndarray | None:
+    """Sample points along a component's aperture rim, in its local frame.
+
     Supports the analytic geometries the compound builders actually use
     (conic, finite plane, annulus, frustum). Geometries with no finite open
     edge (an infinite plane, a full sphere, a mesh) return ``None`` -- there
@@ -112,7 +132,7 @@ def _rim_points(
         n_samples: Points per rim loop.
 
     Returns:
-        (n_samples * num_loops, 3) global-frame points, or ``None``.
+        (n_samples * num_loops, 3) local-frame points, or ``None``.
     """
     from optiland.nonsequential.components.geometry.analytic.annulus import (  # noqa: PLC0415
         AnnularPlaneGeometry,
@@ -196,9 +216,99 @@ def _rim_points(
         # Infinite plane, sphere, mesh: no finite rim supported yet.
         return None
 
-    local_pts = np.concatenate(loops, axis=0)
-    translation, rotation = _get_transform(component.cs)
-    return local_pts @ rotation.T + translation
+    return np.concatenate(loops, axis=0)
+
+
+def _unit_roundoff(cs: object) -> float:
+    """The unit roundoff u of the precision a placement is computed in.
+
+    Read from the live dtype of the effective transform the coordinate
+    system produces (float32 under ``be.set_precision("float32")`` on the
+    torch backend, float64 otherwise): u = 2**-24 or 2**-53.
+    """
+    from optiland.backend.utils import to_numpy  # noqa: PLC0415
+
+    t_be, _ = cs.get_effective_transform()
+    dtype = np.asarray(to_numpy(t_be)).dtype
+    if not np.issubdtype(dtype, np.floating):
+        dtype = np.dtype(np.float64)
+    return float(np.finfo(dtype).eps) / 2.0
+
+
+def _placement_error_bound(cs: object, u: float) -> tuple[float, float]:
+    """First-order bounds on the rounding of a placement computed in precision u.
+
+    ``CoordinateSystem.get_effective_transform`` builds the rotation R and
+    translation t of a surface in the working precision: the six values are
+    stored in it, R = Rz @ Ry @ Rx from their sines and cosines, and each
+    ``reference_cs`` link composes t = t_ref + R_ref @ tau and
+    R = R_ref @ R_local. The rim points themselves are float64 arithmetic on
+    float64 parameters; only R and t carry the working precision. Counted
+    under the standard model fl(a op b) = (a op b)(1 + d), |d| <= u, an inner
+    product of length 3 within gamma_3 = 3u of the sum of the absolute terms,
+    and sine and cosine within one ulp (2u) of the stored angle's value:
+
+    * Local rotation, any angle nonzero: each entry of Rz @ Ry @ Rx is at most
+      two terms, each a product of at most three sines or cosines (the other
+      factors are exact zeros and ones, whose products and sums are exact);
+      the absolute terms sum to at most 1 (Cauchy-Schwarz on unit rows and
+      columns). Three function values at 2u each (6u), two multiplications
+      (2u), one addition (1u), and the angles' storage, at most u|theta| per
+      factor, summed over two terms (2 Theta u, Theta = |rx| + |ry| + |rz|):
+      e_R,local = (9 + 2 Theta) u per entry. All angles zero: R is exactly the
+      identity, e_R,local = 0.
+    * Root placement: t is the stored offset, e_t = u max|tau_i|.
+    * A link: R = R_ref @ R_local has entry error at most
+      sqrt(3) (e_R,ref + e_R,local) + 3u (a column or row of a rotation has a
+      1-norm at most sqrt(3)), or exactly e_R,ref when R_local is the identity.
+      t_i = t_ref,i + sum_j R_ref,ij tau_j has error at most
+      e_t,ref + (e_R,ref + u + 3u) ||tau||_1 + u (|t_ref|_inf + ||tau||_1):
+      the reference rotation's error, the offset's storage (u), the inner
+      product (3u) and the final addition (u at the sum's magnitude); a zero
+      offset adds nothing.
+
+    Args:
+        cs: The surface's coordinate system (a reference chain allowed).
+        u: Unit roundoff of the working precision.
+
+    Returns:
+        ``(e_R, e_t)``: the bound on every entry of R (dimensionless) and on
+        every component of t [mm].
+    """
+    angles = [abs(as_float(cs.rx)), abs(as_float(cs.ry)), abs(as_float(cs.rz))]
+    tau = np.array([as_float(cs.x), as_float(cs.y), as_float(cs.z)])
+    theta = sum(angles)
+    e_r_local = 0.0 if theta == 0.0 else (9.0 + 2.0 * theta) * u
+    if cs.reference_cs is None:
+        return e_r_local, u * float(np.max(np.abs(tau)))
+    e_r_ref, e_t_ref = _placement_error_bound(cs.reference_cs, u)
+    if theta == 0.0:
+        e_r = e_r_ref
+    else:
+        e_r = np.sqrt(3.0) * (e_r_ref + e_r_local) + 3.0 * u
+    tau_1 = float(np.sum(np.abs(tau)))
+    if tau_1 == 0.0:
+        return e_r, e_t_ref
+    t_ref = _get_transform(cs.reference_cs)[0]
+    t_ref_inf = float(np.max(np.abs(t_ref)))
+    e_t = e_t_ref + (e_r_ref + 4.0 * u) * tau_1 + u * (t_ref_inf + tau_1)
+    return e_r, e_t
+
+
+def _rim_error_bound(component: BaseComponent, local_pts: np.ndarray) -> float:
+    """Bound on each global coordinate's rounding of a component's rim points [mm].
+
+    A global rim coordinate is g_i = sum_j R_ij p_j + t_i with p the float64
+    local rim point, so its error is at most e_R ||p||_1 + e_t
+    (:func:`_placement_error_bound`), taken at the rim's largest ||p||_1. The
+    float64 arithmetic of p and of the product itself rounds at 2**-53 of
+    the scale, below the floor ``WATERTIGHT_TOL`` by orders of magnitude at
+    any scene size under 10**6 mm, and is not counted.
+    """
+    u = _unit_roundoff(component.cs)
+    e_r, e_t = _placement_error_bound(component.cs, u)
+    p_1 = float(np.max(np.sum(np.abs(local_pts), axis=1))) if len(local_pts) else 0.0
+    return e_r * p_1 + e_t
 
 
 def _check_watertight(
@@ -206,42 +316,62 @@ def _check_watertight(
 ) -> np.ndarray | None:
     """Verify every boundary surface's rim is met by a neighbour's rim.
 
+    The tolerance for surface a's rim is the larger of the floor ``tol`` and
+    sqrt(3) (E_a + max_b E_b), with E the per-coordinate rounding bound of
+    each surface's rim points (:func:`_rim_error_bound`) and b over the other
+    surfaces: two rims that coincide in exact arithmetic are at most that far
+    apart once both are placed in the working precision (sqrt(3) turns the
+    per-coordinate bound into a Euclidean distance). In float64 the second
+    term is about 1e-13 mm at a 100 mm scale, so the floor decides and the
+    verdicts are those of the floor alone; in float32 it is about 6e-5 mm for
+    a lens 50 mm from the origin, where float32's own spacing is 3.8e-6 mm
+    (KronosNSRT issue 80).
+
     Args:
         boundary: The volume's boundary surfaces.
-        tol: Maximum allowed gap [mm].
+        tol: The floor of the allowed gap [mm].
 
     Returns:
         All sampled rim points (for reuse as a centroid estimate), or
         ``None`` if no surface in ``boundary`` has a finite rim.
 
     Raises:
-        NonWatertightVolumeError: If any rim point is farther than ``tol``
-            from every other surface's rim.
+        NonWatertightVolumeError: If any rim point is farther than its
+            tolerance from every other surface's rim.
     """
-    rims = [(comp, pts) for comp in boundary if (pts := _rim_points(comp)) is not None]
+    rims = []
+    for comp in boundary:
+        local_pts = _rim_local_points(comp)
+        if local_pts is None:
+            continue
+        translation, rotation = _get_transform(comp.cs)
+        pts = local_pts @ rotation.T + translation
+        rims.append((comp, pts, _rim_error_bound(comp, local_pts)))
     if not rims:
         return None
     if len(rims) == 1:
         return rims[0][1]
 
-    for i, (comp_i, pts_i) in enumerate(rims):
+    for i, (comp_i, pts_i, err_i) in enumerate(rims):
         other_pts = np.concatenate(
-            [p for j, (_, p) in enumerate(rims) if j != i], axis=0
+            [p for j, (_, p, _) in enumerate(rims) if j != i], axis=0
         )
+        err_other = max(e for j, (_, _, e) in enumerate(rims) if j != i)
+        tol_i = max(tol, float(np.sqrt(3.0)) * (err_i + err_other))
         # (n_i, n_other) pairwise distances -- rim samples are small (a few
         # hundred points across a handful of surfaces), so this is cheap.
         diff = pts_i[:, None, :] - other_pts[None, :, :]
         dists = np.sqrt((diff**2).sum(axis=2)).min(axis=1)
         worst = float(dists.max())
-        if worst > tol:
+        if worst > tol_i:
             raise NonWatertightVolumeError(
                 f"Volume boundary is not watertight: surface "
                 f"'{comp_i.name or type(comp_i).__name__}' has a rim point "
                 f"{worst:.3g} mm from the nearest point on any other boundary "
-                f"surface (tolerance {tol:.1e} mm). Check that neighbouring "
+                f"surface (tolerance {tol_i:.2e} mm). Check that neighbouring "
                 f"surfaces' aperture radii and rim geometry agree."
             )
-    return np.concatenate([p for _, p in rims], axis=0)
+    return np.concatenate([p for _, p, _ in rims], axis=0)
 
 
 class _DetachedProxy:
