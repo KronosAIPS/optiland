@@ -39,7 +39,10 @@ Per call (one chunk of rays at a time, the chunk size fixed by the ray count):
    (the whole leaf moves the point by less than ``tol`` along a parameter)
    clamps that parameter; beyond the start ``t0``; for a ray leaving the
    surface, beyond ``4 tol / |cos|``, the self root's own uncertainty; inside
-   the patch's ``uv_bounds`` rectangle.
+   the patch's ``uv_bounds`` rectangle; on a trimmed patch, inside its trim
+   loops by the even-odd rule on the library's polygons (:func:`_in_trim`). A
+   root that fails any test is not a hit, so the next accepted root along the
+   ray, on the same leaf from another start or on another leaf, wins.
 5. **One winner per ray:** the smallest accepted ``t``, ties to the lowest
    lane index, and every field gathered from that one lane.
 
@@ -222,9 +225,14 @@ class DeviceLeaves:
     P: int
     Q: int
     n: int
+    # trimming, only when a patch is trimmed inside its domain (see .leaves)
+    piece: Any = None  # (L,) int64 the leaf's Bezier piece
+    tedge: Any = None  # (n_pieces, K, E, 4) polygon edges (a_u, a_v, b_u, b_v) per piece and v slab, zero-padded
+    tslab: Any = None  # (n_pieces, 2) each piece's slab origin in v and slabs per unit v
+    ttrim: Any = None  # (n_pieces,) bool the piece's patch is trimmed
 
 
-def upload(leaves, to_array, pad_ulps: float = 8.0, u: float = 2.0**-53) -> DeviceLeaves:
+def upload(leaves, to_array, pad_ulps: float = 8.0, u: float = 2.0**-53, to_index=None) -> DeviceLeaves:
     """The leaf arrays of a :class:`~.leaves.LeafSet` in the working dtype.
 
     Boxes are padded outward by ``pad_ulps`` units of the working dtype at the
@@ -237,6 +245,7 @@ def upload(leaves, to_array, pad_ulps: float = 8.0, u: float = 2.0**-53) -> Devi
         to_array: NumPy float64 -> backend array (the working dtype and device).
         pad_ulps: The box padding.
         u: The working dtype's unit roundoff.
+        to_index: NumPy int64 -> backend integer array (needed for a trimmed set).
     """
     lv = leaves
     net = lv.net.copy()
@@ -248,11 +257,23 @@ def upload(leaves, to_array, pad_ulps: float = 8.0, u: float = 2.0**-53) -> Devi
     half = lv.half + (pad_ulps * u * 2.0 * coord + 1e-300)[:, None]
     scale = np.abs(lv.half).max(axis=1) * 2.0 * 1.8
     uvb = lv.patch_uv_bounds[lv.patch]
+    trim = {}
+    if getattr(lv, "piece_edges", None) is not None:
+        if to_index is None:
+            def to_index(x):
+                return np.asarray(x, dtype=np.int64)
+        trim = {
+            "piece": to_index(lv.piece),
+            # a padded edge (0, 0, 0, 0) never straddles: both ends compare alike
+            "tedge": to_array(lv.piece_edges),
+            "tslab": to_array(lv.piece_slab),
+            "ttrim": to_index(lv.piece_trimmed.astype(np.int64)) > 0,
+        }
     return DeviceLeaves(
         to_array(net), to_array(lv.centre), to_array(lv.frame), to_array(half), to_array(scale),
         to_array(np.sin(lv.cone)), to_array(lv.uvmap), to_array(lv.sub), to_array(lv.prange),
         to_array(uvb), to_array(lv.orient), to_array(lv.pivot), to_array(poff),
-        lv.degree[0], lv.degree[1], lv.n,
+        lv.degree[0], lv.degree[1], lv.n, **trim,
     )
 
 
@@ -498,6 +519,9 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
     vv = pr[:, 2] + r * (pr[:, 3] - pr[:, 2])
     ub = dl.uvb[lane_leaf]
     ok = ok & (uu >= ub[:, 0]) & (uu <= ub[:, 1]) & (vv >= ub[:, 2]) & (vv <= ub[:, 3])
+    if dl.tedge is not None:
+        pc = dl.piece[lane_leaf]
+        ok = ok & (_in_trim(ops, dl.tedge, dl.tslab, pc, uu, vv) | ~dl.ttrim[pc])
     # -- 5. one winner per ray ----------------------------------------------------
     tt = ops.where(ok, ttot, ops.full_like(ttot, inf))
 
@@ -531,6 +555,43 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
     out["Ss"] = ops.stack([pick(Ss[:, k]) for k in range(3)], -1)
     out["Sr"] = ops.stack([pick(Sr[:, k]) for k in range(3)], -1)
     return out
+
+
+#: Elements of one (lane, edge) block of the trim test: the edges are taken in
+#: chunks of a fixed size so a chunk's arrays stay bounded.
+_MAX_TRIM_PAIRS = 1 << 21
+
+
+def _in_trim(ops, tedge, tslab, pc, uu, vv):
+    """Whether each lane's ``(uu, vv)`` lies inside its piece's trim polygons.
+
+    The library's even-odd rule (``kgeom.nurbs.point_in_trim``), written in the
+    same operations and order: a ray from the point toward ``+u`` counts the
+    edges with one end strictly above ``vv`` and the other not, whose crossing
+    lies beyond ``uu``; odd is inside. Only the edges of the lane's slab of its
+    piece are tested (an edge outside the slab cannot be crossed from it; the
+    slab index is clipped, and the host's slack covers its rounding). Fixed
+    shapes, no host read: the slab's edges are gathered per lane in fixed-size
+    chunks of the padded edge axis.
+    """
+    lanes = uu.shape[0]
+    n_slabs = int(tedge.shape[1])
+    E = int(tedge.shape[2])
+    sl = tslab[pc]
+    k = ops.clip(ops.xp.floor((vv - sl[:, 0]) * sl[:, 1]), 0.0, float(n_slabs - 1))
+    k = k.long() if ops.torch is not None else k.astype(np.int64)
+    step = max(1, min(E, _MAX_TRIM_PAIRS // max(lanes, 1)))
+    pu = uu[:, None]
+    pv = vv[:, None]
+    count = None
+    for e0 in range(0, E, step):
+        ed = tedge[pc, k, e0 : min(E, e0 + step)]
+        au, av, bu, bv = ed[..., 0], ed[..., 1], ed[..., 2], ed[..., 3]
+        straddle = (av > pv) != (bv > pv)
+        cross_u = au + (pv - av) * (bu - au) / (bv - av)
+        c = (straddle & (pu < cross_u)).sum(-1)
+        count = c if count is None else count + c
+    return (count % 2) == 1
 
 
 def _rounds(ops, dl, o, d, t0, n_iter, k_tol, C, A):

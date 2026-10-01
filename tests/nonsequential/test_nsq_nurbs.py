@@ -259,13 +259,16 @@ class TestBuild:
                 ref = kn.evaluate(surface, pr[0] + s * (pr[1] - pr[0]), pr[2] + r * (pr[3] - pr[2]))
                 assert np.abs(S - ref).max() < 1e-12
 
-    def test_trimmed_patch_is_refused_and_the_rectangle_accepted(self):
+    def test_trimmed_patch_is_trimmed_and_the_rectangle_untrimmed(self):
+        # Until ticket C (device trimming) a loop inside the domain was refused;
+        # it now builds a trimmed set (tests in test_nsq_nurbs_trim.py). A loop
+        # on the domain's rectangle still builds no trim data at all.
         s = wavy_surface()
         rect = [[[0, 0], [1, 0]], [[1, 0], [1, 1]], [[1, 1], [0, 1]], [[0, 1], [0, 0]]]
-        NurbsGeometry(contract([s], {0: rect}))
-        hole = [[[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8], [0.2, 0.2]]]
-        with pytest.raises(NotImplementedError, match="ticket C"):
-            NurbsGeometry(contract([s], {0: hole}))
+        assert NurbsGeometry(contract([s], {0: rect})).leaves.piece_edges is None
+        inner = [[[0.2, 0.2], [0.8, 0.2], [0.8, 0.8], [0.2, 0.8], [0.2, 0.2]]]
+        lv = NurbsGeometry(contract([s], {0: inner})).leaves
+        assert lv.piece_edges is not None and lv.patch_trimmed[0] and lv.n_dropped > 0
 
     def test_bad_weight_and_pieces(self):
         a = _arrays(sphere_surface(10.0))

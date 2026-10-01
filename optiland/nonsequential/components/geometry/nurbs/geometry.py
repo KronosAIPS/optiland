@@ -24,13 +24,26 @@ so the library's exact rational sphere and the analytic sphere give the same
 ``n_geom``. A sheet that bounds no solid follows the same rule with its
 ``S_u x S_v`` side as the outside.
 
-Trimming
---------
-Device trimming is ticket C of issue 66 and is not built: a patch whose trim
-loops run inside its domain is refused at build. Loops that run along the
-domain's rectangle (every face of the CAD study's lenses) keep the whole
-domain and are accepted; a hit outside a patch's ``uv_bounds`` rectangle is
-refused on the device.
+Trimming (ticket C)
+-------------------
+A hit outside a patch's ``uv_bounds`` rectangle is refused on the device. A
+patch whose trim loops run inside its domain is trimmed on the device: after
+the Newton root, the root's ``(u, v)`` is tested against the patch's loops by
+the even-odd rule on the polygons the geometry library would build from them
+(:mod:`.trim`, ``kgeom.nurbs.point_in_trim``'s polygons and rule, to the bit at
+float64), with backend operations, fixed shapes and no host read. A
+trimmed-away root is not a hit, and the nearest accepted root of the ray's
+other lanes (another start on the same leaf, another leaf) wins. Leaves wholly
+inside a trimmed-away region are not built. Loops that run along the domain's
+rectangle (every face of the CAD study's lenses) keep the whole domain and add
+no test, so an untrimmed set runs exactly the code it ran before.
+
+Inside the polygonisation band (1e-6 of the ``uv_bounds`` diagonal from a trim
+curve; KronosLIB issue 286) the engine answers what the polygon answers, which
+the true curve may not; :mod:`.trim` bounds the flux that can move across a
+trim curve that way. The trim test is a detached mask: the adjoint is
+unchanged away from a trim curve, and at the curve itself the visibility
+boundary's contribution (the research repository's issue 3) is not modelled.
 
 Changes against the prototype (the research card N1, section 5)
 ----------------------------------------------------------------
@@ -180,7 +193,6 @@ class NurbsGeometry(ComponentGeometry):
 
         Raises:
             ValueError: A bad array, a non-positive weight, an option out of range.
-            NotImplementedError: A patch trimmed inside its domain.
         """
         if not isinstance(arrays, Mapping) and hasattr(arrays, "to_arrays"):
             arrays = arrays.to_arrays(bezier=True)
@@ -305,7 +317,7 @@ class NurbsGeometry(ComponentGeometry):
             def to_index(x):
                 return np.asarray(x, dtype=np.int64)
 
-        dl = K.upload(leaves, to_array, u=ops.u)
+        dl = K.upload(leaves, to_array, u=ops.u, to_index=to_index)
         adj = {
             "mu": to_array(leaves.mu),
             "mv": to_array(leaves.mv),
