@@ -26,7 +26,9 @@ plane, every point of which emits the same distribution (slots ``SOURCE_U1``,
 
 The table is data: its values are detached (a gradient with respect to a table
 value would need the implicit derivative of the inverse CDF). The source's
-total flux carries a gradient, as for every other source.
+total flux carries a gradient, as for every other source, and so does its
+emitting area (width and height, or the disc's radius), attached by the change
+of variables of the research repository's chapter 09 section 9.13.2.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ import numpy as np
 
 import optiland.backend as be
 from optiland.backend.utils import to_numpy
-from optiland.nonsequential._utils import is_tensor
+from optiland.nonsequential._utils import as_attachable_param, host_float, is_tensor
 from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.ray_bundle import NSQRayBundle
 from optiland.nonsequential.rng import EventSlot
@@ -241,9 +243,16 @@ class TabulatedSource(BaseNSQSource):
         self.azimuth_angles_deg = phi_deg
         self.intensity = table
         self.intensity_units = intensity_units
-        self.width = None if width is None else float(width)
-        self.height = None if height is None else float(height)
-        self.aperture_radius = None if aperture_radius is None else float(aperture_radius)
+        # The emitting area may carry a derivative: the trace attaches the
+        # emission points to it by the change of variables, with the same maps
+        # as the extended source (the research repository's chapter 09
+        # sections 9.7 and 9.13.2). A tensor is kept as given; float() would
+        # detach it without a word.
+        self.width = None if width is None else as_attachable_param(width)
+        self.height = None if height is None else as_attachable_param(height)
+        self.aperture_radius = (
+            None if aperture_radius is None else as_attachable_param(aperture_radius)
+        )
         if (self.width is None) != (self.height is None):
             raise ValueError("TabulatedSource: give both width and height, or neither.")
         if self.aperture_radius is not None and self.width is not None:
@@ -351,12 +360,12 @@ class TabulatedSource(BaseNSQSource):
         if self.aperture_radius is not None:
             u1 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1))
             u2 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2))
-            r = self.aperture_radius * np.sqrt(u1)
+            r = host_float(self.aperture_radius) * np.sqrt(u1)
             lx, ly = r * np.cos(2.0 * np.pi * u2), r * np.sin(2.0 * np.pi * u2)
         elif self.width is not None:
             u1 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U1))
             u2 = to_numpy(rng.uniform(ray_id, bounce0, EventSlot.SOURCE_U2))
-            lx, ly = (u1 - 0.5) * self.width, (u2 - 0.5) * self.height
+            lx, ly = (u1 - 0.5) * host_float(self.width), (u2 - 0.5) * host_float(self.height)
         else:
             lx = ly = np.zeros(num)
 

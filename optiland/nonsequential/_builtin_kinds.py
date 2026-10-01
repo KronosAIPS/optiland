@@ -384,6 +384,7 @@ _POINT_ATTACHED = (*_SOURCE_ATTACHED, "half_angle_deg")
 # the beam is built with profile_gradient="implicit" and refuses it otherwise.
 _COLLIMATED_ATTACHED = (*_SOURCE_ATTACHED, "aperture_radius", "gaussian_sigma")
 _EXTENDED_ATTACHED = (*_SOURCE_ATTACHED, "width", "height", "aperture_radius", "half_angle_deg")
+_TABULATED_ATTACHED = (*_SOURCE_ATTACHED, "width", "height", "aperture_radius")
 
 
 def _register_sources() -> None:
@@ -497,9 +498,11 @@ def _register_sources() -> None:
             ),
             "intensity": np.asarray(s.intensity, dtype=np.float64).tolist(),
             "intensity_units": s.intensity_units,
-            "width": s.width,
-            "height": s.height,
-            "aperture_radius": s.aperture_radius,
+            "width": None if s.width is None else _to_float(s.width),
+            "height": None if s.height is None else _to_float(s.height),
+            "aperture_radius": (
+                None if s.aperture_radius is None else _to_float(s.aperture_radius)
+            ),
         }
 
     def tab_from_dict(d, spectrum, total_flux, medium):
@@ -527,7 +530,7 @@ def _register_sources() -> None:
         to_dict=tab_to_dict,
         from_dict=tab_from_dict,
         lower=tab_to_dict,
-        attached=_SOURCE_ATTACHED,
+        attached=_TABULATED_ATTACHED,
         description="a point or area with a tabulated angular intensity I(theta[, phi])",
     )
 
