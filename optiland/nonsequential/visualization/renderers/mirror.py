@@ -14,6 +14,7 @@ from optiland.nonsequential.visualization.renderers.base import (
     ComponentRenderer3D,
 )
 from optiland.nonsequential.visualization.renderers.lens import (
+    _face_sag,
     _projection_indices,
     _sag_array,
 )
@@ -57,7 +58,12 @@ class MirrorRenderer2D(ComponentRenderer2D):
 
         n_pts = 128
         y = np.linspace(-cfg.aperture_radius, cfg.aperture_radius, n_pts)
-        z = _sag_array(cfg.radius, cfg.conic, y)
+        # The face's own sag (an asphere mirror's polynomial included,
+        # KronosNSRT issue 81); the base conic only for a kind with no
+        # closed-form sag.
+        z = _face_sag(component.surfaces[0], y)
+        if z is None:
+            z = _sag_array(cfg.radius, cfg.conic, y)
 
         pts_local = np.stack([np.zeros_like(y), y, z], axis=1)
         pts_global = pts_local @ rot.T + translation
@@ -109,7 +115,9 @@ class MirrorRenderer3D(ComponentRenderer3D):
 
         n_pts = 128
         r = np.linspace(0.0, cfg.aperture_radius, n_pts)
-        z = _sag_array(cfg.radius, cfg.conic, r)
+        z = _face_sag(component.surfaces[0], r)
+        if z is None:
+            z = _sag_array(cfg.radius, cfg.conic, r)
 
         pts_local = np.stack([np.zeros_like(r), r, z], axis=1)
         pts_global = pts_local @ rot.T + translation
