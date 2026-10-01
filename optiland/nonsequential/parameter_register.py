@@ -74,9 +74,12 @@ Gradient classes (chapter 09 sections 9.2, 9.3 and 9.7):
 
 Forward mode: a dual tensor of ``torch.autograd.forward_ad`` counts as a
 parameter to attach, so its tangent reaches the outputs (the cross-check of
-R-09-9); the dead-parameter check covers reverse-mode entries only. The
-functional transforms of ``torch.func`` (``jvp``, ``grad``) are not supported:
-the host build reads the placement's value, which their wrapped tensors refuse.
+R-09-9); the dead-parameter check covers reverse-mode entries only.
+``torch.func.jvp`` works the same way: its argument is a forward-mode dual
+inside the transform, the host builds read its value through
+:func:`optiland.backend.utils.to_numpy` (which reads a value inside a
+``torch.func`` transform), and its tangent equals ``forward_ad``'s to the bit
+(the research repository's chapter 09 section 9.13.5).
 
 Nothing in this module runs when no tensor in the scene requires a gradient:
 the register is empty, :func:`attach_placement` returns the host transform it
