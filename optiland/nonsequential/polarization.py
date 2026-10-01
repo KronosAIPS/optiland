@@ -957,7 +957,8 @@ def fresnel_stokes(
     4. The interface elements. A bare interface: the Fresnel reflection with
        the TIR phase, and the transmission ``sqrt(T_s T_p)`` with
        ``T_s = 1 - r_s^2``, ``T_p = 1 - r_p^2`` and ``M_t01 = -M_r01``. A
-       thin-film coating: :func:`thin_film_sp`. A coating with scalar ``R`` and
+       thin-film coating: :func:`thin_film_sp`; a coating table: its own
+       ``sp`` (``optiland.coatings.TabulatedCoating``). A coating with scalar ``R`` and
        ``T`` only: a non-polarizing element, ``R diag(1, 1, -1, -1)`` and
        ``T diag(1, 1, 1, 1)`` (an ideal reflection flips the handedness). In
        every case ``M_00`` is the scalar ``R`` or ``T`` the engine already
@@ -992,8 +993,12 @@ def fresnel_stokes(
             be.where(tir, zero, m_t.m22),
             zero,
         )
-    elif hasattr(coating, "stack"):
-        sp = thin_film_sp(coating.stack, wavelength, cos_i, reverse=from_substrate)
+    elif hasattr(coating, "stack") or callable(getattr(coating, "sp", None)):
+        if hasattr(coating, "stack"):
+            sp = thin_film_sp(coating.stack, wavelength, cos_i, reverse=from_substrate)
+        else:
+            # a coating table with its phase grids (it refuses without them)
+            sp = coating.sp(wavelength, cos_i, from_substrate)
         m_r = InterfaceMueller(
             R_used,
             be.where(tir, zero, 0.5 * (sp.Rp - sp.Rs)),
@@ -1059,7 +1064,7 @@ class MirrorStokes:
 
 
 def mirror_stokes(rays, dirs, normals, R_used, stack=None, wavelength=None,
-                  cos_i=None) -> MirrorStokes:
+                  cos_i=None, coating=None) -> MirrorStokes:
     """The Stokes half of a mirror reflection, before the flux is weighted.
 
     Two kinds of mirror, each with ``M00`` the scalar reflectance ``R`` the
@@ -1086,14 +1091,20 @@ def mirror_stokes(rays, dirs, normals, R_used, stack=None, wavelength=None,
         dirs, normals: ``(N, 3)`` incident directions and surface normals.
         R_used: The scalar reflectance the mirror applies, per ray.
         stack: The mirror's ``ThinFilmStack``, or ``None``.
-        wavelength: Per-ray wavelength [um] (for a stack).
-        cos_i: Per-ray ``|cos theta_i|`` (for a stack).
+        wavelength: Per-ray wavelength [um] (for a stack or a table).
+        cos_i: Per-ray ``|cos theta_i|`` (for a stack or a table).
+        coating: A coating table (``optiland.coatings.TabulatedCoating``) as
+            the reflectance, or ``None``: its own ``sp`` gives the s and p
+            terms, and it refuses a Stokes trace without its phase grids.
 
     Returns:
         A :class:`MirrorStokes`.
     """
     s, q, u, v = incidence_frame(rays, dirs, normals)
-    if stack is None:
+    if stack is None and coating is not None and callable(getattr(coating, "sp", None)):
+        sp = coating.sp(wavelength, cos_i)
+        m = InterfaceMueller(R_used, 0.5 * (sp.Rp - sp.Rs), sp.xr_re, sp.xr_im)
+    elif stack is None:
         zero = be.zeros_like(R_used)
         m = InterfaceMueller(R_used, zero, -R_used, zero)
     else:
