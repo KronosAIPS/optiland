@@ -119,11 +119,21 @@ def _admittance(n: complex, cos_t: complex, pol: PolSP):
         raise ValueError("Invalid polarization state")
 
 
-def _tmm_coh(stack: ThinFilmStack, wavelength_um, theta0_rad, pol: PolSP):
+def _tmm_coh(
+    stack: ThinFilmStack, wavelength_um, theta0_rad, pol: PolSP, reverse=None
+):
     """Compute the reflection and transmission coefficients for a thin film stack.
 
     Calculation is vectorized over wavelength and angle of incidence.
     Based on Abelès Matrix.
+
+    ``reverse`` (optional, a boolean array broadcastable with the inputs) marks
+    the elements that meet the stack from its substrate side: for those the
+    stack is evaluated reversed -- the substrate as the incident medium, the
+    layers in the opposite order, the incident medium as the substrate --
+    with ``theta0_rad`` the angle in the substrate. Where ``reverse`` is
+    False every value is the one ``reverse=None`` gives, bit for bit (the
+    same operations on the same operands, selected with ``where``).
 
     Ref:
         - Chap 13. Polarized Light and Optical Systems, Russell
@@ -150,6 +160,8 @@ def _tmm_coh(stack: ThinFilmStack, wavelength_um, theta0_rad, pol: PolSP):
     """
     n0 = _complex_index(stack.incident_material, wavelength_um)
     ns = _complex_index(stack.substrate_material, wavelength_um)
+    if reverse is not None:
+        n0, ns = be.where(reverse, ns, n0), be.where(reverse, n0, ns)
     cos0 = _snell_cos(n0, theta0_rad, n0)
     coss = _snell_cos(n0, theta0_rad, ns)
     eta0 = _admittance(n0, cos0, pol)
@@ -161,11 +173,22 @@ def _tmm_coh(stack: ThinFilmStack, wavelength_um, theta0_rad, pol: PolSP):
     C = be.to_complex(be.zeros_like(eta0))
     D = be.to_complex(be.ones_like(eta0))
 
-    for layer in stack.layers:
+    layers = list(stack.layers)
+    for j, layer in enumerate(layers):
         n_l = layer.n_complex(wavelength_um)
-        cos_l = _snell_cos(n0, theta0_rad, n_l)
+        if reverse is None:
+            cos_l = _snell_cos(n0, theta0_rad, n_l)
+            delta = layer.phase_thickness(wavelength_um, cos_l, n_l)
+        else:
+            mirror = layers[len(layers) - 1 - j]
+            n_l = be.where(reverse, mirror.n_complex(wavelength_um), n_l)
+            cos_l = _snell_cos(n0, theta0_rad, n_l)
+            ones = be.ones_like(be.real(cos_l))
+            d = be.where(
+                reverse, ones * mirror.thickness_um, ones * layer.thickness_um
+            )
+            delta = (2 * be.pi / wavelength_um) * n_l * d * cos_l
         eta_l = _admittance(n_l, cos_l, pol)
-        delta = layer.phase_thickness(wavelength_um, cos_l, n_l)
         c = be.cos(delta)
         s = be.sin(delta)
         i = 1j

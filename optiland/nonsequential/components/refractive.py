@@ -17,7 +17,9 @@ from optiland.nonsequential import _tol
 from optiland.nonsequential._utils import resident_scalar
 from optiland.nonsequential.components.base import BaseComponent, _resident_transform
 from optiland.nonsequential.components.coating_support import (
+    coating_incident_is_front,
     evaluate_transmissive_coating,
+    from_substrate_mask,
     reject_polarized_coating,
 )
 from optiland.nonsequential.components.ledger import LedgerBooking
@@ -174,10 +176,16 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
                 so NSQ agrees with the sequential engine's coating model.
                 Must be unpolarized -- a ``BaseCoatingPolarized`` instance
                 raises ``NotImplementedError`` immediately, since NSQ rays
-                carry no polarization state.
+                carry no polarization state. A coating that describes one
+                side of the interface (a thin-film stack, a table) is
+                matched to this component's front or back once
+                (:func:`coating_support.coating_incident_is_front`), and a
+                ray arriving from its substrate side is evaluated as that
+                side sees it (the research repository's issue 83).
         """
         reject_polarized_coating(coating, surface_name=name)
         self.coating = coating
+        self._coating_side = (None, None)
         self.reset_ledger()
         super().__init__(
             cs,
@@ -188,6 +196,25 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             name,
             scatter_fraction=scatter_fraction,
         )
+        # Decided here, outside any bounce loop; re-decided only if a
+        # different coating is attached later.
+        self._coating_incident_front()
+
+    def _coating_incident_front(self) -> bool | None:
+        """Whether the coating's incident medium is this component's front.
+
+        Decided once per attached coating, on the host, when the coating is
+        first used (a Python bool the bounce loop only reads); None for a
+        side-blind coating. See
+        :func:`~optiland.nonsequential.components.coating_support.coating_incident_is_front`.
+        """
+        coating, decided = getattr(self, "_coating_side", (None, None))
+        if coating is not self.coating:
+            decided = coating_incident_is_front(
+                self.coating, self.material_front, self.material_back
+            )
+            self._coating_side = (self.coating, decided)
+        return decided
 
     def interact(
         self,
@@ -317,9 +344,13 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         # coating exposes -- see coating_support.py -- so a scalar
         # SimpleCoating and an angle-dependent UnpolarizedThinFilmCoating
         # both flow through this one call.
+        from_substrate = None
         if self.coating is not None:
+            from_substrate = from_substrate_mask(
+                self._coating_incident_front(), entering_back
+            )
             R_used, T_used = evaluate_transmissive_coating(
-                self.coating, wl, cos_theta_i
+                self.coating, wl, cos_theta_i, from_substrate=from_substrate
             )
         else:
             R_used = R_fresnel
@@ -335,6 +366,7 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             stokes = fresnel_stokes(
                 rays, dirs, normals, n1, n2, cos_theta_i, sin2_t, tir, rs, rp,
                 R_used, T_used, coating=self.coating, wavelength=wl,
+                from_substrate=from_substrate,
             )
             R_used, T_used = stokes.R_eff, stokes.T_eff
 
