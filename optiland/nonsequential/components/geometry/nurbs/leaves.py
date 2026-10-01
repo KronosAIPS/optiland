@@ -32,7 +32,18 @@ the boxes and the leaf choice are topology and are detached,
    annular sector near a pole has a small normal cone but a tangent that
    turns by 90 degrees, and an affine start guess is then poor (the CAD study
    N1 of 2026-09-25, section 5).
-4. **Per leaf:** its net, the linear map from the original block (``mu``,
+4. **Trimming** (ticket C of KronosNSRT issue 66). A patch whose loops run
+   inside its domain gets the library's trim polygons (:mod:`.trim`). A leaf
+   whose parameter box meets no polygon edge (with a margin of twice the
+   polygonisation tolerance) and whose centre lies outside the kept region is
+   wholly trimmed away and is not kept: no root on it can be a hit. Every
+   Bezier piece of such a patch gets the polygon edges a point of the piece
+   can cross (:func:`.trim.piece_edges`), cut into ``K`` equal slabs of ``v``
+   (:func:`.trim.slab_edges`) and padded to one count; the device tests each
+   lane's ``(u, v)`` against its piece's slab. A patch with no loop, or whose
+   loops all run along its domain's rectangle, is untrimmed and builds
+   exactly as before.
+5. **Per leaf:** its net, the linear map from the original block (``mu``,
    ``mv``, ``block``), its range inside its piece (``sub``) and in the patch's
    parameters (``prange``), an oriented box from the control points (the
    convex hull holds: every weight is positive), the sampled normal cone about
@@ -54,6 +65,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+from optiland.nonsequential.components.geometry.nurbs import trim as T
 
 #: Largest half-angle of a leaf's sampled normal cone [degrees].
 DEFAULT_CONE_DEG = 15.0
@@ -101,6 +114,19 @@ class LeafSet:
     patch_sign: np.ndarray  # (n_patches,) +1, or -1 for a reversed patch (outward = -S_u x S_v)
     patch_uv_bounds: np.ndarray  # (n_patches, 4) the trimmed region's box
     n_pieces: int
+    # trimming (all None / empty when no patch is trimmed inside its domain)
+    piece_uv: np.ndarray | None = None  # (n_pieces, 4) each piece's (u0, u1, v0, v1)
+    piece_trimmed: np.ndarray | None = None  # (n_pieces,) bool: the piece's patch is trimmed
+    piece_edges: np.ndarray | None = None  # (n_pieces, K, E, 4) padded polygon edges per piece and v slab
+    piece_slab: np.ndarray | None = None  # (n_pieces, 2) the slabs' v origin and 1 / height
+    patch_trimmed: np.ndarray | None = None  # (n_patches,) bool
+    trim_polygons: dict | None = None  # patch index -> [(points (k, 2), outer), ...]
+    n_dropped: int = 0  # leaves wholly in a trimmed-away region, not kept
+
+    @property
+    def trimmed(self) -> bool:
+        """Whether any patch is trimmed inside its domain."""
+        return self.piece_edges is not None
 
     @property
     def n(self) -> int:
@@ -403,8 +429,6 @@ def build_leaves(
     Raises:
         ValueError: A non-positive weight, a piece that disagrees with the
             contract, an unknown array format.
-        NotImplementedError: A patch trimmed by anything but its domain's
-            rectangle (device trimming is ticket C of KronosNSRT issue 66).
     """
     fmt = int(np.asarray(arrays.get("format", 1)))
     if fmt != 1:
@@ -428,6 +452,22 @@ def build_leaves(
     domains = np.asarray(arrays["patch_domain"], dtype=np.float64).reshape(-1, 4)
     uvb = np.asarray(arrays.get("patch_uv_bounds", domains), dtype=np.float64).reshape(-1, 4)
     has_bezier = check_pieces and "bezier_ctrl_points" in arrays
+    # trimming: which patches have loops inside their domain, and their polygons
+    patch_trimmed = np.zeros(n_p, dtype=bool)
+    polys: dict[int, list] = {}
+    edges_of: dict[int, np.ndarray] = {}
+    for i in range(n_p):
+        if int(arrays["patch_loop_offset"][i + 1]) > int(arrays["patch_loop_offset"][i]) and not (
+            _loops_on_domain_boundary(arrays, i, domains[i])
+        ):
+            patch_trimmed[i] = True
+            polys[i] = T.trim_polygons(arrays, i, uvb[i])
+            edges_of[i] = T.polygon_edges(polys[i])
+    piece_uv: list = []
+    piece_patch: list = []
+    piece_trimmed: list = []
+    piece_edge_list: list = []
+    n_dropped = 0
 
     out: dict[str, list] = {k: [] for k in (
         "net", "mu", "mv", "block", "prange", "sub", "centre", "frame", "half", "cone",
@@ -437,12 +477,11 @@ def build_leaves(
     for i in range(n_p):
         p, q = int(deg[i, 0]), int(deg[i, 1])
         nu, nv = int(nctrl[i, 0]), int(nctrl[i, 1])
-        if int(arrays["patch_loop_offset"][i + 1]) > int(arrays["patch_loop_offset"][i]):
-            if not _loops_on_domain_boundary(arrays, i, domains[i]):
-                raise NotImplementedError(
-                    f"patch {i} is trimmed inside its domain; device trimming is not built yet "
-                    "(ticket C of KronosNSRT issue 66)"
-                )
+        trimmed_i = bool(patch_trimmed[i])
+        if trimmed_i:
+            t_edges = edges_of[i]
+            t_scale = max(abs(float(x)) for x in uvb[i])
+            t_margin = 2.0 * T.trim_tolerance(uvb[i]) + 1e-12 * max(t_scale, 1.0)
         ku = np.asarray(arrays["knots_u"][int(arrays["patch_knot_u_offset"][i]) : int(arrays["patch_knot_u_offset"][i + 1])])
         kv = np.asarray(arrays["knots_v"][int(arrays["patch_knot_v_offset"][i]) : int(arrays["patch_knot_v_offset"][i + 1])])
         sl = slice(int(off[i]), int(off[i + 1]))
@@ -509,6 +548,13 @@ def build_leaves(
                     tan_ok = tan_ok and fill_ok
                     final = cone <= math.radians(cone_deg) + _ANGLE_SLACK and tan_ok
                     if final or depth >= max_depth:
+                        if trimmed_i:
+                            box = (ua + s0 * (ub - ua), ua + s1 * (ub - ua), va + r0 * (vb - va), va + r1 * (vb - va))
+                            if not T.box_meets_edges(t_edges, box, t_margin) and not bool(
+                                T.even_odd(t_edges, 0.5 * (box[0] + box[1]), 0.5 * (box[2] + box[3]))[0]
+                            ):
+                                n_dropped += 1
+                                continue
                         out["net"].append(net)
                         out["mu"].append(Mu)
                         out["mv"].append(Mv)
@@ -541,8 +587,44 @@ def build_leaves(
                         rm = 0.5 * (r0 + r1)
                         stack.append((Mu, Rsplit_v @ Mv, (s0, s1, rm, r1), depth + 1))
                         stack.append((Mu, Lsplit_v @ Mv, (s0, s1, r0, rm), depth + 1))
+                piece_uv.append((ua, ub, va, vb))
+                piece_patch.append(i)
+                piece_trimmed.append(trimmed_i)
+                piece_edge_list.append(
+                    T.piece_edges(t_edges, (ua, ub, va, vb), t_scale) if trimmed_i else np.zeros((0, 4))
+                )
                 piece_id += 1
 
+    if not out["net"]:
+        raise ValueError("every leaf of the patch set is trimmed away")
+    trim_kw: dict = {}
+    if patch_trimmed.any():
+        biggest = max(e.shape[0] for e in piece_edge_list)
+        n_slabs = int(min(T.MAX_SLABS, max(1, math.ceil(biggest / T._EDGES_PER_SLAB))))
+        slabs = []
+        slab_geo = np.zeros((piece_id, 2))
+        for k, e in enumerate(piece_edge_list):
+            ua_k, _ub_k, va_k, vb_k = piece_uv[k]
+            slab_geo[k] = (va_k, n_slabs / (vb_k - va_k))
+            if e.shape[0] == 0:
+                slabs.append([e] * n_slabs)
+            else:
+                p_scale = max(abs(float(x)) for x in uvb[int(piece_patch[k])])
+                slabs.append(T.slab_edges(e, va_k, vb_k, n_slabs, p_scale))
+        e_max = max(1, max(x.shape[0] for sl in slabs for x in sl))
+        padded = np.zeros((piece_id, n_slabs, e_max, 4))
+        for k, sl in enumerate(slabs):
+            for j, x in enumerate(sl):
+                padded[k, j, : x.shape[0]] = x
+        trim_kw = {
+            "piece_uv": np.array(piece_uv, dtype=np.float64).reshape(-1, 4),
+            "piece_trimmed": np.array(piece_trimmed, dtype=bool),
+            "piece_edges": padded,
+            "piece_slab": slab_geo,
+            "patch_trimmed": patch_trimmed,
+            "trim_polygons": polys,
+            "n_dropped": n_dropped,
+        }
     return LeafSet(
         degree=(P, Q),
         net=np.array(out["net"]), mu=np.array(out["mu"]), mv=np.array(out["mv"]),
@@ -553,4 +635,5 @@ def build_leaves(
         patch=np.array(out["patch"], dtype=np.int64),
         piece=np.array(out["piece"], dtype=np.int64), depth=np.array(out["depth"], dtype=np.int64),
         patch_sign=np.where(reversed_, -1.0, 1.0), patch_uv_bounds=uvb, n_pieces=piece_id,
+        **trim_kw,
     )
