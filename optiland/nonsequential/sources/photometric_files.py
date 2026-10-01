@@ -20,10 +20,17 @@ and the ballast-lamp photometric factor. The lateral symmetry is expanded by
 mirroring (a 90-270 degree file about its own plane, where that reader rotates
 it instead). Tilt data and photometry types A and B are refused by name.
 
-EULUMDAT files are read through the optional package ``eulumdat-py`` (import
-name ``pyldt``, MIT), which expands the file's symmetry index to the full
-C-plane matrix; the intensities, in cd per 1000 lm of lamp flux, are scaled by
-the file's conversion factor and the first lamp set's flux.
+The EULUMDAT reader is this module's own too (until 2026-10-01 it went through
+the optional package ``eulumdat-py``, absent from the engine's environments). It
+follows the format as Stockmar proposed it in 1990 and as DIALux's knowledge
+base describes it line by line ("Description of the EULUMDAT format"): 25
+header lines, the number of lamp sets and six lines per field of them, ten
+direct ratios, the C angles, the vertical angles, then the intensities in cd
+per 1000 lm, one value per line, for the C-planes ``Mc1`` to ``Mc2`` that the
+symmetry index leaves (``Isym = 3`` lists them from C = 270 through C = 0 to
+C = 90). The intensities are scaled to candela by the conversion factor and the
+first lamp set's total luminous flux, the field the format names "total
+luminous flux of lamps".
 """
 
 from __future__ import annotations
@@ -322,42 +329,162 @@ def _read_text(source) -> str:
 
 
 # ---------------------------------------------------------------------------
-# EULUMDAT, through the optional reader
+# EULUMDAT (.ldt)
 # ---------------------------------------------------------------------------
 
+#: The header lines of an EULUMDAT file before the lamp-set count (line 26).
+_LDT_HEADER_LINES = 25
 
-def read_eulumdat(path) -> PhotometricTable:
-    """Read an EULUMDAT (.ldt) file through the optional ``eulumdat-py`` package.
 
-    Intensities in the file are cd per 1000 lm of lamp flux; they are scaled by
-    the file's conversion factor and the first lamp set's flux (number of lamps
-    times lamp flux). ``pyldt`` expands the symmetry index to the full matrix.
+def _ldt_number(text: str, what: str) -> float:
+    t = text.strip().replace(",", ".")
+    m = _NUMBER.match(t)
+    if not m:
+        raise ValueError(f"EULUMDAT file: {what} is not a number: {text.strip()!r}")
+    return float(m.group(0))
+
+
+def _ldt_symmetry_source(isym: int, c: float) -> float:
+    """The C-plane a symmetric file stores for the plane ``c`` (degrees, 0..360)."""
+    c = c % 360.0
+    if isym == 0:
+        return c
+    if isym == 1:
+        return 0.0
+    if isym == 2:  # symmetric about the C0-C180 plane: I(C) = I(360 - C)
+        return c if c <= 180.0 + 1e-9 else 360.0 - c
+    if isym == 3:  # symmetric about the C90-C270 plane: I(C) = I(180 - C)
+        return c if (c >= 270.0 - 1e-9 or c <= 90.0 + 1e-9) else (180.0 - c) % 360.0
+    if isym == 4:  # both planes: fold into 0..90
+        c = c if c <= 180.0 + 1e-9 else 360.0 - c
+        return c if c <= 90.0 + 1e-9 else 180.0 - c
+    raise ValueError(f"EULUMDAT file: symmetry indicator Isym = {isym} is not 0 to 4")
+
+
+def read_eulumdat(source) -> PhotometricTable:
+    """Read an EULUMDAT (.ldt) file, natively.
+
+    The layout (one field per line): 1 the company and format identification;
+    2 ``Ityp``; 3 ``Isym``; 4 ``Mc``, the number of C-planes in 0..360; 5 ``Dc``;
+    6 ``Ng``, the number of vertical angles per plane; 7 ``Dg``; 8 to 12 the
+    report number, luminaire name and number, file name, date; 13 to 21 the
+    luminaire's and its luminous area's dimensions [mm]; 22 the downward flux
+    fraction and 23 the light output ratio [%]; 24 the conversion factor of the
+    intensities; 25 the measurement tilt [deg]; 26 ``n``, the number of lamp sets,
+    then ``n`` lines each of the number of lamps, the lamp type, the total
+    luminous flux [lm], the colour temperature, the colour rendering and the
+    system power; 27 ten direct ratios; 28 the ``Mc`` C angles; 29 the ``Ng``
+    vertical angles; 30 the intensities [cd/klm], ``Ng`` per stored plane, for
+    the planes ``Mc1`` to ``Mc2``: all (``Isym`` 0), the first (1), C0 to C180
+    (2, ``Mc/2 + 1``), C270 through C0 to C90 (3, from ``3 Mc/4 + 1``, ``Mc/2 + 1``
+    planes, the indices taken modulo ``Mc``), C0 to C90 (4, ``Mc/4 + 1``).
+
+    The table is expanded to every listed C-plane by the file's symmetry
+    (mirrors, as for IES files) and closed at 360 degrees. A decimal comma is
+    read as a point.
+
+    Args:
+        source: A path, or the file's text.
+
+    Returns:
+        The table in absolute candela: the stored values times the conversion
+        factor times the first lamp set's total flux over 1000 lm.
 
     Raises:
-        ImportError: If ``eulumdat-py`` is not installed.
+        ValueError: For a malformed file, a symmetry index outside 0..4, a
+            plane count the symmetry cannot split, or a missing value.
     """
-    try:
-        from pyldt import LdtReader  # noqa: PLC0415
-    except ImportError as err:  # pragma: no cover - depends on the environment
-        raise ImportError(
-            "EULUMDAT files are read with the optional package 'eulumdat-py' (MIT, import "
-            "name pyldt); install it, or convert the file to IES."
-        ) from err
-    ldt = LdtReader.read(str(path), expand_symmetry=True)
-    h = ldt.header
-    flux = abs(h.num_lamps[0]) * h.lamp_flux[0] if h.num_lamps and h.lamp_flux else 1000.0
-    cd = np.asarray(ldt.intensities, dtype=np.float64) * h.conv_factor * flux / 1000.0
-    c = np.asarray(h.c_angles, dtype=np.float64)
-    if c.size != cd.shape[0]:
-        c = np.arange(cd.shape[0]) * h.dc
-    if not _close(c[-1], 360.0):
-        c = np.append(c, 360.0)
-        cd = np.vstack([cd, cd[:1]])
+    text = _read_text(source)
+    lines = text.splitlines()
+    if len(lines) < _LDT_HEADER_LINES + 1:
+        raise ValueError("EULUMDAT file: fewer lines than the 26 the header takes")
+    f = [line.strip() for line in lines]
+    ityp = int(_ldt_number(f[1], "Ityp (line 2)"))
+    isym = int(_ldt_number(f[2], "Isym (line 3)"))
+    mc = int(_ldt_number(f[3], "Mc (line 4)"))
+    dc = _ldt_number(f[4], "Dc (line 5)")
+    ng = int(_ldt_number(f[5], "Ng (line 6)"))
+    dims = [_ldt_number(f[i], f"line {i + 1}") for i in range(12, 21)]
+    dff, lorl = _ldt_number(f[21], "line 22"), _ldt_number(f[22], "line 23")
+    conversion = _ldt_number(f[23], "the conversion factor (line 24)")
+    tilt = _ldt_number(f[24], "the tilt (line 25)")
+    n_sets = int(_ldt_number(f[25], "the number of lamp sets (line 26)"))
+    if mc < 1 or ng < 1 or n_sets < 1:
+        raise ValueError("EULUMDAT file: Mc, Ng and the number of lamp sets must be positive")
+    pos = _LDT_HEADER_LINES + 1
+    block = f[pos:pos + 6 * n_sets]
+    if len(block) < 6 * n_sets:
+        raise ValueError("EULUMDAT file: the lamp-set block is incomplete")
+    lamps = [_ldt_number(block[k], "a number of lamps (26a)") for k in range(n_sets)]
+    lamp_types = block[n_sets:2 * n_sets]
+    lamp_flux = [_ldt_number(block[2 * n_sets + k], "a lamp flux (26c)") for k in range(n_sets)]
+    watts = [_ldt_number(block[5 * n_sets + k], "a system power (26f)") for k in range(n_sets)]
+    pos += 6 * n_sets
+    values = []
+    for line in f[pos:]:
+        if line:
+            values += [float(t) for t in _NUMBER.findall(line.replace(",", "."))]
+    if isym == 0:
+        stored = list(range(mc))
+    elif isym == 1:
+        stored = [0]
+    elif isym in (2, 3, 4):
+        quarter = 4 if isym in (3, 4) else 2
+        if mc % quarter:
+            raise ValueError(f"EULUMDAT file: Isym = {isym} needs Mc divisible by {quarter}")
+        if isym == 2:
+            stored = list(range(mc // 2 + 1))
+        elif isym == 4:
+            stored = list(range(mc // 4 + 1))
+        else:
+            first = 3 * mc // 4
+            stored = [(first + k) % mc for k in range(mc // 2 + 1)]
+    else:
+        raise ValueError(f"EULUMDAT file: symmetry indicator Isym = {isym} is not 0 to 4")
+    need = 10 + mc + ng + len(stored) * ng
+    if len(values) < need:
+        raise ValueError(f"EULUMDAT file: {len(values)} numbers after the lamp sets where "
+                         f"{need} are needed")
+    direct_ratios = values[:10]
+    c_all = np.array(values[10:10 + mc])
+    gamma = np.array(values[10 + mc:10 + mc + ng])
+    data = np.array(values[10 + mc + ng:need]).reshape(len(stored), ng)
+    if not np.all(np.diff(c_all) > 0) or c_all[0] < 0 or c_all[-1] >= 360.0:
+        raise ValueError("EULUMDAT file: C angles must increase within 0 to 360 degrees")
+    if not np.all(np.diff(gamma) > 0) or gamma[0] < 0 or gamma[-1] > 180:
+        raise ValueError("EULUMDAT file: vertical angles must increase within 0 to 180 degrees")
+    by_angle = {round(float(c_all[i]), 9): data[k] for k, i in enumerate(stored)}
+    rows = []
+    for c in c_all:
+        src = round(_ldt_symmetry_source(isym, float(c)), 9) if isym != 1 else None
+        row = data[0] if isym == 1 else by_angle.get(src)
+        if row is None:
+            raise ValueError(
+                f"EULUMDAT file: the plane C = {c:g} maps to C = {src:g} by Isym = {isym}, "
+                "which the file does not list"
+            )
+        rows.append(row)
+    c_full = np.append(c_all, 360.0)
+    rows.append(rows[0])
+    if not _close(c_full[0], 0.0):
+        raise ValueError("EULUMDAT file: the C angles must start at 0 degrees")
+    candela = np.stack(rows) * conversion * lamp_flux[0] / 1000.0
+    length, width = dims[3], dims[4]
+    keywords = {
+        "company": f[0], "Ityp": ityp, "isym": isym, "Mc": mc, "Dc": dc, "Ng": ng,
+        "report": f[7], "luminaire_name": f[8], "luminaire_number": f[9], "file_name": f[10],
+        "date": f[11], "downward_flux_fraction_pct": dff, "light_output_ratio_pct": lorl,
+        "conversion_factor": conversion, "tilt_deg": tilt, "lamp_sets": n_sets,
+        "number_of_lamps": lamps, "lamp_types": lamp_types, "lamp_flux_lm": lamp_flux,
+        "system_power_w": watts, "direct_ratios": direct_ratios,
+    }
     return PhotometricTable(
-        c_angles_deg=c,
-        gamma_angles_deg=np.asarray(h.g_angles, dtype=np.float64),
-        candela=cd,
+        c_angles_deg=c_full,
+        gamma_angles_deg=gamma,
+        candela=candela,
         file_format="EULUMDAT",
-        keywords={"luminaire_name": h.luminaire_name, "isym": h.isym, "company": h.company},
-        luminous_opening_mm=(h.width_lum_area, h.length_lum_area, 0.0),
+        keywords=keywords,
+        # (width, length, height) as the IES convention keeps it; a circular
+        # luminous area (width 0 in the file) is a negative width, its diameter
+        luminous_opening_mm=(width if width > 0 else -length, length, dims[5]),
     )
