@@ -13,8 +13,8 @@ test against an independent route:
   ``exp(-i w t)`` matrix ``[[cos d, -i sin d / eta], [-i eta sin d, cos d]]``);
 * no conjugation beyond the critical angle of a bare interface, against the
   analytic reference's TIR phase;
-* the one case outside both conventions (a coated face beyond its critical
-  angle) is flagged, not corrected.
+* a coated face beyond its critical angle, outside both conventions until the
+  module stated one (issue 78, 2026-10-01), now against the reference.
 
 Tolerances: 1e-14 on a power term or a phase element at float64 (the module
 itself is a product of a few 2x2 complex matrices; the closed forms agree to
@@ -270,16 +270,22 @@ class TestPhaseCorrections:
             assert abs(_n(sp.xt_sin)[i] - xt.imag / abs(xt)) <= window
 
     def test_coated_face_beyond_its_critical_angle_is_flagged(self):
-        """The module's phase there matches neither convention; the adapter says so."""
+        """The module's phase there is now the reference's, and no lane is flagged.
+
+        Replaced on 2026-10-01 with the research repository's issue 78, for the
+        maintainer's approval: this test asserted the defect (phase_valid [1, 0],
+        a phase in neither convention, -34.00 against -29.22 degrees). The power
+        assertion is kept as it was.
+        """
         _configure("numpy", "float64")
         st, layers = qw_stack(1.5, 0, 2.32, 1.38, 1.0, extra=(1.38,))
         thetas = [30.0, 60.0]
         sp = _sp(st, thetas)
-        assert list(_n(sp.phase_valid)) == [1.0, 0.0]
+        assert list(_n(sp.phase_valid)) == [1.0, 1.0]
         rs, _ = characteristic_matrix(1.5, layers, complex(1.0), 60.0, "s")
         rp, _ = characteristic_matrix(1.5, layers, complex(1.0), 60.0, "p")
         ref = math.degrees(cmath.phase(rp * np.conj(rs)))
         got = math.degrees(math.atan2(_n(sp.xr_im)[1], _n(sp.xr_re)[1]))
-        assert abs(abs(got) - abs(ref)) > 1.0  # not a conjugate, not equal
+        assert abs(got - ref) < 1e-12
         # the power terms stay right: |r| = 1
         assert abs(_n(sp.Rs)[1] - 1.0) < 1e-14 and abs(_n(sp.Rp)[1] - 1.0) < 1e-14
