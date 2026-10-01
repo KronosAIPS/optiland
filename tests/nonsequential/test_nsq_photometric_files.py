@@ -257,7 +257,6 @@ LED
 
 
 def test_eulumdat_matches_the_equivalent_ies(tmp_path):
-    pytest.importorskip("pyldt")
     per_klm = PROFILE / 2.0  # cd per 1000 lm; the lamp set is 2000 lm
     rows = "\n".join(repr(float(v)) for _ in range(4) for v in per_klm)
     path = tmp_path / "fixture.ldt"
