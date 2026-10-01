@@ -28,58 +28,42 @@ if TYPE_CHECKING:
 
 Weighting = Literal["photopic", "scotopic"]
 
-# CIE 1931 2-degree photopic luminous efficiency function V(lambda), and
-# CIE 1951 scotopic V'(lambda), tabulated at 10 nm from 380-780 nm (standard
-# reference values). optiland.nonsequential uses micrometres everywhere
-# else, so wavelengths are stored in um to match.
-_PHOTOPIC_WAVELENGTHS_UM = np.arange(0.380, 0.781, 0.010)
-_PHOTOPIC_V = np.array(
-    [
-        0.0000,
-        0.0001,
-        0.0004,
-        0.0012,
-        0.0040,
-        0.0116,
-        0.0230,
-        0.0380,
-        0.0600,
-        0.0910,
-        0.1390,
-        0.2080,
-        0.3230,
-        0.5030,
-        0.7100,
-        0.8620,
-        0.9540,
-        0.9950,
-        0.9950,
-        0.9520,
-        0.8700,
-        0.7570,
-        0.6310,
-        0.5030,
-        0.3810,
-        0.2650,
-        0.1750,
-        0.1070,
-        0.0610,
-        0.0320,
-        0.0170,
-        0.0082,
-        0.0041,
-        0.0021,
-        0.0010,
-        0.00052,
-        0.00025,
-        0.00012,
-        0.00006,
-        0.00003,
-        0.000015,
-    ]
-)
 
-_SCOTOPIC_WAVELENGTHS_UM = _PHOTOPIC_WAVELENGTHS_UM
+def _photopic_table() -> tuple[np.ndarray, np.ndarray]:
+    """The CIE photopic V(lambda) at 1 nm, 380 to 780 nm, in micrometres.
+
+    V(lambda) is by definition the CIE 1931 2-degree ybar(lambda); the CIE
+    publishes both at 1 nm (CIE 15:2004 table T.4; CIE 018:2019; ISO/CIE
+    11664-1). The values are the ybar column of the engine's frozen 1 nm CIE
+    table (:mod:`optiland.colorimetry.constants`), the table the colorimetric
+    detectors read, so the two photometric routes of the engine read one
+    table (KronosNSRT issue 82; it equals the CIE 1931 1 nm ybar as
+    distributed by the Colour and Vision Research Laboratory, ciexyz31_1.csv,
+    within 2e-15 at every node). V(555 nm) = 1 exactly, so a monochromatic
+    555 nm watt is K_m lumens. The 10 nm table this replaces put 0.995 at
+    555 nm (its nodes 550 and 560 nm flank the peak).
+
+    Linear interpolation between the 1 nm nodes is the reading every caller
+    uses (``v_lambda``, the exact piecewise-linear integrals of
+    :meth:`~optiland.nonsequential.sources.spectra.PiecewiseLinearSpectrum.luminous_efficacy`).
+    """
+    from optiland.colorimetry.constants import (  # noqa: PLC0415
+        CIE_1931_2DEG,
+        WAVELENGTHS_STD,
+    )
+
+    wl_um = np.asarray(WAVELENGTHS_STD, dtype=np.float64) / 1000.0
+    v = np.asarray([row[1] for row in CIE_1931_2DEG], dtype=np.float64)
+    return wl_um, v
+
+
+# CIE photopic V(lambda) at 1 nm (see :func:`_photopic_table`), and CIE 1951
+# scotopic V'(lambda) tabulated at 10 nm from 380-780 nm (standard reference
+# values). optiland.nonsequential uses micrometres everywhere else, so
+# wavelengths are stored in um to match.
+_PHOTOPIC_WAVELENGTHS_UM, _PHOTOPIC_V = _photopic_table()
+
+_SCOTOPIC_WAVELENGTHS_UM = np.arange(0.380, 0.781, 0.010)
 _SCOTOPIC_V = np.array(
     [
         0.000589,
