@@ -70,8 +70,11 @@ class LensRenderer2D(ComponentRenderer2D):
         back_y = np.linspace(-back_r, back_r, n_pts)
 
         # Sag values in local frame
-        front_z_local = _sag_array(cfg.r1, cfg.conic1, front_y)
-        back_z_local = _sag_array(cfg.r2, cfg.conic2, back_y) + cfg.thickness
+        # The faces' own sag (conic, or conic plus polynomial for an asphere
+        # face): surfaces[0] is the front face, surfaces[1] the back face.
+        front_face, back_face = component.surfaces[0], component.surfaces[1]
+        front_z_local = _face_sag(front_face, front_y)
+        back_z_local = _face_sag(back_face, back_y) + cfg.thickness
 
         # Transform to global: apply rotation + translation (row-vector form)
         def local_to_global(
@@ -197,9 +200,11 @@ class DoubletRenderer2D(ComponentRenderer2D):
         y = np.linspace(-r, r, n_pts)
 
         # Local sags
-        z1 = _sag_array(cfg.r1, cfg.conic1, y)
-        z2 = _sag_array(cfg.r2, cfg.conic2, y) + cfg.thickness1
-        z3 = _sag_array(cfg.r3, cfg.conic3, y) + cfg.thickness1 + cfg.thickness2
+        # The faces' own sag: surfaces[0] front, [1] cemented, [2] back.
+        faces = component.surfaces
+        z1 = _face_sag(faces[0], y)
+        z2 = _face_sag(faces[1], y) + cfg.thickness1
+        z3 = _face_sag(faces[2], y) + cfg.thickness1 + cfg.thickness2
 
         def to_global(y_arr, z_arr):
             pts_local = np.stack([np.zeros_like(y_arr), y_arr, z_arr], axis=1)
@@ -291,8 +296,8 @@ class LensRenderer3D(ComponentRenderer3D):
         r_front = np.linspace(0.0, front_r, n_pts)
         r_back = np.linspace(0.0, back_r, n_pts)
 
-        z_front = _sag_array(cfg.r1, cfg.conic1, r_front)
-        z_back = _sag_array(cfg.r2, cfg.conic2, r_back) + cfg.thickness
+        z_front = _face_sag(component.surfaces[0], r_front)
+        z_back = _face_sag(component.surfaces[1], r_back) + cfg.thickness
 
         # Build contour for revolution: r along +y axis, z along optical axis
         # Contour: front face + rim + back face (reversed) + axis segment
@@ -374,9 +379,10 @@ class DoubletRenderer3D(ComponentRenderer3D):
         n_pts = 64
         rs = np.linspace(0.0, r, n_pts)
 
-        z1 = _sag_array(cfg.r1, cfg.conic1, rs)
-        z2 = _sag_array(cfg.r2, cfg.conic2, rs) + cfg.thickness1
-        z3 = _sag_array(cfg.r3, cfg.conic3, rs) + cfg.thickness1 + cfg.thickness2
+        faces = component.surfaces
+        z1 = _face_sag(faces[0], rs)
+        z2 = _face_sag(faces[1], rs) + cfg.thickness1
+        z3 = _face_sag(faces[2], rs) + cfg.thickness1 + cfg.thickness2
 
         # Element 1 contour
         y_c1 = np.concatenate([rs, [r], rs[::-1], [0.0]])
@@ -414,6 +420,44 @@ class DoubletRenderer3D(ComponentRenderer3D):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _face_sag(face, r: np.ndarray) -> np.ndarray:
+    """The sag a face's geometry kind evaluates, along a radial line [mm].
+
+    The drawing follows the surface the trace intersects: a conic face's
+    ``_sag``, and an asphere face's ``sag`` (conic plus polynomial), not the
+    base conic of the config's radius and conic constant (KronosNSRT issue
+    81). Evaluated on a detached plain-float copy of the geometry on the
+    numpy backend, whatever backend the scene uses, so a gradient-carrying
+    parameter is never touched by a plot.
+
+    Args:
+        face: A built face component (its ``geometry`` a conic or asphere kind).
+        r: Signed positions along the local y axis [mm], shape (N,); the
+            surfaces are rotationally symmetric, so the sag is that at |r|.
+
+    Returns:
+        Sag values [mm], shape (N,), float64; ``None`` for a kind with no
+        closed-form sag (a NURBS patch set), which the caller draws as before.
+    """
+    import optiland.backend as be  # noqa: PLC0415
+    from optiland.nonsequential.components.volume import (  # noqa: PLC0415
+        _detached_geometry,
+    )
+
+    geom = _detached_geometry(face.geometry)
+    if not (hasattr(geom, "sag") or hasattr(geom, "_sag")):
+        return None
+    y = np.asarray(r, dtype=np.float64)
+    x = np.zeros_like(y)
+    previous_backend = be.get_backend()
+    try:
+        be.set_backend("numpy")
+        z = geom.sag(x, y) if hasattr(geom, "sag") else geom._sag(x, y)
+    finally:
+        be.set_backend(previous_backend)
+    return np.asarray(z, dtype=np.float64)
 
 
 def _sag_array(radius: float, conic: float, r: np.ndarray) -> np.ndarray:

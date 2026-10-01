@@ -311,3 +311,107 @@ class TestVolumeIntegratesWithTracing:
         )
         result = scene.trace(num_rays=2_000, seed=1)
         assert result.detectors["D_det"].total_flux > 0.5
+
+
+# -- KronosNSRT issue 80: the rim tolerance follows the working precision ------
+
+#: The decentred, tilted singlet of the interior-gradient tests
+#: (``test_nsq_interior_gradients._LENS``): its back rim sits near z = 55 mm,
+#: where float32's spacing is 3.8e-6 mm, and the absolute 1e-6 mm tolerance
+#: refused it at float32.
+_FAR_SINGLET = {"x": 0.5, "y": -0.3, "z": 50.0, "rx": 0.01, "ry": -0.02, "rz": 0.0}
+
+
+@pytest.fixture
+def _torch_backend():
+    torch = pytest.importorskip("torch", reason="Torch not available")  # noqa: F841
+    import optiland.backend as be  # noqa: PLC0415
+
+    yield be
+    be.set_backend("numpy")
+    be.set_precision("float64")
+
+
+def _far_singlet():
+    return Lens(
+        "L",
+        CoordinateSystem(**_FAR_SINGLET),
+        LensConfig(
+            r1=60.0,
+            r2=float("inf"),
+            thickness=5.0,
+            material="N-BK7",
+            front_aperture_radius=12.0,
+        ),
+    )
+
+
+def _open_lens(cs_front, cs_back):
+    """Front and back faces with no edge: an annular gap of several mm."""
+    front = RefractiveComponent(
+        cs=cs_front,
+        geometry=ConicGeometry(50.0, 0.0, 12.5),
+        material_front=VACUUM,
+        material_back=_glass(),
+        name="front",
+    )
+    back = RefractiveComponent(
+        cs=cs_back,
+        geometry=ConicGeometry(-50.0, 0.0, 12.5),
+        material_front=_glass(),
+        material_back=VACUUM,
+        name="back",
+    )
+    return [front, back]
+
+
+class TestRimToleranceFollowsThePrecision:
+    @pytest.mark.parametrize("precision", ["float32", "float64"])
+    def test_far_singlet_is_accepted(self, _torch_backend, precision):
+        _torch_backend.set_backend("torch")
+        _torch_backend.set_precision(precision)
+        lens = _far_singlet()
+        assert len(lens._volume.boundary) == 3
+
+    @pytest.mark.parametrize("precision", ["float32", "float64"])
+    def test_open_volume_far_from_the_origin_is_refused(self, _torch_backend, precision):
+        _torch_backend.set_backend("torch")
+        _torch_backend.set_precision(precision)
+        cs_front = CoordinateSystem(**_FAR_SINGLET)
+        cs_back = CoordinateSystem(z=5.0, reference_cs=cs_front)
+        with pytest.raises(NonWatertightVolumeError, match="not watertight"):
+            Volume(name="open", boundary=_open_lens(cs_front, cs_back), interior=_glass())
+
+    def test_derived_term_scales_with_the_unit_roundoff(self, _torch_backend):
+        """The numerical term is linear in u: float32 over float64 is 2**29, up to
+        the float32 storage of the placement's own values (a relative 2**-24)."""
+        from optiland.nonsequential.components.volume import (  # noqa: PLC0415
+            _rim_error_bound,
+            _rim_local_points,
+        )
+
+        bounds = {}
+        for precision in ("float32", "float64"):
+            _torch_backend.set_backend("torch")
+            _torch_backend.set_precision(precision)
+            lens = _far_singlet()
+            bounds[precision] = [
+                _rim_error_bound(c, _rim_local_points(c)) for c in lens.surfaces
+            ]
+        for b32, b64 in zip(bounds["float32"], bounds["float64"]):
+            assert b32 / b64 == pytest.approx(2.0**29, rel=4.0 * 2.0**-24)
+
+    def test_float64_tolerance_is_the_floor(self):
+        """At float64 the derived term sits orders below the 1e-6 mm floor, so the
+        verdicts are those of the floor alone (the rule before issue 80)."""
+        import numpy as np  # noqa: PLC0415
+
+        from optiland.nonsequential.components.volume import (  # noqa: PLC0415
+            WATERTIGHT_TOL,
+            _rim_error_bound,
+            _rim_local_points,
+        )
+
+        lens = _far_singlet()
+        terms = [_rim_error_bound(c, _rim_local_points(c)) for c in lens.surfaces]
+        assert np.sqrt(3.0) * 2.0 * max(terms) < WATERTIGHT_TOL * 1e-6
