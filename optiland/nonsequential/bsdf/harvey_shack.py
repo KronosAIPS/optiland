@@ -7,6 +7,7 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
+from optiland.nonsequential._utils import refuse_gradients
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -130,6 +131,15 @@ class HarveyShackBSDF(BaseBSDF):
                 event blurs the straight-through ray instead of the
                 specular reflection.
         """
+        refuse_gradients(
+            "HarveyShackBSDF",
+            "the lobe's parameters and the reflect-or-transmit split are read as "
+            "numbers on the host",
+            b0=b0,
+            l0=l0,
+            s=s,
+            transmissive_fraction=transmissive_fraction,
+        )
         self.b0 = float(b0)
         self.l0 = float(l0)
         self.s = float(s)

@@ -7,6 +7,7 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
+from optiland.nonsequential._utils import refuse_gradients
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -64,6 +65,11 @@ class TabulatedBSDF(BaseBSDF):
                 event lands in the transmissive hemisphere rather than the
                 reflective one.
         """
+        refuse_gradients(
+            "TabulatedBSDF",
+            "the reflect-or-transmit split is read as a number on the host",
+            transmissive_fraction=transmissive_fraction,
+        )
         self.path = Path(path)
         self.transmissive_fraction = float(transmissive_fraction)
         self._load(self.path)

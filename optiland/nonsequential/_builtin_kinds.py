@@ -1236,3 +1236,8 @@ def register_all() -> None:
     _register_geometries()
     _register_bsdfs()
     _register_components()
+    # Every parameter's gradient rule (T-09-2; the research repository's
+    # chapter 09 section 9.13.3), attached to the kinds registered above.
+    from optiland.nonsequential import _builtin_gradients  # noqa: PLC0415
+
+    _builtin_gradients.apply()

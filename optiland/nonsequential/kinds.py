@@ -35,6 +35,17 @@ What a registration carries (:class:`KindSpec`)
   raise, in the research repository). ``attached="*"`` marks a built-in whose
   constructor already enforces the rule parameter by parameter
   (``as_param`` / ``as_detached_param``); a plug-in kind states its list.
+- The gradient classes, ``gradients``: for every field of the kind's config
+  (sources, detectors, components) or every argument of its constructor
+  (geometries, scatter models, spectra), one :class:`GradientRule` --
+  *attached* with its class of chapter 09 and the stage its derivative enters,
+  *detached* with the reason it is not a differentiable quantity (a count, a
+  mode, a name), or *refused* with the reason its derivative is not built.
+  The parameter register classifies a parameter from its kind's rule, and the
+  gradient rule above refuses a detached or refused field by its reason. A
+  kind registered without ``gradients`` (a plug-in that predates them) keeps
+  the ``attached`` list alone. (``docs/theory/09_differentiation.md`` section
+  9.13.3, T-09-2, in the research repository.)
 
 Plug-ins
 --------
@@ -58,7 +69,7 @@ from __future__ import annotations
 import importlib.metadata
 import warnings
 from collections.abc import Callable
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 from typing import Any
 
 from optiland._suggest import options_hint
@@ -68,6 +79,52 @@ PLUGIN_GROUP = "optiland.nonsequential"
 
 #: The families a kind can belong to.
 FAMILIES = ("source", "detector", "geometry", "bsdf", "component", "spectrum")
+
+
+#: The three kinds of gradient rule a field can carry.
+RULE_ATTACHED = "attached"
+RULE_DETACHED = "detached"
+RULE_REFUSED = "refused"
+
+
+@dataclass(frozen=True)
+class GradientRule:
+    """How one parameter of a kind takes a gradient (chapter 09 section 9.13.3).
+
+    Attributes:
+        rule: ``"attached"``, ``"detached"`` or ``"refused"``.
+        gradient_class: For an attached field, its class of chapter 09
+            (``"interior"``, ``"interior+boundary"``, ``"boundary-only"``);
+            ``"detached"`` otherwise.
+        text: For an attached field, the stage its derivative enters; for a
+            detached or refused one, the reason.
+    """
+
+    rule: str
+    gradient_class: str
+    text: str
+
+    @property
+    def is_attached(self) -> bool:
+        """True when a gradient-carrying value is kept and registered."""
+        return self.rule == RULE_ATTACHED
+
+
+def attached(gradient_class: str, stage: str) -> GradientRule:
+    """An attached field: its class of chapter 09 and the stage its derivative enters."""
+    if gradient_class not in ("interior", "interior+boundary", "boundary-only"):
+        raise ValueError(f"not a class of an attached field: {gradient_class!r}")
+    return GradientRule(RULE_ATTACHED, gradient_class, stage)
+
+
+def detached(reason: str) -> GradientRule:
+    """A field that is not a differentiable quantity (a count, a mode, a name)."""
+    return GradientRule(RULE_DETACHED, "detached", reason)
+
+
+def refused(reason: str) -> GradientRule:
+    """A differentiable quantity whose derivative is not built."""
+    return GradientRule(RULE_REFUSED, "detached", reason)
 
 
 @dataclass(frozen=True)
@@ -100,6 +157,8 @@ class KindSpec:
         accept_subclasses: Whether an unregistered subclass of ``cls`` is
             handled by this spec.
         description: One line for listings and error messages.
+        gradients: Every parameter's :class:`GradientRule`, by field or
+            argument name, or ``None`` (the kind states ``attached`` only).
     """
 
     family: str
@@ -114,6 +173,7 @@ class KindSpec:
     ir_kind: str | None = None
     accept_subclasses: bool = False
     description: str = ""
+    gradients: Any = None
 
     @property
     def lowered_kind(self) -> str:
@@ -191,6 +251,30 @@ class KindRegistry:
             del self._by_cls[spec.cls]
         if spec.config_cls is not None and self._by_config.get(spec.config_cls) is spec:
             del self._by_config[spec.config_cls]
+
+    def set_gradients(self, name: str, gradients: Any) -> KindSpec:
+        """Give kind ``name`` its gradient rules, in place (its order kept).
+
+        Args:
+            name: A registered kind of this family.
+            gradients: ``{field or argument name: GradientRule}``.
+
+        Returns:
+            The updated spec.
+
+        Raises:
+            KeyError: If no such kind is registered.
+        """
+        old = self._by_name.get(name)
+        if old is None:
+            raise KeyError(f"No {self.family} kind {name!r} is registered.")
+        spec = replace(old, gradients=dict(gradients))
+        self._by_name[name] = spec
+        if self._by_cls.get(old.cls) is old:
+            self._by_cls[old.cls] = spec
+        if old.config_cls is not None and self._by_config.get(old.config_cls) is old:
+            self._by_config[old.config_cls] = spec
+        return spec
 
     def unregister(self, name: str) -> None:
         """Remove kind ``name`` (tests and plug-in reloads use this).
@@ -314,7 +398,27 @@ class KindRegistry:
             NotImplementedError: If a field holds a tensor with
                 ``requires_grad`` and is not in ``spec.attached``.
         """
-        if spec.attached == "*" or not is_dataclass(config):
+        if not is_dataclass(config):
+            return
+        if spec.gradients is not None:
+            for f in fields(config):
+                value = getattr(config, f.name)
+                if not (is_tensor(value) and value.requires_grad):
+                    continue
+                rule = spec.gradients.get(f.name)
+                if rule is not None and rule.is_attached:
+                    continue
+                why = "it has no gradient rule" if rule is None else f"{rule.rule}: {rule.text}"
+                raise NotImplementedError(
+                    f"{self.family.capitalize()} kind {spec.name!r}: the field "
+                    f"{f.name!r} carries a gradient, but the kind does not "
+                    f"declare it attached ({why}), so the gradient would be "
+                    f"silently dropped. Pass a plain float for {f.name!r}. "
+                    "Attached fields of this kind: "
+                    f"{', '.join(k for k, r in spec.gradients.items() if r.is_attached) or 'none'}."
+                )
+            return
+        if spec.attached == "*":
             return
         for f in fields(config):
             value = getattr(config, f.name)
@@ -391,6 +495,7 @@ def register_source(
     attached: tuple[str, ...] | str = (),
     overwrite: bool = False,
     description: str = "",
+    gradients: Any = None,
 ) -> KindSpec:
     """Register a source kind.
 
@@ -406,7 +511,7 @@ def register_source(
     return _register(
         "source", name, cls, overwrite, config_cls=config_cls, build=build,
         to_dict=to_dict, from_dict=from_dict, lower=lower, attached=attached,
-        description=description,
+        description=description, gradients=gradients,
     )
 
 
@@ -423,6 +528,7 @@ def register_detector(
     overwrite: bool = False,
     accept_subclasses: bool = False,
     description: str = "",
+    gradients: Any = None,
 ) -> KindSpec:
     """Register a detector kind.
 
@@ -436,7 +542,7 @@ def register_detector(
     return _register(
         "detector", name, cls, overwrite, config_cls=config_cls, build=build,
         to_dict=to_dict, from_dict=from_dict, lower=lower, attached=attached,
-        accept_subclasses=accept_subclasses, description=description,
+        accept_subclasses=accept_subclasses, description=description, gradients=gradients,
     )
 
 
@@ -449,6 +555,7 @@ def register_geometry(
     accept_subclasses: bool = False,
     overwrite: bool = False,
     description: str = "",
+    gradients: Any = None,
 ) -> KindSpec:
     """Register a geometry kind: a
     :class:`~optiland.nonsequential.components.geometry.base.ComponentGeometry`
@@ -456,7 +563,7 @@ def register_geometry(
     calls) and its IR params."""
     return _register(
         "geometry", name, cls, overwrite, lower=lower, ir_kind=ir_kind,
-        accept_subclasses=accept_subclasses, description=description,
+        accept_subclasses=accept_subclasses, description=description, gradients=gradients,
     )
 
 
@@ -468,13 +575,14 @@ def register_bsdf(
     accept_subclasses: bool = False,
     overwrite: bool = False,
     description: str = "",
+    gradients: Any = None,
 ) -> KindSpec:
     """Register a scatter kind: a
     :class:`~optiland.nonsequential.bsdf.base.BaseBSDF` subclass and its IR
     params."""
     return _register(
         "bsdf", name, cls, overwrite, lower=lower,
-        accept_subclasses=accept_subclasses, description=description,
+        accept_subclasses=accept_subclasses, description=description, gradients=gradients,
     )
 
 
@@ -489,6 +597,7 @@ def register_component(
     attached: tuple[str, ...] | str = (),
     overwrite: bool = False,
     description: str = "",
+    gradients: Any = None,
 ) -> KindSpec:
     """Register a compound-component kind.
 
@@ -499,7 +608,7 @@ def register_component(
     return _register(
         "component", name, cls, overwrite, config_cls=config_cls, build=build,
         to_dict=to_dict, from_dict=from_dict, attached=attached,
-        description=description,
+        description=description, gradients=gradients,
     )
 
 
@@ -512,6 +621,7 @@ def register_spectrum(
     *,
     overwrite: bool = False,
     description: str = "",
+    gradients: Any = None,
 ) -> KindSpec:
     """Register a spectrum kind (the source's wavelength distribution).
 
@@ -520,7 +630,7 @@ def register_spectrum(
     """
     return _register(
         "spectrum", name, cls, overwrite, to_dict=to_dict, from_dict=from_dict,
-        lower=lower, description=description,
+        lower=lower, description=description, gradients=gradients,
     )
 
 

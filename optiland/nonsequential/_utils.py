@@ -131,6 +131,32 @@ def as_attachable_param(value: ScalarOrArrayT) -> Any:
     return float(value)
 
 
+def refuse_gradients(owner: str, reason: str, **values: Any) -> None:
+    """Raise if any of ``values`` carries a derivative (a gradient or a forward-mode tangent).
+
+    For constructor arguments that the constructor reads as plain numbers
+    (``float()``, ``int()``) and whose kind declares them detached or refused
+    (:mod:`optiland.nonsequential._builtin_gradients`): reading a tensor that
+    carries a derivative as a number would drop the derivative without a word,
+    which the research repository's chapter 09 R-09-5 forbids.
+
+    Args:
+        owner: The class name, for the message.
+        reason: Why the arguments carry no gradient.
+        **values: The arguments, by name.
+
+    Raises:
+        NotImplementedError: Naming the first argument that carries one.
+    """
+    for name, value in values.items():
+        if _carries_derivative(value):
+            raise NotImplementedError(
+                f"{owner}.{name} cannot carry a gradient: {reason}, so the "
+                f"gradient would be silently dropped. Pass a plain number for "
+                f"'{name}'."
+            )
+
+
 def host_float(value: Any) -> float:
     """The float value of a parameter that :func:`as_attachable_param` may have kept as a tensor."""
     if is_tensor(value):

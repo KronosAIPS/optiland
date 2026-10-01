@@ -67,10 +67,17 @@ Gradient classes (chapter 09 sections 9.2, 9.3 and 9.7):
     finite plane's width and height, an annulus' radii. Its pathwise gradient
     is structurally zero; if it reaches no output it is dead by contract.
 ``detached``
-    Detached by contract (chapter 09 R-09-2): source sampling geometry until
-    its change of variables lands (R-09-4). The constructors of those kinds
-    refuse a gradient-carrying value today, so the class is listed in
-    :data:`CONTRACT` and seldom meets a live tensor.
+    Detached by contract (chapter 09 R-09-2): a parameter whose kind declares
+    it detached or refused (:mod:`optiland.nonsequential._builtin_gradients`).
+    The kinds' constructors and the scene builder refuse a gradient-carrying
+    value for such a field, so the register meets one only when a value was
+    set after construction; it raises if no output depends on it.
+
+The class of a source's, a detector's, a geometry's or a scatter model's
+parameter is read from the rule its registered kind declares (T-09-2,
+chapter 09 section 9.13.3); the name tables below are the fallback for a
+surface's own coefficients, materials, coatings and kinds registered without
+rules.
 
 Forward mode: a dual tensor of ``torch.autograd.forward_ad`` counts as a
 parameter to attach, so its tangent reaches the outputs (the cross-check of
@@ -177,7 +184,10 @@ _GEOMETRY_EXTENT = {"width", "height"}
 #: points and directions is exact on the interior, and moving the emitted rays
 #: moves them across every downstream edge as a placement does (the boundary
 #: term, absent). A truncated Gaussian's sigma (and its radius, the truncation
-#: edge) stays detached: its constructor refuses a gradient-carrying value.
+#: edge) is refused by its constructor unless the beam is built with
+#: profile_gradient="implicit" (chapter 09 section 9.13.1); this table is the
+#: fallback for a source whose kind declares no rules, and the built-in kinds'
+#: rules (:mod:`optiland.nonsequential._builtin_gradients`) take precedence.
 _SOURCE_CONTRACT: dict[str, tuple[str, str]] = {
     "aperture_radius": (
         INTERIOR_BOUNDARY,
@@ -680,9 +690,50 @@ def attach_source_geometry(rays: NSQRayBundle, source) -> NSQRayBundle:
 # ---------------------------------------------------------------------------
 
 
+def _kind_rule(family: str, obj: Any, name: str):
+    """The gradient rule ``obj``'s registered kind declares for ``name``, or None.
+
+    The kind is looked up as the lowering does (the nearest registered
+    ancestor of the object's class); a kind registered without rules, an
+    object of no registered kind, or a name the kind does not declare gives
+    None, and the caller falls back to the name table.
+    """
+    from optiland.nonsequential import kinds  # noqa: PLC0415
+
+    try:
+        spec = kinds.registry(family).for_object(obj, any_ancestor=True)
+    except TypeError:
+        return None
+    rules = getattr(spec, "gradients", None)
+    return None if rules is None else rules.get(name)
+
+
 def _classify(kind: str, path: str, obj: Any = None) -> tuple[str, str]:
-    """The gradient class and stage of a non-placement parameter at ``path``."""
+    """The gradient class and stage of a non-placement parameter at ``path``.
+
+    T-09-2 (chapter 09 section 9.13.3): the class is read from the rule the
+    owner's registered kind declares -- a source's or a detector's own
+    fields, a surface's geometry (``geometry.<argument>``) and its scatter
+    model (``bsdf.<argument>``). An attached rule gives its class and stage; a
+    detached or refused one gives the class ``detached`` with its reason (the
+    constructor refuses such a value, so the register meets one only when a
+    value was set after construction). A surface's own coefficients (a
+    mirror's reflectance), its materials and coatings are not kinds of a
+    family; they, and kinds registered without rules, keep the name table.
+    """
     leaf = path.rsplit(".", 1)[-1]
+    rule = None
+    if obj is not None:
+        parts = path.split(".")
+        if kind in ("source", "detector") and len(parts) == 1:
+            rule = _kind_rule(kind, obj, leaf)
+        elif kind == "surface" and len(parts) == 2 and parts[0] in ("geometry", "bsdf"):
+            family = "geometry" if parts[0] == "geometry" else "bsdf"
+            rule = _kind_rule(family, getattr(obj, parts[0], None), leaf)
+    if rule is not None:
+        if rule.is_attached:
+            return rule.gradient_class, rule.text
+        return DETACHED, f"{rule.rule} by its kind: {rule.text}"
     if kind == "source" and leaf in _SOURCE_CONTRACT:
         return _SOURCE_CONTRACT[leaf]
     if kind == "detector" and leaf in _DETECTOR_CONTRACT:
