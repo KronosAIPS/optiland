@@ -36,7 +36,10 @@ String catalog names (e.g. ``'N-BK7'``) round-trip as strings.
 :class:`~optiland.nonsequential.materials.nsq_material.NSQMaterial` instances
 with an underlying optiland material round-trip via the catalog name stored on
 the material object.  NSQMaterial vacuum (``optiland_material=None``) is
-serialized as ``null``.
+serialized as ``null``.  A material taken from a record of the shared material
+library (:class:`~optiland.nonsequential.materials.record_material.RecordMaterial`)
+round-trips as ``{"type": "record", "record": <nsq-material-record/1 mapping>}``:
+its model, its band, and the record's identity key and content hash.
 
 Not serialized
 --------------
@@ -192,6 +195,7 @@ def _serialize_material(mat: str | NSQMaterial | None) -> Any:
     - ``None`` or vacuum NSQMaterial -> ``null``
     - string catalog name -> that string
     - NSQMaterial with optiland_material -> ``{"type": "catalog", "name": ...}``
+    - NSQMaterial over a library record -> ``{"type": "record", "record": ...}``
 
     Args:
         mat: Material to serialize; may be a catalog name string, an
@@ -220,6 +224,14 @@ def _serialize_material(mat: str | NSQMaterial | None) -> Any:
             return None  # vacuum
         # Try to recover the catalog name from the underlying material
         underlying = mat.optiland_material
+        from optiland.nonsequential.materials.record_material import (  # noqa: PLC0415
+            RecordMaterial,
+        )
+
+        if isinstance(underlying, RecordMaterial):
+            # A library record round-trips as its own data: the model, the
+            # band, and the record's identity key and content hash.
+            return {"type": "record", "record": underlying.to_mapping()}
         glass_name = getattr(underlying, "name", None) or getattr(
             underlying, "_name", None
         )
@@ -234,7 +246,7 @@ def _serialize_material(mat: str | NSQMaterial | None) -> Any:
     raise TypeError(f"Unrecognised material type: {type(mat).__name__}")
 
 
-def _deserialize_material(d: Any) -> str | None:
+def _deserialize_material(d: Any) -> str | NSQMaterial | None:
     """Reconstruct a material from a serialized value.
 
     Args:
@@ -242,7 +254,7 @@ def _deserialize_material(d: Any) -> str | None:
 
     Returns:
         String catalog name (which ``add_lens`` etc. resolve at build time),
-        or ``None`` for vacuum.
+        an ``NSQMaterial`` for a library record, or ``None`` for vacuum.
     """
     if d is None:
         return None
@@ -250,6 +262,12 @@ def _deserialize_material(d: Any) -> str | None:
         return d
     if isinstance(d, dict) and d.get("type") == "catalog":
         return d["name"]  # scene builder resolves via NSQMaterial.from_glass
+    if isinstance(d, dict) and d.get("type") == "record":
+        from optiland.nonsequential.materials.nsq_material import (  # noqa: PLC0415
+            NSQMaterial,
+        )
+
+        return NSQMaterial.from_record(d["record"])
     raise ValueError(f"Cannot deserialize material: {d!r}")
 
 

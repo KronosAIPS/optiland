@@ -105,6 +105,35 @@ class NSQMaterial:
             ) from exc
         return cls(optiland_material=mat)
 
+    @classmethod
+    def from_record(cls, record, *, extrapolate: bool = False) -> NSQMaterial:
+        """The material of a library record, or of its ``nsq-material-record/1`` mapping.
+
+        The engine's way in for every material of the shared material library
+        (research repository issue 87): ``record`` is a ``kmat.MaterialRecord``
+        (read by duck typing; the engine does not import the library) or the
+        plain mapping :mod:`optiland.nonsequential.materials.record_material`
+        defines. See :class:`~optiland.nonsequential.materials.record_material.RecordMaterial`.
+
+        Args:
+            record: A library record or its mapping.
+            extrapolate: Read past the record's stated band (the library refuses
+                by default, and so does the engine).
+
+        Returns:
+            NSQMaterial wrapping a ``RecordMaterial``.
+        """
+        from optiland.nonsequential.materials.record_material import (  # noqa: PLC0415
+            RecordMaterial,
+        )
+
+        if isinstance(record, dict):
+            mapping = dict(record)
+            if extrapolate:
+                mapping["extrapolate"] = True
+            return cls(optiland_material=RecordMaterial(mapping))
+        return cls(optiland_material=RecordMaterial.from_kmat(record, extrapolate=extrapolate))
+
     def reset_memo(self) -> None:
         """Clear the identity memo of both ``n()`` and ``k()``.
 

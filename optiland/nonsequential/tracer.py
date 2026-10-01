@@ -104,6 +104,13 @@ class SimulationResult:
             record of a scalar run says what its numbers assume; until then
             a key saying only ``"off"`` would add a field to every existing
             record without saying anything more than its absence does.
+            ``materials`` is present only when a medium of the scene came
+            from a record of the shared material library
+            (:class:`~optiland.nonsequential.materials.record_material.RecordMaterial`,
+            research repository issue 87): one row per such medium with the
+            library and its version, the record's name, variant, identity key
+            and content hash, the model kinds and the band, so a result says
+            which page it traced. Absent otherwise, by the same rule.
     """
 
     detectors: dict[str, object] = field(default_factory=dict)
