@@ -25,10 +25,10 @@ Conventions (stated here once, at the API boundary; R-06-1)
   ``r_p = (n2 cos_i - n1 cos_t) / (n2 cos_i + n1 cos_t)``. This is the
   convention of the catalogue's analytic reference (its
   ``fresnel_amplitude_rs_rp``): beyond the critical angle at 1.5 -> 1.0 and
-  45 degrees, ``arg(r_p r_s*) = -36.8699`` degrees. Section 6.1 of the
-  research repository's theory chapter 06 prints the same magnitudes with the
-  opposite sign, which is the other time convention; the chapter does not
-  state its own, and the catalogue grades against the analytic module.
+  45 degrees, ``arg(r_p r_s*) = -36.8699`` degrees. The research repository's
+  theory chapter 06 states it in section 6.0 since 2026-10-01 (its issues 73
+  and 78; section 6.1 printed the other sign until then), and the fork's
+  thin-film module is in it too.
 * **Frame rotation.** Turning the reference axis from ``e`` to ``a`` (both
   perpendicular to ``k``) by the angle ``psi`` measured about ``k`` applies
   ``M_rot(psi)`` of chapter 06 section 6.5: ``q' = cos2psi q + sin2psi u``,
