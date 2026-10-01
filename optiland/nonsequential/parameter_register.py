@@ -67,16 +67,26 @@ Gradient classes (chapter 09 sections 9.2, 9.3 and 9.7):
     finite plane's width and height, an annulus' radii. Its pathwise gradient
     is structurally zero; if it reaches no output it is dead by contract.
 ``detached``
-    Detached by contract (chapter 09 R-09-2): source sampling geometry until
-    its change of variables lands (R-09-4). The constructors of those kinds
-    refuse a gradient-carrying value today, so the class is listed in
-    :data:`CONTRACT` and seldom meets a live tensor.
+    Detached by contract (chapter 09 R-09-2): a parameter whose kind declares
+    it detached or refused (:mod:`optiland.nonsequential._builtin_gradients`).
+    The kinds' constructors and the scene builder refuse a gradient-carrying
+    value for such a field, so the register meets one only when a value was
+    set after construction; it raises if no output depends on it.
+
+The class of a source's, a detector's, a geometry's or a scatter model's
+parameter is read from the rule its registered kind declares (T-09-2,
+chapter 09 section 9.13.3); the name tables below are the fallback for a
+surface's own coefficients, materials, coatings and kinds registered without
+rules.
 
 Forward mode: a dual tensor of ``torch.autograd.forward_ad`` counts as a
 parameter to attach, so its tangent reaches the outputs (the cross-check of
-R-09-9); the dead-parameter check covers reverse-mode entries only. The
-functional transforms of ``torch.func`` (``jvp``, ``grad``) are not supported:
-the host build reads the placement's value, which their wrapped tensors refuse.
+R-09-9); the dead-parameter check covers reverse-mode entries only.
+``torch.func.jvp`` works the same way: its argument is a forward-mode dual
+inside the transform, the host builds read its value through
+:func:`optiland.backend.utils.to_numpy` (which reads a value inside a
+``torch.func`` transform), and its tangent equals ``forward_ad``'s to the bit
+(the research repository's chapter 09 section 9.13.5).
 
 Nothing in this module runs when no tensor in the scene requires a gradient:
 the register is empty, :func:`attach_placement` returns the host transform it
@@ -186,7 +196,10 @@ _GEOMETRY_EXTENT = {"width", "height"}
 #: points and directions is exact on the interior, and moving the emitted rays
 #: moves them across every downstream edge as a placement does (the boundary
 #: term, absent). A truncated Gaussian's sigma (and its radius, the truncation
-#: edge) stays detached: its constructor refuses a gradient-carrying value.
+#: edge) is refused by its constructor unless the beam is built with
+#: profile_gradient="implicit" (chapter 09 section 9.13.1); this table is the
+#: fallback for a source whose kind declares no rules, and the built-in kinds'
+#: rules (:mod:`optiland.nonsequential._builtin_gradients`) take precedence.
 _SOURCE_CONTRACT: dict[str, tuple[str, str]] = {
     "aperture_radius": (
         INTERIOR_BOUNDARY,
@@ -254,6 +267,12 @@ class RegisteredParameter:
         stage: Where its gradient path enters the trace.
         also_owned_by: Other owners that hold the same tensor (a lens's
             front and edge share one coordinate system).
+        structural_zero: Why the interior derivative of every output with
+            respect to it is zero by structure, or ``None``. Set for a
+            parameter whose every owner ends every ray that reaches it (an
+            absorbing surface: an occluder, a baffle, a stop); its whole
+            derivative is a boundary term (chapter 09 section 9.13.4), and the
+            trace raises on it rather than return that zero.
     """
 
     owner: str
@@ -263,6 +282,7 @@ class RegisteredParameter:
     gradient_class: str
     stage: str
     also_owned_by: list[str] = field(default_factory=list)
+    structural_zero: str | None = None
 
     @property
     def boundary_term(self) -> str:
@@ -282,6 +302,7 @@ class RegisteredParameter:
             "stage": self.stage,
             "shape": tuple(getattr(self.tensor, "shape", ())),
             "also_owned_by": list(self.also_owned_by),
+            "structural_zero": self.structural_zero,
         }
 
 
@@ -401,9 +422,41 @@ def device_transform(cs, like):
     return t_ref + R_ref @ t, R_ref @ R
 
 
+#: The state of a running :func:`entry_split`, or None (the default: every
+#: tangent is kept whole).
+_ENTRY_SPLIT: dict | None = None
+
+
 def _tangent_only(x):
-    """``x - sg(x)``: exactly zero in value, the derivative of ``x`` in the graph."""
-    return x - x.detach()
+    """``x - sg(x)``: exactly zero in value, the derivative of ``x`` in the graph.
+
+    Every attached tangent of the trace passes here once, in the order the
+    trace attaches them, so this is where :func:`entry_split` numbers the
+    entry elements (chapter 09 section 9.13.6) and keeps one at a time. With
+    no split running it is the bare expression.
+    """
+    d = x - x.detach()
+    state = _ENTRY_SPLIT
+    if state is None:
+        return d
+    call = state["call"]
+    state["call"] += 1
+    if state["keep"] is None:
+        from torch.autograd import forward_ad  # noqa: PLC0415
+
+        tangent = forward_ad.unpack_dual(x).tangent
+        if tangent is not None:
+            flat = tangent.reshape(-1)
+            state["live"].extend(
+                (call, e, tuple(x.shape)) for e in range(x.numel()) if flat[e] != 0
+            )
+        return d
+    import torch  # noqa: PLC0415
+
+    mask = torch.zeros(x.numel(), dtype=x.dtype, device=x.device)
+    if state["keep"][0] == call:
+        mask[state["keep"][1]] = 1.0
+    return d * mask.reshape(x.shape)
 
 
 def attach_placement(cs, translation, rotation):
@@ -478,7 +531,49 @@ def attach_source_placement(rays: NSQRayBundle, source) -> NSQRayBundle:
 
 
 #: The source-geometry fields :func:`attach_source_geometry` attaches.
-SOURCE_GEOMETRY_FIELDS = ("aperture_radius", "width", "height", "half_angle_deg")
+SOURCE_GEOMETRY_FIELDS = ("aperture_radius", "width", "height", "half_angle_deg", "gaussian_sigma")
+
+
+def truncated_gaussian_tangents(r2, sigma: float, radius: float):
+    """The relative tangents of a truncated Gaussian beam's radial coordinate.
+
+    The beam's radial distribution is ``F(r) = (1 - exp(-a)) / (1 - exp(-A))``
+    with ``a = r**2 / (2 sigma**2)`` and ``A = R**2 / (2 sigma**2)``. Held at a
+    fixed ``u = F(r)``, ``r`` is a smooth function of ``sigma`` and ``R``,
+    and its derivative is the implicit one, ``-dF/dtheta / (dF/dr)``
+    (chapter 09 section 9.13.1 of the research repository)::
+
+        dr/dsigma = r / sigma - R**2 Q / (sigma r),   dr/dR = R Q / r,
+        Q = exp(a - A) (1 - exp(-a)) / (1 - exp(-A))
+
+    This returns ``(dr/dsigma) / r`` and ``(dr/dR) / r``, written with
+    ``G = Q / r**2``, which is finite at ``r = 0`` (``exp(-A) / (2 sigma**2
+    (1 - exp(-A)))``), so the tangent of an emission point is ``p_l`` times
+    a finite factor. Every exponential is evaluated as ``exp(a - A)`` or
+    ``expm1`` of a non-positive argument, so nothing overflows or cancels
+    for ``0 <= a <= A``.
+
+    Args:
+        r2: ``x_l**2 + y_l**2`` of each emission point, a tensor (N,).
+        sigma: The beam's sigma [mm], a float.
+        radius: Its truncation radius ``R`` [mm], a float.
+
+    Returns:
+        ``(rel_sigma, rel_radius)``, tensors (N,) in ``r2``'s dtype.
+    """
+    import torch  # noqa: PLC0415
+
+    two_s2 = 2.0 * sigma * sigma
+    big_a = radius * radius / two_s2
+    a = r2 / two_s2
+    positive = a > 0
+    safe_a = torch.where(positive, a, torch.ones_like(a))
+    # (1 - exp(-a)) / a, which is 1 at a = 0
+    ratio = torch.where(positive, -torch.expm1(-safe_a) / safe_a, torch.ones_like(a))
+    g = torch.exp(a - big_a) * ratio / (two_s2 * -float(np.expm1(-big_a)))
+    rel_sigma = 1.0 / sigma - (radius * radius / sigma) * g
+    rel_radius = radius * g
+    return rel_sigma, rel_radius
 
 
 def source_geometry_is_attached(source) -> bool:
@@ -563,8 +658,34 @@ def attach_source_geometry(rays: NSQRayBundle, source) -> NSQRayBundle:
             return None
         return _tangent_only(_scalar_like(value, p_local)) / host_float(value)
 
+    def abs_tangent(name):
+        value = getattr(source, name, None)
+        if not _requires_grad(value):
+            return None
+        return _tangent_only(_scalar_like(value, p_local))
+
     radius = getattr(source, "aperture_radius", None)
-    if radius is not None:
+    if getattr(source, "profile", None) == "gaussian":
+        # The truncated Gaussian beam: the implicit reparameterisation of its
+        # radial distribution (chapter 09 section 9.13.1). A sigma that was
+        # not given follows the radius, sigma = R / 2.
+        d_radius = abs_tangent("aperture_radius")
+        d_sigma = abs_tangent("gaussian_sigma")
+        if d_radius is not None and getattr(source, "_sigma_follows_radius", False):
+            d_sigma = d_radius * 0.5 if d_sigma is None else d_sigma + d_radius * 0.5
+        if d_radius is not None or d_sigma is not None:
+            r2 = p_local[:, 0] * p_local[:, 0] + p_local[:, 1] * p_local[:, 1]
+            rel_sigma, rel_radius = truncated_gaussian_tangents(
+                r2, host_float(source.gaussian_sigma), host_float(radius)
+            )
+            rel = torch.zeros_like(r2)
+            if d_sigma is not None:
+                rel = rel + rel_sigma * d_sigma
+            if d_radius is not None:
+                rel = rel + rel_radius * d_radius
+            dp = dp + p_local * torch.stack([rel, rel, torch.zeros_like(rel)], dim=1)
+            touched = True
+    elif radius is not None:
         da = rel_tangent("aperture_radius")
         if da is not None:
             dp = dp + p_local * torch.stack([da, da, torch.zeros_like(da)])
@@ -580,7 +701,7 @@ def attach_source_geometry(rays: NSQRayBundle, source) -> NSQRayBundle:
             touched = True
 
     alpha = getattr(source, "half_angle_deg", None)
-    lambertian = hasattr(source, "width") and host_float(alpha) >= 90.0
+    lambertian = alpha is not None and hasattr(source, "width") and host_float(alpha) >= 90.0
     if alpha is not None and _requires_grad(alpha) and not lambertian:
         cos_a_host = float(np.cos(np.radians(host_float(alpha))))
         cos_a = torch.cos(_scalar_like(alpha, p_local) * (np.pi / 180.0))
@@ -613,9 +734,50 @@ def attach_source_geometry(rays: NSQRayBundle, source) -> NSQRayBundle:
 # ---------------------------------------------------------------------------
 
 
-def _classify(kind: str, path: str) -> tuple[str, str]:
-    """The gradient class and stage of a non-placement parameter at ``path``."""
+def _kind_rule(family: str, obj: Any, name: str):
+    """The gradient rule ``obj``'s registered kind declares for ``name``, or None.
+
+    The kind is looked up as the lowering does (the nearest registered
+    ancestor of the object's class); a kind registered without rules, an
+    object of no registered kind, or a name the kind does not declare gives
+    None, and the caller falls back to the name table.
+    """
+    from optiland.nonsequential import kinds  # noqa: PLC0415
+
+    try:
+        spec = kinds.registry(family).for_object(obj, any_ancestor=True)
+    except TypeError:
+        return None
+    rules = getattr(spec, "gradients", None)
+    return None if rules is None else rules.get(name)
+
+
+def _classify(kind: str, path: str, obj: Any = None) -> tuple[str, str]:
+    """The gradient class and stage of a non-placement parameter at ``path``.
+
+    T-09-2 (chapter 09 section 9.13.3): the class is read from the rule the
+    owner's registered kind declares -- a source's or a detector's own
+    fields, a surface's geometry (``geometry.<argument>``) and its scatter
+    model (``bsdf.<argument>``). An attached rule gives its class and stage; a
+    detached or refused one gives the class ``detached`` with its reason (the
+    constructor refuses such a value, so the register meets one only when a
+    value was set after construction). A surface's own coefficients (a
+    mirror's reflectance), its materials and coatings are not kinds of a
+    family; they, and kinds registered without rules, keep the name table.
+    """
     leaf = path.rsplit(".", 1)[-1]
+    rule = None
+    if obj is not None:
+        parts = path.split(".")
+        if kind in ("source", "detector") and len(parts) == 1:
+            rule = _kind_rule(kind, obj, leaf)
+        elif kind == "surface" and len(parts) == 2 and parts[0] in ("geometry", "bsdf"):
+            family = "geometry" if parts[0] == "geometry" else "bsdf"
+            rule = _kind_rule(family, getattr(obj, parts[0], None), leaf)
+    if rule is not None:
+        if rule.is_attached:
+            return rule.gradient_class, rule.text
+        return DETACHED, f"{rule.rule} by its kind: {rule.text}"
     if kind == "source" and leaf in _SOURCE_CONTRACT:
         return _SOURCE_CONTRACT[leaf]
     if kind == "detector" and leaf in _DETECTOR_CONTRACT:
@@ -716,12 +878,32 @@ class ParameterRegister:
             by_id[id(tensor)] = entry
             entries.append(entry)
 
+        terminal: set[str] = set()
         for owner, kind, obj in _scene_objects(scene):
+            if kind == "surface" and getattr(obj, "terminates_rays", False):
+                terminal.add(owner)
             for path, tensor in placement_tensors(getattr(obj, "cs", None)):
                 add(owner, kind, path, tensor, INTERIOR_BOUNDARY, _PLACEMENT_STAGE[kind])
             for path, tensor in _walk(obj, "", 0, set()):
-                klass, stage = _classify(kind, path)
+                klass, stage = _classify(kind, path, obj)
                 add(owner, kind, path, tensor, klass, stage)
+        # T-09-4 (chapter 09 section 9.13.4): a parameter whose every owner
+        # ends every ray that reaches it decides only which rays stop there.
+        for entry in entries:
+            owners = [entry.owner, *entry.also_owned_by]
+            if all(o in terminal for o in owners):
+                entry.gradient_class = BOUNDARY_ONLY
+                entry.stage = (
+                    "the occluder's silhouette (which rays " + ", ".join(owners) + " stops)"
+                )
+                entry.structural_zero = (
+                    "every ray that reaches " + ", ".join(owners) + " ends there and is "
+                    "booked with the weight it arrives with, so the interior derivative "
+                    "of every output is zero by structure; its derivative is the "
+                    "boundary term of the occluder's silhouette, which is absent "
+                    "(chapter 09 sections 9.3 and 9.13.4; the research repository's "
+                    "issue 3)"
+                )
         return cls(entries)
 
     # -- after the trace ---------------------------------------------------
@@ -780,6 +962,9 @@ class ParameterRegister:
                 # A forward-mode tangent only: there is no recorded graph to
                 # walk. Forward mode is the cross-check of chapter 09 (R-09-9),
                 # run against a reverse-mode gradient, not a user mode yet.
+                continue
+            if e.structural_zero is not None:
+                dead.append((e.owner, e.name, e.stage, e.structural_zero))
                 continue
             if live[i] and not self._unreached(e, reached):
                 continue
@@ -927,3 +1112,172 @@ def refuse_without_autograd(register: ParameterRegister) -> None:
             f"require a gradient and would be silently detached: {names}. Trace "
             "on the torch backend (docs/theory/09_differentiation.md R-09-3)."
         )
+
+
+# ---------------------------------------------------------------------------
+# The entry split (T-09-6, second form)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EntrySplit:
+    """The forward-mode derivative of a detector image, split by entry element and hit.
+
+    Built by :func:`entry_split`. An *entry element* is one element of one
+    tangent the trace attaches (a placement's translation has 3, its rotation
+    9, a source-geometry scalar 1), numbered in the order the trace attaches
+    them; only those whose tangent is not zero are kept. A *hit* is one value
+    of one scatter-add into the detector's image.
+
+    Attributes:
+        elements: ``(call, element, shape)`` of each live entry element: the
+            attachment's number in the trace, the element's flat index and
+            the attached tensor's shape.
+        image_size: The number of bins of the detector's image.
+        nominal: ``(bins, value)`` of every scatter-add of the unsplit trace.
+        by_element: For each live element, ``(bins, tangent)`` of every
+            scatter-add of its trace (the tangent of the hits with that
+            element's tangent kept and every other zeroed).
+    """
+
+    elements: list
+    image_size: int
+    nominal: list
+    by_element: list
+
+    def image(self):
+        """The detector image of the unsplit trace (its values), flat."""
+        import torch  # noqa: PLC0415
+
+        bins = None
+        for flat, value in self.nominal:
+            if bins is None:
+                bins = torch.zeros(self.image_size, dtype=value.dtype, device=value.device)
+            bins.index_add_(0, flat, value)
+        return bins
+
+    def contributions(self, dloss_dbins):
+        """``c[e, i]``: each element's contribution through each hit, weighted by the loss.
+
+        A hit's contribution is its tangent times the loss's derivative with
+        respect to the bin it lands in. When every scatter-add of a trace has
+        the same length (one value per ray, as the irradiance detector's four
+        bilinear corners have), the corners of one ray are summed, so ``i``
+        runs over rays; otherwise every value of every scatter-add is its own
+        column. By the tangent's linearity the sum over ``e`` and ``i`` is the
+        forward-mode derivative of the loss, to rounding.
+
+        Args:
+            dloss_dbins: The loss's derivative with respect to each bin of the
+                image, flat.
+
+        Returns:
+            A tensor (elements, hits).
+        """
+        import torch  # noqa: PLC0415
+
+        rows = []
+        for hits in self.by_element:
+            lengths = {int(t.numel()) for _, t in hits}
+            terms = [dloss_dbins[flat] * tangent for flat, tangent in hits]
+            if len(lengths) == 1:
+                rows.append(sum(terms))
+            else:
+                rows.append(torch.cat([t.reshape(-1) for t in terms]))
+        return torch.stack(rows)
+
+    def derivative(self, dloss_dbins) -> float:
+        """``sum_{e,i} c[e, i]``: the forward-mode derivative of the loss."""
+        return float(self.contributions(dloss_dbins).sum())
+
+    def absolute_sum(self, dloss_dbins) -> float:
+        """``sum_{e,i} |c[e, i]|``: the scale of T-09-6's second form."""
+        return float(self.contributions(dloss_dbins).abs().sum())
+
+
+def _set_entry_split(state) -> None:
+    global _ENTRY_SPLIT  # noqa: PLW0603
+    _ENTRY_SPLIT = state
+
+
+def entry_split(build, value: float, *, detector: str = "D1", trace=None, tangent: float = 1.0) -> EntrySplit:
+    """Split a parameter's forward-mode derivative by entry element and hit (T-09-6, second form).
+
+    One forward-mode trace with nothing masked numbers the entry elements and
+    keeps the live ones; then one trace per live element keeps that element's
+    tangent and zeroes every other, and a hook on the detector's scatter-adds
+    records each hit's value and tangent (chapter 09 section 9.13.6 of the
+    research repository). Torch backend only; nothing else of the trace
+    changes, and no state is left behind.
+
+    Args:
+        build: ``build(param) -> scene``, with ``param`` the parameter as a
+            forward-mode dual tensor (a placement field, a source size).
+        value: The parameter's value.
+        detector: The name of the detector whose image is split.
+        trace: ``trace(scene) -> SimulationResult``; default
+            ``scene.trace(num_rays=2000, seed=3, max_depth=8)``.
+        tangent: The tangent of the parameter (1 for its derivative).
+
+    Returns:
+        The :class:`EntrySplit`.
+    """
+    import torch  # noqa: PLC0415
+    from torch.autograd import forward_ad  # noqa: PLC0415
+
+    from optiland.nonsequential.detectors import base as detector_base  # noqa: PLC0415
+
+    if trace is None:
+
+        def trace(scene):
+            return scene.trace(num_rays=2_000, seed=3, max_depth=8)
+
+    torch_dtype = torch.float32 if be.get_precision() == 32 else torch.float64
+
+    def one_trace(keep):
+        hits: list = []
+        state = {"call": 0, "keep": keep, "live": []}
+        with forward_ad.dual_level():
+            dual = forward_ad.make_dual(
+                torch.tensor(value, dtype=torch_dtype), torch.tensor(tangent, dtype=torch_dtype)
+            )
+            scene = build(dual)
+            target = scene.detector_registry.get(detector)
+
+            def observe(buffer, flat, contribution):
+                if buffer is getattr(target, "_data", None):
+                    hits.append((flat, contribution))
+
+            detector_base.HIT_OBSERVERS.append(observe)
+            _set_entry_split(state)
+            try:
+                trace(scene)
+            finally:
+                _set_entry_split(None)
+                detector_base.HIT_OBSERVERS.remove(observe)
+            size = int(target._data.shape[-1])
+            out = []
+            for flat, contribution in hits:
+                primal, tan = forward_ad.unpack_dual(contribution)
+                index = flat.long() if torch.is_tensor(flat) else torch.as_tensor(flat).long()
+                out.append(
+                    (
+                        index,
+                        primal.detach(),
+                        torch.zeros_like(primal).detach() if tan is None else tan.detach(),
+                    )
+                )
+        return out, state["live"], size
+
+    nominal, live, size = one_trace(None)
+    by_element = []
+    for call, element, _shape in live:
+        hits, _, _ = one_trace((call, element))
+        by_element.append([(flat, tan) for flat, _p, tan in hits])
+    return EntrySplit(
+        elements=list(live),
+        image_size=size,
+        nominal=[(flat, p) for flat, p, _t in nominal],
+        by_element=by_element,
+    )
+

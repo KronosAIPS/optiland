@@ -112,6 +112,7 @@ def build_collimated_source(cs: Any, config: Any) -> Any:
         profile=config.profile,
         gaussian_sigma=config.gaussian_sigma,
         medium=getattr(config, "medium", None),
+        profile_gradient=config.profile_gradient,
     )
 
 
@@ -379,8 +380,11 @@ _SOURCE_ATTACHED = ("total_flux", "total_flux_lumens")
 # Source geometry attached by the change of variables of chapter 09 section
 # 9.7 (R-09-4; parameter_register.attach_source_geometry), per kind.
 _POINT_ATTACHED = (*_SOURCE_ATTACHED, "half_angle_deg")
-_COLLIMATED_ATTACHED = (*_SOURCE_ATTACHED, "aperture_radius")
+# A Gaussian beam's sigma reaches the constructor, which attaches it only when
+# the beam is built with profile_gradient="implicit" and refuses it otherwise.
+_COLLIMATED_ATTACHED = (*_SOURCE_ATTACHED, "aperture_radius", "gaussian_sigma")
 _EXTENDED_ATTACHED = (*_SOURCE_ATTACHED, "width", "height", "aperture_radius", "half_angle_deg")
+_TABULATED_ATTACHED = (*_SOURCE_ATTACHED, "width", "height", "aperture_radius")
 
 
 def _register_sources() -> None:
@@ -494,9 +498,11 @@ def _register_sources() -> None:
             ),
             "intensity": np.asarray(s.intensity, dtype=np.float64).tolist(),
             "intensity_units": s.intensity_units,
-            "width": s.width,
-            "height": s.height,
-            "aperture_radius": s.aperture_radius,
+            "width": None if s.width is None else _to_float(s.width),
+            "height": None if s.height is None else _to_float(s.height),
+            "aperture_radius": (
+                None if s.aperture_radius is None else _to_float(s.aperture_radius)
+            ),
         }
 
     def tab_from_dict(d, spectrum, total_flux, medium):
@@ -524,7 +530,7 @@ def _register_sources() -> None:
         to_dict=tab_to_dict,
         from_dict=tab_from_dict,
         lower=tab_to_dict,
-        attached=_SOURCE_ATTACHED,
+        attached=_TABULATED_ATTACHED,
         description="a point or area with a tabulated angular intensity I(theta[, phi])",
     )
 
@@ -1230,3 +1236,8 @@ def register_all() -> None:
     _register_geometries()
     _register_bsdfs()
     _register_components()
+    # Every parameter's gradient rule (T-09-2; the research repository's
+    # chapter 09 section 9.13.3), attached to the kinds registered above.
+    from optiland.nonsequential import _builtin_gradients  # noqa: PLC0415
+
+    _builtin_gradients.apply()

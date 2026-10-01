@@ -222,6 +222,14 @@ def _flat_index_like(buffer, flat_np):
     return flat_np
 
 
+#: Observers of every scatter-add into a detector buffer, ``observer(buffer,
+#: flat, contribution)``, called before the add. Empty except while
+#: :func:`optiland.nonsequential.parameter_register.entry_split` runs (the
+#: research repository's chapter 09 section 9.13.6); an empty list costs one
+#: truth test per call and changes nothing.
+HIT_OBSERVERS: list = []
+
+
 def _accumulate_into(buffer, flat_np, contribution, key=None) -> None:
     """Scatter-add ``contribution`` into ``buffer`` in place, in the buffer's dtype.
 
@@ -253,6 +261,9 @@ def _accumulate_into(buffer, flat_np, contribution, key=None) -> None:
             ``rays.ray_id``. ``None`` deals the contributions round-robin by
             position (bounded the same way, but not batch-invariant).
     """
+    if HIT_OBSERVERS:
+        for observer in HIT_OBSERVERS:
+            observer(buffer, flat_np, contribution)
     if is_torch_tensor(buffer):
         import torch  # noqa: PLC0415
 

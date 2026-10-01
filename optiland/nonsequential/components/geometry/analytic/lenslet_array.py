@@ -40,6 +40,7 @@ can cross on an ``num_x`` by ``num_y`` grid (``num_x + num_y - 1``).
 
 from __future__ import annotations
 
+from optiland.nonsequential._utils import refuse_gradients
 import numpy as np
 
 import optiland.backend as be
@@ -125,6 +126,9 @@ class LensletArrayGeometry(AnalyticGeometry):
             ValueError: If ``num_x`` or ``num_y`` is not a positive
                 integer, or ``sag_offsets`` has the wrong shape.
         """
+        refuse_gradients(
+            "LensletArrayGeometry", "a count of cells", num_x=num_x, num_y=num_y
+        )
         if int(num_x) < 1 or int(num_y) < 1:
             raise ValueError(
                 "A lenslet array needs at least one cell along each axis; "

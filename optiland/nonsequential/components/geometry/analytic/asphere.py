@@ -122,6 +122,7 @@ step, there measured to 8.8e-16 median against a closed form).
 
 from __future__ import annotations
 
+from optiland.nonsequential._utils import refuse_gradients
 import contextlib
 import math
 
@@ -276,6 +277,14 @@ class _AsphereGeometry(AnalyticGeometry):
             self.coefficients = coefficients
         else:
             self.coefficients = tuple(as_param(a) for a in coefficients)
+        refuse_gradients(
+            type(self).__name__,
+            "a setting of the root finder, read as a number",
+            max_iterations=max_iterations,
+            guard_eta=guard_eta,
+            residual_k=residual_k,
+            scan_samples=scan_samples,
+        )
         if int(max_iterations) < 1:
             raise ValueError("max_iterations must be at least 1.")
         if not 0.0 < float(guard_eta) < 1.0:

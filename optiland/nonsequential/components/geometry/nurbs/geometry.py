@@ -75,6 +75,7 @@ rule: ``control_points`` and ``weights`` are the kind's attached parameters
 
 from __future__ import annotations
 
+from optiland.nonsequential._utils import refuse_gradients
 import contextlib
 from collections.abc import Mapping
 from typing import Any
@@ -192,6 +193,21 @@ class NurbsGeometry(ComponentGeometry):
             raise ValueError(f"control_points must have shape {base_cp.shape}")
         if tuple(self.weights.shape) != base_w.shape:
             raise ValueError(f"weights must have shape {base_w.shape}")
+        refuse_gradients(
+            "NurbsGeometry",
+            "a setting of the intersection, read as a number",
+            cone_deg=cone_deg,
+            tangent_deg=tangent_deg,
+            max_depth=max_depth,
+            fill_min=fill_min,
+            n_iter=n_iter,
+            k_tol=k_tol,
+            n_candidates=n_candidates,
+            n_ambiguous=n_ambiguous,
+            n_candidates_2=n_candidates_2,
+            n_ambiguous_2=n_ambiguous_2,
+            second_round_share=second_round_share,
+        )
         if int(n_iter) < 1 or float(k_tol) <= 0 or int(n_candidates) < 1 or int(n_ambiguous) < 0:
             raise ValueError("n_iter, k_tol and n_candidates must be positive, n_ambiguous non-negative")
         self.cone_deg = float(cone_deg)

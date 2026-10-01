@@ -7,6 +7,7 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
+from optiland.nonsequential._utils import refuse_gradients
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -52,6 +53,11 @@ class LambertianBSDF(BaseBSDF):
         """
         # Intentionally not float()-cast so torch tensors remain attached.
         self.reflectance_value = reflectance_value
+        refuse_gradients(
+            "LambertianBSDF",
+            "the reflect-or-transmit split is read as a number on the host",
+            transmissive_fraction=transmissive_fraction,
+        )
         self.transmissive_fraction = float(transmissive_fraction)
 
     def sample(
