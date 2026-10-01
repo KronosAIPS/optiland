@@ -245,6 +245,12 @@ class RegisteredParameter:
         stage: Where its gradient path enters the trace.
         also_owned_by: Other owners that hold the same tensor (a lens's
             front and edge share one coordinate system).
+        structural_zero: Why the interior derivative of every output with
+            respect to it is zero by structure, or ``None``. Set for a
+            parameter whose every owner ends every ray that reaches it (an
+            absorbing surface: an occluder, a baffle, a stop); its whole
+            derivative is a boundary term (chapter 09 section 9.13.4), and the
+            trace raises on it rather than return that zero.
     """
 
     owner: str
@@ -254,6 +260,7 @@ class RegisteredParameter:
     gradient_class: str
     stage: str
     also_owned_by: list[str] = field(default_factory=list)
+    structural_zero: str | None = None
 
     @property
     def boundary_term(self) -> str:
@@ -273,6 +280,7 @@ class RegisteredParameter:
             "stage": self.stage,
             "shape": tuple(getattr(self.tensor, "shape", ())),
             "also_owned_by": list(self.also_owned_by),
+            "structural_zero": self.structural_zero,
         }
 
 
@@ -672,7 +680,7 @@ def attach_source_geometry(rays: NSQRayBundle, source) -> NSQRayBundle:
 # ---------------------------------------------------------------------------
 
 
-def _classify(kind: str, path: str) -> tuple[str, str]:
+def _classify(kind: str, path: str, obj: Any = None) -> tuple[str, str]:
     """The gradient class and stage of a non-placement parameter at ``path``."""
     leaf = path.rsplit(".", 1)[-1]
     if kind == "source" and leaf in _SOURCE_CONTRACT:
@@ -775,12 +783,32 @@ class ParameterRegister:
             by_id[id(tensor)] = entry
             entries.append(entry)
 
+        terminal: set[str] = set()
         for owner, kind, obj in _scene_objects(scene):
+            if kind == "surface" and getattr(obj, "terminates_rays", False):
+                terminal.add(owner)
             for path, tensor in placement_tensors(getattr(obj, "cs", None)):
                 add(owner, kind, path, tensor, INTERIOR_BOUNDARY, _PLACEMENT_STAGE[kind])
             for path, tensor in _walk(obj, "", 0, set()):
-                klass, stage = _classify(kind, path)
+                klass, stage = _classify(kind, path, obj)
                 add(owner, kind, path, tensor, klass, stage)
+        # T-09-4 (chapter 09 section 9.13.4): a parameter whose every owner
+        # ends every ray that reaches it decides only which rays stop there.
+        for entry in entries:
+            owners = [entry.owner, *entry.also_owned_by]
+            if all(o in terminal for o in owners):
+                entry.gradient_class = BOUNDARY_ONLY
+                entry.stage = (
+                    "the occluder's silhouette (which rays " + ", ".join(owners) + " stops)"
+                )
+                entry.structural_zero = (
+                    "every ray that reaches " + ", ".join(owners) + " ends there and is "
+                    "booked with the weight it arrives with, so the interior derivative "
+                    "of every output is zero by structure; its derivative is the "
+                    "boundary term of the occluder's silhouette, which is absent "
+                    "(chapter 09 sections 9.3 and 9.13.4; the research repository's "
+                    "issue 3)"
+                )
         return cls(entries)
 
     # -- after the trace ---------------------------------------------------
@@ -839,6 +867,9 @@ class ParameterRegister:
                 # A forward-mode tangent only: there is no recorded graph to
                 # walk. Forward mode is the cross-check of chapter 09 (R-09-9),
                 # run against a reverse-mode gradient, not a user mode yet.
+                continue
+            if e.structural_zero is not None:
+                dead.append((e.owner, e.name, e.stage, e.structural_zero))
                 continue
             if live[i] and not self._unreached(e, reached):
                 continue

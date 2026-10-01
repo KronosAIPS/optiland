@@ -44,6 +44,13 @@ class AbsorbingComponent(BaseComponent):
         name: Optional label.
     """
 
+    #: Every ray that reaches the surface ends there, and the weight it books
+    #: does not depend on where it lands: the interior derivative of every
+    #: output with respect to the surface's placement or shape is zero by
+    #: structure (the research repository's chapter 09 section 9.13.4). The
+    #: parameter register reads this flag.
+    terminates_rays = True
+
     def __init__(
         self,
         cs: CoordinateSystem,
