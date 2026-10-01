@@ -410,9 +410,41 @@ def device_transform(cs, like):
     return t_ref + R_ref @ t, R_ref @ R
 
 
+#: The state of a running :func:`entry_split`, or None (the default: every
+#: tangent is kept whole).
+_ENTRY_SPLIT: dict | None = None
+
+
 def _tangent_only(x):
-    """``x - sg(x)``: exactly zero in value, the derivative of ``x`` in the graph."""
-    return x - x.detach()
+    """``x - sg(x)``: exactly zero in value, the derivative of ``x`` in the graph.
+
+    Every attached tangent of the trace passes here once, in the order the
+    trace attaches them, so this is where :func:`entry_split` numbers the
+    entry elements (chapter 09 section 9.13.6) and keeps one at a time. With
+    no split running it is the bare expression.
+    """
+    d = x - x.detach()
+    state = _ENTRY_SPLIT
+    if state is None:
+        return d
+    call = state["call"]
+    state["call"] += 1
+    if state["keep"] is None:
+        from torch.autograd import forward_ad  # noqa: PLC0415
+
+        tangent = forward_ad.unpack_dual(x).tangent
+        if tangent is not None:
+            flat = tangent.reshape(-1)
+            state["live"].extend(
+                (call, e, tuple(x.shape)) for e in range(x.numel()) if flat[e] != 0
+            )
+        return d
+    import torch  # noqa: PLC0415
+
+    mask = torch.zeros(x.numel(), dtype=x.dtype, device=x.device)
+    if state["keep"][0] == call:
+        mask[state["keep"][1]] = 1.0
+    return d * mask.reshape(x.shape)
 
 
 def attach_placement(cs, translation, rotation):
@@ -1068,3 +1100,172 @@ def refuse_without_autograd(register: ParameterRegister) -> None:
             f"require a gradient and would be silently detached: {names}. Trace "
             "on the torch backend (docs/theory/09_differentiation.md R-09-3)."
         )
+
+
+# ---------------------------------------------------------------------------
+# The entry split (T-09-6, second form)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class EntrySplit:
+    """The forward-mode derivative of a detector image, split by entry element and hit.
+
+    Built by :func:`entry_split`. An *entry element* is one element of one
+    tangent the trace attaches (a placement's translation has 3, its rotation
+    9, a source-geometry scalar 1), numbered in the order the trace attaches
+    them; only those whose tangent is not zero are kept. A *hit* is one value
+    of one scatter-add into the detector's image.
+
+    Attributes:
+        elements: ``(call, element, shape)`` of each live entry element: the
+            attachment's number in the trace, the element's flat index and
+            the attached tensor's shape.
+        image_size: The number of bins of the detector's image.
+        nominal: ``(bins, value)`` of every scatter-add of the unsplit trace.
+        by_element: For each live element, ``(bins, tangent)`` of every
+            scatter-add of its trace (the tangent of the hits with that
+            element's tangent kept and every other zeroed).
+    """
+
+    elements: list
+    image_size: int
+    nominal: list
+    by_element: list
+
+    def image(self):
+        """The detector image of the unsplit trace (its values), flat."""
+        import torch  # noqa: PLC0415
+
+        bins = None
+        for flat, value in self.nominal:
+            if bins is None:
+                bins = torch.zeros(self.image_size, dtype=value.dtype, device=value.device)
+            bins.index_add_(0, flat, value)
+        return bins
+
+    def contributions(self, dloss_dbins):
+        """``c[e, i]``: each element's contribution through each hit, weighted by the loss.
+
+        A hit's contribution is its tangent times the loss's derivative with
+        respect to the bin it lands in. When every scatter-add of a trace has
+        the same length (one value per ray, as the irradiance detector's four
+        bilinear corners have), the corners of one ray are summed, so ``i``
+        runs over rays; otherwise every value of every scatter-add is its own
+        column. By the tangent's linearity the sum over ``e`` and ``i`` is the
+        forward-mode derivative of the loss, to rounding.
+
+        Args:
+            dloss_dbins: The loss's derivative with respect to each bin of the
+                image, flat.
+
+        Returns:
+            A tensor (elements, hits).
+        """
+        import torch  # noqa: PLC0415
+
+        rows = []
+        for hits in self.by_element:
+            lengths = {int(t.numel()) for _, t in hits}
+            terms = [dloss_dbins[flat] * tangent for flat, tangent in hits]
+            if len(lengths) == 1:
+                rows.append(sum(terms))
+            else:
+                rows.append(torch.cat([t.reshape(-1) for t in terms]))
+        return torch.stack(rows)
+
+    def derivative(self, dloss_dbins) -> float:
+        """``sum_{e,i} c[e, i]``: the forward-mode derivative of the loss."""
+        return float(self.contributions(dloss_dbins).sum())
+
+    def absolute_sum(self, dloss_dbins) -> float:
+        """``sum_{e,i} |c[e, i]|``: the scale of T-09-6's second form."""
+        return float(self.contributions(dloss_dbins).abs().sum())
+
+
+def _set_entry_split(state) -> None:
+    global _ENTRY_SPLIT  # noqa: PLW0603
+    _ENTRY_SPLIT = state
+
+
+def entry_split(build, value: float, *, detector: str = "D1", trace=None, tangent: float = 1.0) -> EntrySplit:
+    """Split a parameter's forward-mode derivative by entry element and hit (T-09-6, second form).
+
+    One forward-mode trace with nothing masked numbers the entry elements and
+    keeps the live ones; then one trace per live element keeps that element's
+    tangent and zeroes every other, and a hook on the detector's scatter-adds
+    records each hit's value and tangent (chapter 09 section 9.13.6 of the
+    research repository). Torch backend only; nothing else of the trace
+    changes, and no state is left behind.
+
+    Args:
+        build: ``build(param) -> scene``, with ``param`` the parameter as a
+            forward-mode dual tensor (a placement field, a source size).
+        value: The parameter's value.
+        detector: The name of the detector whose image is split.
+        trace: ``trace(scene) -> SimulationResult``; default
+            ``scene.trace(num_rays=2000, seed=3, max_depth=8)``.
+        tangent: The tangent of the parameter (1 for its derivative).
+
+    Returns:
+        The :class:`EntrySplit`.
+    """
+    import torch  # noqa: PLC0415
+    from torch.autograd import forward_ad  # noqa: PLC0415
+
+    from optiland.nonsequential.detectors import base as detector_base  # noqa: PLC0415
+
+    if trace is None:
+
+        def trace(scene):
+            return scene.trace(num_rays=2_000, seed=3, max_depth=8)
+
+    torch_dtype = torch.float32 if be.get_precision() == 32 else torch.float64
+
+    def one_trace(keep):
+        hits: list = []
+        state = {"call": 0, "keep": keep, "live": []}
+        with forward_ad.dual_level():
+            dual = forward_ad.make_dual(
+                torch.tensor(value, dtype=torch_dtype), torch.tensor(tangent, dtype=torch_dtype)
+            )
+            scene = build(dual)
+            target = scene.detector_registry.get(detector)
+
+            def observe(buffer, flat, contribution):
+                if buffer is getattr(target, "_data", None):
+                    hits.append((flat, contribution))
+
+            detector_base.HIT_OBSERVERS.append(observe)
+            _set_entry_split(state)
+            try:
+                trace(scene)
+            finally:
+                _set_entry_split(None)
+                detector_base.HIT_OBSERVERS.remove(observe)
+            size = int(target._data.shape[-1])
+            out = []
+            for flat, contribution in hits:
+                primal, tan = forward_ad.unpack_dual(contribution)
+                index = flat.long() if torch.is_tensor(flat) else torch.as_tensor(flat).long()
+                out.append(
+                    (
+                        index,
+                        primal.detach(),
+                        torch.zeros_like(primal).detach() if tan is None else tan.detach(),
+                    )
+                )
+        return out, state["live"], size
+
+    nominal, live, size = one_trace(None)
+    by_element = []
+    for call, element, _shape in live:
+        hits, _, _ = one_trace((call, element))
+        by_element.append([(flat, tan) for flat, _p, tan in hits])
+    return EntrySplit(
+        elements=list(live),
+        image_size=size,
+        nominal=[(flat, p) for flat, p, _t in nominal],
+        by_element=by_element,
+    )
+
