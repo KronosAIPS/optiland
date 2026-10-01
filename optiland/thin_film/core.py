@@ -3,6 +3,23 @@
 This provides core functions for thin film optics calculations using the
 transfer matrix method (TMM).
 
+Time convention (the research repository's issue 78; its theory chapters 04
+section 4.4 and 06 section 6.0). Fields vary as ``exp(-i omega t)``: a complex
+index is ``n + i k`` with ``k >= 0`` for an absorbing medium, a layer's matrix
+is ``[[cos d, -i sin d / eta], [-i eta sin d, cos d]]``, and the root of
+``N cos theta = sqrt(N^2 - (n0 sin theta0)^2)`` is the one with a non-negative
+imaginary part, a wave that decays (or, beyond the critical angle of a
+lossless medium, is evanescent with ``N cos theta = +i kappa``) away from the
+interface. One convention for the layers, the absorbing media and the
+evanescent root: a coated face used beyond its critical angle (frustrated
+total internal reflection) is in it too. The reflection ``r`` is the
+admittance form ``(eta0 B - C) / (eta0 B + C)`` (for p the negative of the
+Fresnel ``r_p``) and ``t = 2 eta0 / (eta0 B + C)`` is the ratio of tangential
+fields. Until 2026-10-01 the layers and the absorbing index were in the
+``exp(+i omega t)`` convention while the evanescent root was the
+``exp(-i omega t)`` one, and ``t`` was conjugated; the powers were right in
+every case, and they are unchanged.
+
 Corentin Nannini, 2025
 """
 
@@ -90,7 +107,12 @@ def _snell_cos(n0, theta0, n):
     """
     nr = n.real
     k = n.imag
-    return be.csqrt(nr**2 - k**2 - (n0 * be.sin(theta0)) ** 2 - 2j * nr * k) / n
+    root = be.csqrt(nr**2 - k**2 - (n0 * be.sin(theta0)) ** 2 + 2j * nr * k)
+    # exp(-i omega t): the root with Im >= 0. The principal root already is,
+    # except beyond the critical angle of a lossless medium, where the
+    # radicand is a negative real whose imaginary zero may carry either sign.
+    root = be.where(be.imag(root) < 0, -root, root)
+    return root / n
 
 
 def _admittance(n: complex, cos_t: complex, pol: PolSP):
@@ -113,7 +135,7 @@ def _admittance(n: complex, cos_t: complex, pol: PolSP):
     if pol == "s":
         return eta_s
     elif pol == "p":
-        eta_p = sqrt_eps_mu**2 * (n.real - 1j * n.imag) ** 2 / eta_s
+        eta_p = sqrt_eps_mu**2 * (n.real + 1j * n.imag) ** 2 / eta_s
         return eta_p
     else:
         raise ValueError("Invalid polarization state")
@@ -191,7 +213,7 @@ def _tmm_coh(
         eta_l = _admittance(n_l, cos_l, pol)
         c = be.cos(delta)
         s = be.sin(delta)
-        i = 1j
+        i = -1j  # exp(-i omega t)
         mA = c
         mB = i * (s / eta_l)
         mC = i * (eta_l * s)
@@ -202,7 +224,7 @@ def _tmm_coh(
     denom = be.where(be.abs(denom) == 0, _denominator_floor(denom), denom)
 
     r = (eta0 * A + eta0 * etas * B - C - etas * D) / denom
-    t = be.conj((2 * eta0) / denom)
+    t = (2 * eta0) / denom
 
     R = (r * be.conj(r)).real
     T = (t * be.conj(t)).real * etas.real / eta0.real

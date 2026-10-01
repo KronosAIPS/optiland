@@ -13,9 +13,10 @@ admittances scaled by sqrt(eps0 / mu0), JonesFresnel through the index ratio).
 Measured: at most 4.4e-16.
 
 Beyond the critical angle the module's evanescent root is the exp(-i omega t) one,
-as JonesFresnel's is, so the reflection matches there too; the transmitted
-(evanescent) amplitude carries the module's conjugation of t and is compared only
-below the critical angle here (the research repository's issue 78).
+as JonesFresnel's is, so the reflection matches there too. The transmitted
+(evanescent) amplitude is compared below the critical angle here; beyond it in
+tests/nonsequential/test_nsq_phase_convention.py, since the module's t lost its
+conjugation (the research repository's issue 78).
 """
 
 from __future__ import annotations

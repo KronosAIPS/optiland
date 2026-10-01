@@ -669,10 +669,8 @@ class SPCoefficients(NamedTuple):
             convention (the reflection's ``m22`` and ``m23``).
         xt_cos, xt_sin: ``cos`` and ``sin`` of ``Delta = arg(t_p t_s*)``
             (``(1, 0)`` where either transmittance is zero).
-        phase_valid: Per-ray mask, False where the thin-film module's phases
-            are not in either time convention (a coated interface beyond the
-            critical angle; see :func:`thin_film_sp`). The power terms are
-            right everywhere.
+        phase_valid: Per-ray mask; True everywhere since the thin-film module
+            states one time convention (issue 78). Kept for its readers.
     """
 
     Rs: object
@@ -696,50 +694,31 @@ class SPCoefficients(NamedTuple):
         return transmission_mueller(self.Ts, self.Tp, phase=(self.xt_cos, self.xt_sin))
 
 
-def _material_nk(material, wavelength_um):
-    """Real ``n`` and ``k`` of a thin-film stack's material at the rays' wavelengths."""
-    if be.get_backend() == "torch" and hasattr(wavelength_um, "detach"):
-        n = material._calculate_n(wavelength_um)
-        k = material._calculate_k(wavelength_um)
-    else:
-        n = material.n(wavelength_um)
-        k = material.k(wavelength_um)
-    return be.atleast_1d(n), be.atleast_1d(k)
-
-
 def thin_film_sp(stack, wavelength_um, cos_theta_i, reverse=None) -> SPCoefficients:
-    """The fork's thin-film module's s and p results, in this module's convention.
+    """The fork's thin-film module's s and p results, as Mueller terms.
 
-    ``ThinFilmStack.compute_rtRTA_elementwise(..., "s" | "p")`` gives ``R`` and
-    ``T`` right to about 1e-15 at float64 on bare, totally reflecting,
-    metallic and coated interfaces. Its complex reflection amplitudes need two
-    corrections before they are Mueller phase terms, each pinned by a test
+    ``ThinFilmStack.compute_rtRTA_elementwise(..., "s" | "p")`` gives the powers
+    and the complex amplitudes in this module's own time convention
+    (``exp(-i omega t)``; the thin-film module states it, the research
+    repository's issue 78). One correction remains, pinned by a test
     (``tests/nonsequential/test_nsq_polarization_thin_film.py``):
 
-    1. **The sign of ``r_p``.** The module's ``p`` admittance is
-       ``eta_p = n / cos theta``, which gives ``r_p`` with the opposite sign to
-       the Fresnel convention of the catalogue's analytic reference; ``r_p`` is
-       negated.
-    2. **The time convention.** The module's layer matrices and its complex
-       index (entered through ``n - i k``) are in the ``exp(+i omega t)``
-       convention, so for a stack with at least one layer, and for an
-       absorbing substrate or incident medium, its reflection phase is the
-       complex conjugate of this module's; it is conjugated. For a bare,
-       lossless interface below the critical angle both amplitudes are real
-       and nothing changes; beyond it the module's evanescent root is this
-       module's (``cos_t = +i kappa``) and nothing is conjugated.
+    **The sign of ``r_p``.** The module's ``p`` admittance is
+    ``eta_p = n / cos theta``, which gives ``r_p`` with the opposite sign to the
+    Fresnel convention of the catalogue's analytic reference; ``r_p`` is
+    negated.
 
-    Its transmission amplitudes carry a conjugation of their own, and their
-    relative phase ``arg(t_p t_s*)`` agrees with an independent
-    ``exp(-i omega t)`` characteristic-matrix calculation as it is.
+    The transmission terms are the module's tangential-field amplitudes; the
+    p field amplitude differs from its tangential part by a real positive
+    factor in lossless media, so ``arg(t_p t_s*)`` is the same.
 
-    One case is outside both conventions: a stack **with layers** met beyond
-    the critical angle of its substrate (a coated face used in total internal
-    reflection). There the module mixes the ``exp(+i omega t)`` layers with
-    the ``exp(-i omega t)`` evanescent root, and its relative phase matches
-    neither convention (measured: -34.00 degrees against -29.22 degrees at
-    60 degrees for one quarter-wave layer of 1.38 between 1.5 and 1.0). Those
-    lanes are flagged in ``phase_valid``; the power terms stay right.
+    Until 2026-10-01 the module's layers were in the ``exp(+i omega t)``
+    convention while its evanescent root was the ``exp(-i omega t)`` one, and
+    this adapter conjugated the reflection phase of a stack with layers or an
+    absorbing medium; a coated face met beyond its critical angle matched
+    neither convention and was flagged in ``phase_valid``. With the module in
+    one convention the phase is right on every lane, and ``phase_valid`` is
+    True everywhere (kept so that a caller reading it still can).
 
     Args:
         stack: A configured ``optiland.thin_film.ThinFilmStack``.
@@ -763,23 +742,8 @@ def thin_film_sp(stack, wavelength_um, cos_theta_i, reverse=None) -> SPCoefficie
     )
     rs, rp = s["r"], -p["r"]
     x_r = rp * be.conj(rs)
-
-    n0, k0 = _material_nk(stack.incident_material, wavelength_um)
-    ns, ks = _material_nk(stack.substrate_material, wavelength_um)
-    if reverse is not None:
-        n0, ns = be.where(reverse, ns, n0), be.where(reverse, n0, ns)
-        k0, ks = be.where(reverse, ks, k0), be.where(reverse, k0, ks)
-    absorbing = (k0 > 0) | (ks > 0)
-    everywhere = be.ones_like(ks) > 0
-    if stack.layers:
-        conjugate = everywhere
-        sin2_t = (n0 / ns) ** 2 * (1.0 - cos_theta_i**2)
-        phase_valid = ~((sin2_t >= 1.0) & ~absorbing)
-    else:
-        conjugate = absorbing
-        phase_valid = everywhere
     re = be.real(x_r)
-    im = be.where(conjugate, -be.imag(x_r), be.imag(x_r))
+    im = be.imag(x_r)
 
     x_t = p["t"] * be.conj(s["t"])
     mag = be.abs(x_t)
@@ -787,6 +751,7 @@ def thin_film_sp(stack, wavelength_um, cos_theta_i, reverse=None) -> SPCoefficie
     safe = be.where(nonzero, mag, be.ones_like(mag))
     xt_cos = be.where(nonzero, be.real(x_t) / safe, be.ones_like(mag))
     xt_sin = be.where(nonzero, be.imag(x_t) / safe, be.zeros_like(mag))
+    phase_valid = be.ones_like(mag) > 0
     return SPCoefficients(
         s["R"], p["R"], s["T"], p["T"], re, im, xt_cos, xt_sin, phase_valid
     )
@@ -1082,9 +1047,7 @@ def mirror_stokes(rays, dirs, normals, R_used, stack=None, wavelength=None,
       absorbing substrate. The s and p reflectances and the relative phase
       ``r_p r_s*`` come from :func:`thin_film_sp`, in this module's
       convention: ``M01 = (R_p - R_s) / 2``, ``(M22, M23) = (Re, Im)(r_p
-      r_s*)``. A lane the adapter flags in ``phase_valid`` (a coated face
-      beyond its substrate's critical angle) carries the module's phase as it
-      is; the power terms are right there.
+      r_s*)``, a coated face beyond its substrate's critical angle included.
 
     Args:
         rays: The bundle (reads its state and reference axis).
