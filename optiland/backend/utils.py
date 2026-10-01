@@ -28,8 +28,72 @@ def torch_to_numpy(obj: Tensor) -> NDArray:
         import torch
 
         if isinstance(obj, torch.Tensor):
+            if in_functorch_transform():
+                return _numpy_inside_transform(obj)
             return obj.detach().cpu().numpy()
     raise TypeError
+
+
+def in_functorch_transform() -> bool:
+    """True while a ``torch.func`` transform (``jvp``, ``grad``, ``vmap``) is running."""
+    import torch  # noqa: PLC0415
+
+    functorch = getattr(torch._C, "_functorch", None)
+    return functorch is not None and functorch.peek_interpreter_stack() is not None
+
+
+def _numpy_inside_transform(obj: Tensor) -> NDArray:
+    """A host copy of ``obj``'s value while a ``torch.func`` transform runs.
+
+    Inside a transform every tensor refuses ``.numpy()`` (the transform's
+    interpreter stack intercepts the data access), and an argument of the
+    transform, or anything computed from it, is a wrapper with no storage.
+    The value is read with the stack cleared, from the innermost wrapped
+    tensor: the same bits a host read gives outside the transform. The
+    derivative stays with the wrapper, which a host read drops in any case.
+    """
+    from torch._functorch import pyfunctorch  # noqa: PLC0415
+
+    with pyfunctorch.temporarily_clear_interpreter_stack():
+        return unwrap_functorch(obj).detach().cpu().numpy()
+
+
+def is_functorch_wrapped(obj) -> bool:
+    """True for a wrapper tensor of a ``torch.func`` transform (``jvp``, ``grad``, ``vmap``)."""
+    import torch  # noqa: PLC0415
+
+    functorch = getattr(torch._C, "_functorch", None)
+    return (
+        functorch is not None
+        and isinstance(obj, torch.Tensor)
+        and functorch.is_functorch_wrapped_tensor(obj)
+    )
+
+
+def unwrap_functorch(obj: Tensor) -> Tensor:
+    """The plain tensor inside the wrappers of ``torch.func``'s transforms.
+
+    Under ``torch.func.jvp`` (or ``grad``, ``vjp``) the arguments and
+    everything computed from them are wrapper tensors with no storage of
+    their own, so reading one's value on the host (``.numpy()``) fails. The
+    value is the innermost wrapped tensor's; the derivative stays with the
+    wrapper, which is what a host read drops in any case. A plain tensor is
+    returned unchanged.
+
+    Args:
+        obj: A torch tensor, wrapped or not.
+
+    Returns:
+        The innermost plain tensor.
+    """
+    import torch  # noqa: PLC0415
+
+    functorch = getattr(torch._C, "_functorch", None)
+    if functorch is None:
+        return obj
+    while functorch.is_functorch_wrapped_tensor(obj):
+        obj = functorch.get_unwrapped(obj)
+    return obj
 
 
 CONVERTERS = [torch_to_numpy]

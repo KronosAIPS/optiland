@@ -466,7 +466,49 @@ def attach_source_placement(rays: NSQRayBundle, source) -> NSQRayBundle:
 
 
 #: The source-geometry fields :func:`attach_source_geometry` attaches.
-SOURCE_GEOMETRY_FIELDS = ("aperture_radius", "width", "height", "half_angle_deg")
+SOURCE_GEOMETRY_FIELDS = ("aperture_radius", "width", "height", "half_angle_deg", "gaussian_sigma")
+
+
+def truncated_gaussian_tangents(r2, sigma: float, radius: float):
+    """The relative tangents of a truncated Gaussian beam's radial coordinate.
+
+    The beam's radial distribution is ``F(r) = (1 - exp(-a)) / (1 - exp(-A))``
+    with ``a = r**2 / (2 sigma**2)`` and ``A = R**2 / (2 sigma**2)``. Held at a
+    fixed ``u = F(r)``, ``r`` is a smooth function of ``sigma`` and ``R``,
+    and its derivative is the implicit one, ``-dF/dtheta / (dF/dr)``
+    (chapter 09 section 9.13.1 of the research repository)::
+
+        dr/dsigma = r / sigma - R**2 Q / (sigma r),   dr/dR = R Q / r,
+        Q = exp(a - A) (1 - exp(-a)) / (1 - exp(-A))
+
+    This returns ``(dr/dsigma) / r`` and ``(dr/dR) / r``, written with
+    ``G = Q / r**2``, which is finite at ``r = 0`` (``exp(-A) / (2 sigma**2
+    (1 - exp(-A)))``), so the tangent of an emission point is ``p_l`` times
+    a finite factor. Every exponential is evaluated as ``exp(a - A)`` or
+    ``expm1`` of a non-positive argument, so nothing overflows or cancels
+    for ``0 <= a <= A``.
+
+    Args:
+        r2: ``x_l**2 + y_l**2`` of each emission point, a tensor (N,).
+        sigma: The beam's sigma [mm], a float.
+        radius: Its truncation radius ``R`` [mm], a float.
+
+    Returns:
+        ``(rel_sigma, rel_radius)``, tensors (N,) in ``r2``'s dtype.
+    """
+    import torch  # noqa: PLC0415
+
+    two_s2 = 2.0 * sigma * sigma
+    big_a = radius * radius / two_s2
+    a = r2 / two_s2
+    positive = a > 0
+    safe_a = torch.where(positive, a, torch.ones_like(a))
+    # (1 - exp(-a)) / a, which is 1 at a = 0
+    ratio = torch.where(positive, -torch.expm1(-safe_a) / safe_a, torch.ones_like(a))
+    g = torch.exp(a - big_a) * ratio / (two_s2 * -float(np.expm1(-big_a)))
+    rel_sigma = 1.0 / sigma - (radius * radius / sigma) * g
+    rel_radius = radius * g
+    return rel_sigma, rel_radius
 
 
 def source_geometry_is_attached(source) -> bool:
@@ -551,8 +593,34 @@ def attach_source_geometry(rays: NSQRayBundle, source) -> NSQRayBundle:
             return None
         return _tangent_only(_scalar_like(value, p_local)) / host_float(value)
 
+    def abs_tangent(name):
+        value = getattr(source, name, None)
+        if not _requires_grad(value):
+            return None
+        return _tangent_only(_scalar_like(value, p_local))
+
     radius = getattr(source, "aperture_radius", None)
-    if radius is not None:
+    if getattr(source, "profile", None) == "gaussian":
+        # The truncated Gaussian beam: the implicit reparameterisation of its
+        # radial distribution (chapter 09 section 9.13.1). A sigma that was
+        # not given follows the radius, sigma = R / 2.
+        d_radius = abs_tangent("aperture_radius")
+        d_sigma = abs_tangent("gaussian_sigma")
+        if d_radius is not None and getattr(source, "_sigma_follows_radius", False):
+            d_sigma = d_radius * 0.5 if d_sigma is None else d_sigma + d_radius * 0.5
+        if d_radius is not None or d_sigma is not None:
+            r2 = p_local[:, 0] * p_local[:, 0] + p_local[:, 1] * p_local[:, 1]
+            rel_sigma, rel_radius = truncated_gaussian_tangents(
+                r2, host_float(source.gaussian_sigma), host_float(radius)
+            )
+            rel = torch.zeros_like(r2)
+            if d_sigma is not None:
+                rel = rel + rel_sigma * d_sigma
+            if d_radius is not None:
+                rel = rel + rel_radius * d_radius
+            dp = dp + p_local * torch.stack([rel, rel, torch.zeros_like(rel)], dim=1)
+            touched = True
+    elif radius is not None:
         da = rel_tangent("aperture_radius")
         if da is not None:
             dp = dp + p_local * torch.stack([da, da, torch.zeros_like(da)])
@@ -568,7 +636,7 @@ def attach_source_geometry(rays: NSQRayBundle, source) -> NSQRayBundle:
             touched = True
 
     alpha = getattr(source, "half_angle_deg", None)
-    lambertian = hasattr(source, "width") and host_float(alpha) >= 90.0
+    lambertian = alpha is not None and hasattr(source, "width") and host_float(alpha) >= 90.0
     if alpha is not None and _requires_grad(alpha) and not lambertian:
         cos_a_host = float(np.cos(np.radians(host_float(alpha))))
         cos_a = torch.cos(_scalar_like(alpha, p_local) * (np.pi / 180.0))

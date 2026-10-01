@@ -61,6 +61,7 @@ class CollimatedSource(BaseNSQSource):
         profile: Literal["tophat", "gaussian"] = "tophat",
         gaussian_sigma: float | None = None,
         medium=None,
+        profile_gradient: Literal["refuse", "implicit"] = "refuse",
     ) -> None:
         """Initialize CollimatedSource.
 
@@ -73,29 +74,64 @@ class CollimatedSource(BaseNSQSource):
             gaussian_sigma: Gaussian standard deviation [mm].
                 Defaults to aperture_radius / 2 if None.
             medium: Medium the source is embedded in (default: vacuum).
+            profile_gradient: ``"refuse"`` (the default): a Gaussian beam's
+                sigma and radius raise when they carry a gradient.
+                ``"implicit"``: they are attached by the implicit
+                reparameterisation of the truncated profile
+                (:func:`~optiland.nonsequential.parameter_register
+                .truncated_gaussian_tangents`; the research repository's
+                chapter 09 section 9.13.1). A top-hat beam ignores it.
         """
         super().__init__(cs, spectrum, total_flux)
+        if profile_gradient not in ("refuse", "implicit"):
+            raise ValueError(
+                "CollimatedSource: profile_gradient must be 'refuse' or 'implicit', "
+                f"got {profile_gradient!r}."
+            )
+        self.profile_gradient = profile_gradient
+        implicit = profile == "gaussian" and profile_gradient == "implicit"
         # The aperture radius of a top-hat beam may carry a derivative: the
         # trace attaches the emission points to it by the change of variables
         # (chapter 09 section 9.7, R-09-4). A truncated Gaussian's radius is
-        # its truncation edge, which moves accepted samples across it (a
-        # boundary term the change of variables does not carry), so it stays
-        # detached there.
-        if profile == "gaussian":
+        # its truncation edge. Held at a fixed value of the radial
+        # distribution function, the edge does not move, and the implicit
+        # reparameterisation of chapter 09 section 9.13.1 carries the
+        # derivative in the radius and in sigma; that is taken when the beam
+        # is built with profile_gradient="implicit". By default both refuse a
+        # gradient, as they always have.
+        if profile == "gaussian" and not implicit:
             self.aperture_radius = as_detached_param(
                 aperture_radius,
                 "aperture_radius",
                 "CollimatedSource",
-                reason="it truncates the Gaussian profile (a boundary term)",
+                reason=(
+                    "it truncates the Gaussian profile and the beam was built "
+                    "with profile_gradient='refuse' (pass "
+                    "profile_gradient='implicit' to attach it by the implicit "
+                    "reparameterisation)"
+                ),
             )
         else:
             self.aperture_radius = as_attachable_param(aperture_radius)
         self.profile = profile
-        self.gaussian_sigma = (
-            as_detached_param(gaussian_sigma, "gaussian_sigma", "CollimatedSource")
-            if gaussian_sigma is not None
-            else host_float(self.aperture_radius) / 2.0
-        )
+        # With the implicit reparameterisation a sigma that is not given
+        # follows the radius (sigma = R / 2): its value is the float, and the
+        # trace adds the radius' tangent to it (d sigma = d R / 2).
+        self._sigma_follows_radius = gaussian_sigma is None
+        if gaussian_sigma is None:
+            self.gaussian_sigma = host_float(self.aperture_radius) / 2.0
+        elif implicit:
+            self.gaussian_sigma = as_attachable_param(gaussian_sigma)
+        else:
+            self.gaussian_sigma = as_detached_param(
+                gaussian_sigma,
+                "gaussian_sigma",
+                "CollimatedSource",
+                reason=(
+                    "the beam was built with profile_gradient='refuse' (pass "
+                    "profile_gradient='implicit' to attach it)"
+                ),
+            )
         self.medium = medium
 
     def generate(self, ray_id: np.ndarray, rng: NSQRng) -> NSQRayBundle:
@@ -212,8 +248,9 @@ class CollimatedSource(BaseNSQSource):
             # Box-Muller transform: (u1, u2) -> independent standard normals.
             r_bm = np.sqrt(-2.0 * np.log(np.maximum(u1, 1e-300)))
             theta_bm = 2.0 * np.pi * u2
-            x = self.gaussian_sigma * r_bm * np.cos(theta_bm)
-            y = self.gaussian_sigma * r_bm * np.sin(theta_bm)
+            sigma = host_float(self.gaussian_sigma)
+            x = sigma * r_bm * np.cos(theta_bm)
+            y = sigma * r_bm * np.sin(theta_bm)
             accept = pending & (x**2 + y**2 <= max_r2)
             lx = np.where(accept, x, lx)
             ly = np.where(accept, y, ly)

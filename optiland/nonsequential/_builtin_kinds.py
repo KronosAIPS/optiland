@@ -112,6 +112,7 @@ def build_collimated_source(cs: Any, config: Any) -> Any:
         profile=config.profile,
         gaussian_sigma=config.gaussian_sigma,
         medium=getattr(config, "medium", None),
+        profile_gradient=config.profile_gradient,
     )
 
 
@@ -379,7 +380,9 @@ _SOURCE_ATTACHED = ("total_flux", "total_flux_lumens")
 # Source geometry attached by the change of variables of chapter 09 section
 # 9.7 (R-09-4; parameter_register.attach_source_geometry), per kind.
 _POINT_ATTACHED = (*_SOURCE_ATTACHED, "half_angle_deg")
-_COLLIMATED_ATTACHED = (*_SOURCE_ATTACHED, "aperture_radius")
+# A Gaussian beam's sigma reaches the constructor, which attaches it only when
+# the beam is built with profile_gradient="implicit" and refuses it otherwise.
+_COLLIMATED_ATTACHED = (*_SOURCE_ATTACHED, "aperture_radius", "gaussian_sigma")
 _EXTENDED_ATTACHED = (*_SOURCE_ATTACHED, "width", "height", "aperture_radius", "half_angle_deg")
 
 
