@@ -82,8 +82,20 @@ class _MediumRegistry:
                 :func:`optiland.nonsequential.serialization._serialize_material`.
         """
         underlying = None if material is None else material.optiland_material
+        from optiland.nonsequential.materials.record_material import (  # noqa: PLC0415
+            RecordMaterial,
+        )
+
+        record = None
         if underlying is None:
             key: tuple = ("vacuum",)
+        elif isinstance(underlying, RecordMaterial):
+            # A library record lowers losslessly as its own data, whatever
+            # ``strict`` says; two materials of the same record share an id.
+            record = underlying.to_mapping()
+            ident = record["identity"]
+            key = ("record", underlying.label, ident.get("content_hash"),
+                   repr(record["n_model"]), repr(record["k_model"]))
         else:
             glass_name = getattr(underlying, "name", None) or getattr(
                 underlying, "_name", None
@@ -108,6 +120,14 @@ class _MediumRegistry:
                     name="vacuum",
                     n_model={"kind": "constant", "n": 1.0},
                     k_model={"kind": "constant", "k": 0.0},
+                )
+            elif key[0] == "record":
+                common = {"identity": record["identity"], "range_m": record["range_m"]}
+                medium = MediumIR(
+                    id=idx,
+                    name=key[1],
+                    n_model={"kind": "record", "model": record["n_model"], **common},
+                    k_model={"kind": "record", "model": record["k_model"], **common},
                 )
             elif key[0] == "opaque":
                 medium = MediumIR(

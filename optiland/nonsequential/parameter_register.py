@@ -154,6 +154,18 @@ CONTRACT: dict[str, tuple[str, str]] = {
     "n": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert"),
     "k": (INTERIOR_BOUNDARY, "Beer-Lambert and Fresnel"),
     "index": (INTERIOR_BOUNDARY, "Fresnel and Snell"),
+    # a material record's model (research repository issue 87): through
+    # n(lambda) or k(lambda) of RecordMaterial, then as "n" and "k" above
+    "constant_n": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's stated index)"),
+    "constant_k": (INTERIOR_BOUNDARY, "Beer-Lambert and Fresnel (the record's stated extinction)"),
+    "sellmeier_eps_inf": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
+    "sellmeier_strengths": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
+    "sellmeier_resonance_um": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
+    "sellmeier_resonance_um2": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
+    "buchdahl_n0": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
+    "buchdahl_nu": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
+    "table_n": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
+    "table_k": (INTERIOR_BOUNDARY, "Beer-Lambert and Fresnel (the record's k(lambda))"),
 }
 
 #: Parameters a detector carries: its extent is a binning coordinate

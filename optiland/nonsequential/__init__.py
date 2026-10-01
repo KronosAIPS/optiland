@@ -80,7 +80,7 @@ Public API (selected)::
         IrradianceDetectorConfig, FarFieldDetectorConfig,
         SpectralDetectorConfig, RayDatabaseConfig, HemisphereDetectorConfig,
         # Materials
-        NSQMaterial, VACUUM,
+        NSQMaterial, VACUUM, RecordMaterial, MaterialOutOfRange,
         # Conversion from a sequential Optic
         sequential_to_nonsequential, ConversionError,
         # Photometric units
@@ -317,7 +317,13 @@ from optiland.nonsequential.detectors import (
 )
 
 # Materials
-from optiland.nonsequential.materials import VACUUM, NSQMaterial
+from optiland.nonsequential.materials import (
+    VACUUM,
+    MaterialOutOfRange,
+    NSQMaterial,
+    RecordMaterial,
+    RecordRefused,
+)
 
 # Results
 from optiland.nonsequential.results import (
@@ -456,6 +462,9 @@ __all__ = [
     # Materials
     "NSQMaterial",
     "VACUUM",
+    "RecordMaterial",
+    "MaterialOutOfRange",
+    "RecordRefused",
     # Results
     "FarFieldPattern",
     "IrradianceMap",

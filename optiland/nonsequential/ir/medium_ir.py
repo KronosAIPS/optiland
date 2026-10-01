@@ -16,7 +16,7 @@ class MediumIR:
     ``n_model``/``k_model`` describe *how* to evaluate dispersion/absorption
     without embedding a live evaluator: a dict tagged by ``"kind"`` rather
     than a bound method, so the description survives a JSON round-trip and a
-    non-Python backend can interpret it. Both use the same three kinds and
+    non-Python backend can interpret it. Both use the same four kinds and
     are always populated together by :func:`~optiland.nonsequential.ir.lower.lower`:
 
     - ``{"kind": "constant", "n": <float>}`` / ``{"kind": "constant", "k":
@@ -25,6 +25,11 @@ class MediumIR:
       ``"N-BK7"``), resolved via :meth:`NSQMaterial.from_glass` the same way
       :mod:`optiland.nonsequential.serialization` already round-trips
       materials.
+    - ``{"kind": "record", "model": <n_model or k_model>, "identity": ...,
+      "range_m": ...}`` -- a material taken from a record of the shared
+      material library (:class:`~optiland.nonsequential.materials.record_material.RecordMaterial`):
+      the model the engine evaluates, as plain data, with the record's
+      identity key and content hash; lossless.
     - ``{"kind": "opaque"}`` -- a non-catalog material kept only for
       dispatch (``lower(scene, strict=False)``); not losslessly
       serializable.

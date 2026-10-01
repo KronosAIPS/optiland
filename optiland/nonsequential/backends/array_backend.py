@@ -201,6 +201,29 @@ def _cull_to_budget(
 
 
 
+def _record_manifest(ir) -> list[dict]:
+    """One row per medium of the scene IR that came from a material record.
+
+    Each row names the medium and the record it traced: the library and its
+    version, the record's name, variant, identity key and content hash, the
+    model kinds and the band (research repository issue 87). Empty when no
+    medium came from a record.
+    """
+    rows = []
+    for medium in ir.media:
+        n_model = medium.n_model or {}
+        if n_model.get("kind") != "record":
+            continue
+        ident = n_model.get("identity") or {}
+        row = {"medium": medium.name}
+        row.update({k: ident.get(k) for k in ("library", "library_version", "name", "variant", "key", "content_hash")})
+        row["n_model"] = (n_model.get("model") or {}).get("kind")
+        row["k_model"] = ((medium.k_model or {}).get("model") or {}).get("kind")
+        row["range_m"] = n_model.get("range_m")
+        rows.append(row)
+    return rows
+
+
 def detector_labels(scene, detectors) -> list[str]:
     """The name each detector is known by, in the scene's detector order.
 
@@ -1272,6 +1295,12 @@ class ArrayBackend(TracerBackend):
             reflection_histograms=reflection_histograms,
             environment=self._environment(),
         )
+        materials = _record_manifest(ir)
+        if materials:
+            # Which library page each medium traced (research repository issue
+            # 87): present only when a medium came from a material record, so a
+            # trace without one keeps its record unchanged.
+            result.environment["materials"] = materials
         if register:
             # R-09-7: a gradient result says the boundary term is not in it;
             # the register is the per-parameter statement (its rows carry
