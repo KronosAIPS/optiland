@@ -974,8 +974,12 @@ class TabulatedCoating(BaseCoating):
             n_sub = self._material_n(self.substrate_material, wavelength_um)
             ratio = n_sub / n_inc
             s2_0 = ratio * ratio * (1.0 - c * c)
-            far_tir = from_substrate & (s2_0 >= 1.0)
-            w0 = be.where(far_tir, be.zeros_like(s2_0), 1.0 - s2_0)
+            beyond = s2_0 >= 1.0
+            far_tir = from_substrate & beyond
+            # the radicand masked on every lane beyond, whichever side: a
+            # square root of a negative is never formed (R-09-10, the
+            # double where), not even on a lane the select below discards
+            w0 = be.where(beyond, be.zeros_like(s2_0), 1.0 - s2_0)
             c = be.where(from_substrate, w0**0.5, c)
         theta = be.arccos(c) * (180.0 / be.pi)
         x = wavelength_um * 1000.0
