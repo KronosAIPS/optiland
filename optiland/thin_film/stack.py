@@ -265,19 +265,26 @@ class ThinFilmStack:
         wavelength_um: float | Array,
         aoi_rad: float | Array = 0.0,
         polarization: Pol = "u",
+        reverse: Array | None = None,
     ) -> dict[str, Any]:
         """Compute complex and power coefficients element-wise (no grid).
 
         Use this when wavelength and aoi have matching shapes (e.g. per-ray).
+
+        ``reverse`` (optional, a boolean array of the same shape) marks the
+        elements that meet the stack from its substrate side: those are
+        evaluated on the reversed stack (substrate as the incident medium,
+        layers in the opposite order), ``aoi_rad`` being their angle in the
+        substrate. ``None`` evaluates every element from the incident side.
         """
         wl = be.atleast_1d(wavelength_um)
         th = be.atleast_1d(aoi_rad)
         if polarization in ("s", "p"):
-            r, t, R, T, A = _tmm_coh(self, wl, th, polarization)
+            r, t, R, T, A = _tmm_coh(self, wl, th, polarization, reverse)
             return {"r": r, "t": t, "R": R, "T": T, "A": A}
         elif polarization == "u":
-            rs, ts, Rs, Ts, As = _tmm_coh(self, wl, th, "s")
-            rp, tp, Rp, Tp, Ap = _tmm_coh(self, wl, th, "p")
+            rs, ts, Rs, Ts, As = _tmm_coh(self, wl, th, "s", reverse)
+            rp, tp, Rp, Tp, Ap = _tmm_coh(self, wl, th, "p", reverse)
             R = 0.5 * (Rs + Rp)
             T = 0.5 * (Ts + Tp)
             A = 0.5 * (As + Ap)

@@ -707,7 +707,7 @@ def _material_nk(material, wavelength_um):
     return be.atleast_1d(n), be.atleast_1d(k)
 
 
-def thin_film_sp(stack, wavelength_um, cos_theta_i) -> SPCoefficients:
+def thin_film_sp(stack, wavelength_um, cos_theta_i, reverse=None) -> SPCoefficients:
     """The fork's thin-film module's s and p results, in this module's convention.
 
     ``ThinFilmStack.compute_rtRTA_elementwise(..., "s" | "p")`` gives ``R`` and
@@ -744,20 +744,31 @@ def thin_film_sp(stack, wavelength_um, cos_theta_i) -> SPCoefficients:
     Args:
         stack: A configured ``optiland.thin_film.ThinFilmStack``.
         wavelength_um: Per-ray wavelength [um].
-        cos_theta_i: Per-ray ``|cos theta_i|`` in the incident medium.
+        cos_theta_i: Per-ray ``|cos theta_i|`` in the medium the ray arrives
+            from.
+        reverse: Optional per-ray mask of the rays arriving from the stack's
+            substrate side (the research repository's issue 83): those see
+            the reversed stack, the substrate as their incident medium.
 
     Returns:
         :class:`SPCoefficients`, per ray, real arrays in the working dtype.
     """
     cos_theta_i = be.clip(cos_theta_i, -1.0, 1.0)
     aoi = be.arccos(cos_theta_i)
-    s = stack.compute_rtRTA_elementwise(wavelength_um, aoi, polarization="s")
-    p = stack.compute_rtRTA_elementwise(wavelength_um, aoi, polarization="p")
+    s = stack.compute_rtRTA_elementwise(
+        wavelength_um, aoi, polarization="s", reverse=reverse
+    )
+    p = stack.compute_rtRTA_elementwise(
+        wavelength_um, aoi, polarization="p", reverse=reverse
+    )
     rs, rp = s["r"], -p["r"]
     x_r = rp * be.conj(rs)
 
     n0, k0 = _material_nk(stack.incident_material, wavelength_um)
     ns, ks = _material_nk(stack.substrate_material, wavelength_um)
+    if reverse is not None:
+        n0, ns = be.where(reverse, ns, n0), be.where(reverse, n0, ns)
+        k0, ks = be.where(reverse, ks, k0), be.where(reverse, k0, ks)
     absorbing = (k0 > 0) | (ks > 0)
     everywhere = be.ones_like(ks) > 0
     if stack.layers:
@@ -936,7 +947,7 @@ def incidence_frame(rays, dirs, normals):
 
 def fresnel_stokes(
     rays, dirs, normals, n1, n2, cos_i, sin2_t, tir, rs, rp, R_used, T_used,
-    coating=None, wavelength=None,
+    coating=None, wavelength=None, from_substrate=None,
 ) -> FresnelStokes:
     """The Stokes half of a refractive interface, before the branch is drawn.
 
@@ -946,7 +957,8 @@ def fresnel_stokes(
     4. The interface elements. A bare interface: the Fresnel reflection with
        the TIR phase, and the transmission ``sqrt(T_s T_p)`` with
        ``T_s = 1 - r_s^2``, ``T_p = 1 - r_p^2`` and ``M_t01 = -M_r01``. A
-       thin-film coating: :func:`thin_film_sp`. A coating with scalar ``R`` and
+       thin-film coating: :func:`thin_film_sp`; a coating table: its own
+       ``sp`` (``optiland.coatings.TabulatedCoating``). A coating with scalar ``R`` and
        ``T`` only: a non-polarizing element, ``R diag(1, 1, -1, -1)`` and
        ``T diag(1, 1, 1, 1)`` (an ideal reflection flips the handedness). In
        every case ``M_00`` is the scalar ``R`` or ``T`` the engine already
@@ -961,6 +973,8 @@ def fresnel_stokes(
             uses (bare, or the coating's), after its TIR override.
         coating: The surface's coating, or ``None``.
         wavelength: Per-ray wavelength [um] (for a thin-film coating).
+        from_substrate: Per-ray mask of the rays arriving from a side-aware
+            coating's substrate side, or ``None`` (issue 83).
 
     Returns:
         A :class:`FresnelStokes`.
@@ -979,8 +993,12 @@ def fresnel_stokes(
             be.where(tir, zero, m_t.m22),
             zero,
         )
-    elif hasattr(coating, "stack"):
-        sp = thin_film_sp(coating.stack, wavelength, cos_i)
+    elif hasattr(coating, "stack") or callable(getattr(coating, "sp", None)):
+        if hasattr(coating, "stack"):
+            sp = thin_film_sp(coating.stack, wavelength, cos_i, reverse=from_substrate)
+        else:
+            # a coating table with its phase grids (it refuses without them)
+            sp = coating.sp(wavelength, cos_i, from_substrate)
         m_r = InterfaceMueller(
             R_used,
             be.where(tir, zero, 0.5 * (sp.Rp - sp.Rs)),
@@ -1046,7 +1064,7 @@ class MirrorStokes:
 
 
 def mirror_stokes(rays, dirs, normals, R_used, stack=None, wavelength=None,
-                  cos_i=None) -> MirrorStokes:
+                  cos_i=None, coating=None) -> MirrorStokes:
     """The Stokes half of a mirror reflection, before the flux is weighted.
 
     Two kinds of mirror, each with ``M00`` the scalar reflectance ``R`` the
@@ -1073,14 +1091,20 @@ def mirror_stokes(rays, dirs, normals, R_used, stack=None, wavelength=None,
         dirs, normals: ``(N, 3)`` incident directions and surface normals.
         R_used: The scalar reflectance the mirror applies, per ray.
         stack: The mirror's ``ThinFilmStack``, or ``None``.
-        wavelength: Per-ray wavelength [um] (for a stack).
-        cos_i: Per-ray ``|cos theta_i|`` (for a stack).
+        wavelength: Per-ray wavelength [um] (for a stack or a table).
+        cos_i: Per-ray ``|cos theta_i|`` (for a stack or a table).
+        coating: A coating table (``optiland.coatings.TabulatedCoating``) as
+            the reflectance, or ``None``: its own ``sp`` gives the s and p
+            terms, and it refuses a Stokes trace without its phase grids.
 
     Returns:
         A :class:`MirrorStokes`.
     """
     s, q, u, v = incidence_frame(rays, dirs, normals)
-    if stack is None:
+    if stack is None and coating is not None and callable(getattr(coating, "sp", None)):
+        sp = coating.sp(wavelength, cos_i)
+        m = InterfaceMueller(R_used, 0.5 * (sp.Rp - sp.Rs), sp.xr_re, sp.xr_im)
+    elif stack is None:
         zero = be.zeros_like(R_used)
         m = InterfaceMueller(R_used, zero, -R_used, zero)
     else:

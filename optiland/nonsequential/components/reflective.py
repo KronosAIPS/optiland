@@ -169,8 +169,9 @@ class ReflectiveComponent(BaseComponent, LedgerBooking):
         if rays.pol_q is not None:
             stokes = mirror_stokes(
                 rays, dirs, normals, R,
-                stack=self.reflectance.stack if stack_mirror else None,
+                stack=getattr(self.reflectance, "stack", None) if stack_mirror else None,
                 wavelength=rays.wavelength, cos_i=be.abs(raw_dot[:, 0]),
+                coating=self.reflectance if stack_mirror else None,
             )
             R = stokes.R_eff
         # Ch. 10 (10.1): the (1 - R) a mirror below unit reflectance removes

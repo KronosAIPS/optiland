@@ -84,9 +84,19 @@ class UnpolarizedThinFilmCoating:
     reflectance of the incident/substrate interface, since the
     characteristic matrix of a layer-less stack is the identity.
 
+    The stack describes the interface as its incident medium sees it. A ray
+    arriving from the substrate side is evaluated on the reversed stack (the
+    research repository's issue 83): the refractive component matches the
+    stack's two media to its own front and back once
+    (:func:`coating_incident_is_front`) and passes the per-ray side to
+    :meth:`evaluate`.
+
     Args:
         stack: A configured ``optiland.thin_film.ThinFilmStack`` (incident
             medium, substrate, and zero or more layers).
+        incident_side: Which side of the component the stack's incident
+            medium is on: ``"front"``, ``"back"``, or ``"auto"`` (the
+            default: matched by index, see :func:`coating_incident_is_front`).
 
     Note:
         Nothing here detaches from the autograd graph:
@@ -97,20 +107,37 @@ class UnpolarizedThinFilmCoating:
         already does for ``material_front``/``material_back``.
     """
 
-    def __init__(self, stack: ThinFilmStack) -> None:
+    def __init__(self, stack: ThinFilmStack, incident_side: str = "auto") -> None:
         self.stack = stack
+        self.incident_side = _check_incident_side(incident_side)
+
+    def media(self):
+        """``(incident, substrate)``: the stack's two media (``BaseMaterial``)."""
+        return self.stack.incident_material, self.stack.substrate_material
 
     def evaluate(
-        self, wavelength_um: be.ndarray, cos_theta_i: be.ndarray
+        self,
+        wavelength_um: be.ndarray,
+        cos_theta_i: be.ndarray,
+        from_substrate: be.ndarray | None = None,
     ) -> tuple[be.ndarray, be.ndarray]:
         """Per-ray unpolarized (R, T) at this ray's wavelength and AOI.
 
         Args:
             wavelength_um: Per-ray wavelength [µm], shape (N,).
             cos_theta_i: Per-ray cosine of the angle of incidence, shape
-                (N,). Clipped to [-1, 1] here (mirrors
-                ``BaseCoating._compute_aoi``) since the caller's value can
-                land a hair outside that range from floating-point error.
+                (N,), in the medium the ray arrives from. Clipped to [-1, 1]
+                here (mirrors ``BaseCoating._compute_aoi``) since the
+                caller's value can land a hair outside that range from
+                floating-point error.
+            from_substrate: Optional per-ray boolean mask of the rays that
+                arrive from the stack's substrate side (the research
+                repository's issue 83). Those are evaluated on the reversed
+                stack: the substrate as the incident medium, the layers in
+                the opposite order, at their own angle in the substrate.
+                ``None`` (the default, and what a caller with no side
+                information passes) evaluates every ray from the incident
+                medium, as before.
 
         Returns:
             ``(R, T)``, each shape (N,): :math:`(R_s+R_p)/2` and the
@@ -120,15 +147,102 @@ class UnpolarizedThinFilmCoating:
         cos_theta_i = be.clip(cos_theta_i, -1.0, 1.0)
         aoi_rad = be.arccos(cos_theta_i)
         out = self.stack.compute_rtRTA_elementwise(
-            wavelength_um, aoi_rad, polarization="u"
+            wavelength_um, aoi_rad, polarization="u", reverse=from_substrate
         )
         return out["R"], out["T"]
+
+
+#: The values ``incident_side`` takes on a side-aware coating.
+INCIDENT_SIDES = ("auto", "front", "back")
+
+
+def _check_incident_side(value: str) -> str:
+    if value not in INCIDENT_SIDES:
+        raise ValueError(f"incident_side must be one of {INCIDENT_SIDES}, got {value!r}")
+    return value
+
+
+def _index_at(material, wavelength_um: float) -> float:
+    """A material's real index at one wavelength, as a Python float (host side).
+
+    ``None`` (the engine's vacuum) is 1. Accepts an ``NSQMaterial`` (its
+    ``optiland_material``) or an ``optiland.materials.BaseMaterial``.
+    """
+    inner = getattr(material, "optiland_material", material)
+    if inner is None:
+        return 1.0
+    import numpy as np  # noqa: PLC0415
+
+    value = inner.n(wavelength_um)
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    return float(np.asarray(value, dtype=float).ravel()[0])
+
+
+def coating_incident_is_front(
+    coating: object, material_front: object, material_back: object
+) -> bool | None:
+    """Whether a side-aware coating's incident medium is the component's front.
+
+    A coating that describes one side of an interface (a thin-film stack, a
+    table) has its own incident medium and substrate, and a refractive
+    component has its own front and back media; the two are matched once,
+    when the coating is attached, never per ray (the research repository's
+    issue 83). ``coating.incident_side`` decides when it is ``"front"`` or
+    ``"back"``. With ``"auto"`` (the default) the indices are compared at
+    the stack's reference wavelength (0.55 um when it has none): the
+    incident medium is the front when
+    ``|n_front - n_inc| + |n_back - n_sub| <= |n_front - n_sub| + |n_back - n_inc|``,
+    so a stack written from its outer medium inwards is placed right on
+    either face of a lens; a tie (a stack between two equal media) keeps
+    the front, which is what every coating was before the side existed.
+
+    Args:
+        coating: The attached coating.
+        material_front, material_back: The component's two media.
+
+    Returns:
+        True or False for a side-aware coating (one with ``media()``);
+        None for a side-blind one (a ``SimpleCoating``, a constant).
+    """
+    media = getattr(coating, "media", None)
+    if not callable(media):
+        return None
+    side = getattr(coating, "incident_side", "auto")
+    if side == "front":
+        return True
+    if side == "back":
+        return False
+    incident, substrate = media()
+    stack = getattr(coating, "stack", None)
+    wl = getattr(stack, "reference_wl_um", None) or getattr(
+        coating, "reference_wavelength_um", None
+    ) or 0.55
+    wl = float(wl)
+    n_inc, n_sub = _index_at(incident, wl), _index_at(substrate, wl)
+    n_f, n_b = _index_at(material_front, wl), _index_at(material_back, wl)
+    return abs(n_f - n_inc) + abs(n_b - n_sub) <= abs(n_f - n_sub) + abs(n_b - n_inc)
+
+
+def from_substrate_mask(incident_is_front: bool | None, entering_back):
+    """Per ray: does it arrive from the coating's substrate side?
+
+    ``entering_back`` is the component's own mask of the rays on its front
+    side (travelling from ``material_front`` into ``material_back``).
+
+    Returns:
+        A boolean mask, or None for a side-blind coating.
+    """
+    if incident_is_front is None:
+        return None
+    return ~entering_back if incident_is_front else entering_back
 
 
 def evaluate_transmissive_coating(
     coating: object,
     wavelength_um: be.ndarray,
     cos_theta_i: be.ndarray,
+    from_substrate: be.ndarray | None = None,
 ) -> tuple[be.ndarray, be.ndarray]:
     """Per-ray (R, T) for a non-None coating on a ``RefractiveComponent``.
 
@@ -149,12 +263,17 @@ def evaluate_transmissive_coating(
             this branch when ``self.coating is not None``).
         wavelength_um: Per-ray wavelength [µm], shape (N,).
         cos_theta_i: Per-ray cosine of the angle of incidence, shape (N,).
+        from_substrate: Optional per-ray mask of the rays arriving from the
+            coating's substrate side (:func:`from_substrate_mask`); passed
+            to a side-aware coating, ignored by a side-blind one.
 
     Returns:
         ``(R_used, T_used)``, each shape (N,), matching ``wavelength_um``.
     """
     evaluate = getattr(coating, "evaluate", None)
     if callable(evaluate):
+        if from_substrate is not None:
+            return evaluate(wavelength_um, cos_theta_i, from_substrate=from_substrate)
         return evaluate(wavelength_um, cos_theta_i)
     return (
         be.ones_like(wavelength_um) * float(coating.reflectance),
