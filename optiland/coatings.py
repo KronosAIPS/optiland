@@ -489,7 +489,15 @@ class JonesThinFilm(BaseJones):
     """Jones matrix generator for a thin-film stack.
 
     Builds diagonal Jones matrices in the s/p basis using thin-film r/t
-    amplitude coefficients. Reflect or transmit selection mirrors JonesFresnel.
+    amplitude coefficients, in :class:`~optiland.jones.JonesFresnel`'s form
+    (the research repository's issue 74): an empty stack gives
+    ``JonesFresnel``'s matrices. The thin-film module's coefficients are the
+    admittance form's: its ``r_p`` is the negative of the Fresnel ``r_p``
+    (``eta_p = n / cos theta``), and its ``t`` is the ratio of the tangential
+    fields. The reflected p entry is therefore the module's ``r_p`` itself
+    (``JonesFresnel`` puts ``-r_p`` there), and the transmitted p entry is the
+    module's ``t_p`` times ``cos theta_0 / cos theta_sub``, the ratio of the p
+    field to its tangential component on the two sides.
 
     Args:
         stack: ThinFilmStack configured with incident/substrate and layers.
@@ -515,20 +523,29 @@ class JonesThinFilm(BaseJones):
         r_s, t_s, _, _ = self._coeffs_amp(wl_um, th, pol="s", reflect=reflect)
         r_p, t_p, _, _ = self._coeffs_amp(wl_um, th, pol="p", reflect=reflect)
 
-        z = be.zeros_like(r_s)
-        o = be.ones_like(r_s)
-
+        # Filled in place into a complex array, as JonesFresnel does: the torch
+        # backend's ``stack`` casts to its real working dtype, which dropped
+        # the imaginary part of every coefficient (a total internal
+        # reflection's phase, a coated face's) on that backend.
+        jones = be.to_complex(be.zeros((be.size(r_s), 3, 3)))
         if reflect:
-            col0 = be.stack([r_s, z, z], axis=-1)
-            col1 = be.stack([z, -r_p, z], axis=-1)
-            col2 = be.stack([z, z, -o], axis=-1)
+            # the module's r_p is -r_p(Fresnel); JonesFresnel's entry is -r_p(Fresnel)
+            jones[:, 0, 0] = r_s
+            jones[:, 1, 1] = r_p
+            jones[:, 2, 2] = -1
         else:
-            col0 = be.stack([t_s, z, z], axis=-1)
-            col1 = be.stack([z, t_p, z], axis=-1)
-            col2 = be.stack([z, z, o], axis=-1)
-
-        jones = be.stack([col0, col1, col2], axis=-2)
+            jones[:, 0, 0] = t_s
+            jones[:, 1, 1] = t_p * self._p_field_ratio(wl_um, th)
+            jones[:, 2, 2] = 1
         return jones
+
+    def _p_field_ratio(self, wl_um: be.ndarray, th_rad: be.ndarray) -> be.ndarray:
+        """``cos theta_0 / cos theta_sub``: p field over its tangential part, per ray."""
+        from optiland.thin_film.core import _complex_index, _snell_cos  # noqa: PLC0415
+
+        n0 = _complex_index(self.stack.incident_material, wl_um)
+        ns = _complex_index(self.stack.substrate_material, wl_um)
+        return _snell_cos(n0, th_rad, n0) / _snell_cos(n0, th_rad, ns)
 
     def _coeffs_amp(
         self, wl_um: be.ndarray, th_rad: be.ndarray, pol: str, reflect: bool
