@@ -5,6 +5,8 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
+import math
+
 import importlib.util
 from typing import TYPE_CHECKING, Any
 
@@ -208,26 +210,43 @@ def distribute_ray_budget(num_rays_total: int, source_fluxes: list[float]) -> li
 def estimate_bounding_scale(scene: Any) -> float:
     """Estimate a reasonable length to extend escaped rays past the scene.
 
+    The extent is taken over the finite bounds of the surfaces' boxes only.
+    An unbounded surface (an infinite plane, whose box is infinite on every
+    axis) contributes no bound: an infinite escape distance makes every
+    escaped ray's position infinite or NaN (inf * 0 for a direction
+    component of zero), its advance has the derivative inf, and in a
+    gradient trace the zero cotangent of a discarded lane times that inf, or
+    a later bounce's arithmetic on the infinite position, is NaN in every
+    parameter's gradient (KronosNSRT issue 79; R-09-10 asks a discarded lane
+    to contribute zero). An escaped ray is dead, so the distance it is
+    moved only has to be finite. A scene whose boxes are all finite takes
+    the same bounds in the same order as before, bit for bit.
+
     Args:
         scene: NSQScene instance (or anything exposing ``surfaces`` with a
             ``bounding_box`` attribute per surface).
 
     Returns:
-        The scene's bounding-box diagonal [mm], or ``100.0`` if the scene has
-        no surfaces or the diagonal is degenerately small.
+        The diagonal of the finite part of the scene's bounding box [mm], or
+        ``100.0`` if the scene has no surfaces, no finite bound, or the
+        diagonal is degenerately small.
     """
     boxes = [comp.bounding_box for comp in scene.surfaces]
     if not boxes:
         return 100.0
 
-    xmin = min(b.xmin for b in boxes)
-    xmax = max(b.xmax for b in boxes)
-    ymin = min(b.ymin for b in boxes)
-    ymax = max(b.ymax for b in boxes)
-    zmin = min(b.zmin for b in boxes)
-    zmax = max(b.zmax for b in boxes)
+    def _span(lows, highs) -> float:
+        lo = [v for v in lows if math.isfinite(v)]
+        hi = [v for v in highs if math.isfinite(v)]
+        if not lo or not hi:
+            return 0.0
+        return max(hi) - min(lo)
 
-    extent = ((xmax - xmin) ** 2 + (ymax - ymin) ** 2 + (zmax - zmin) ** 2) ** 0.5
+    dx = _span([b.xmin for b in boxes], [b.xmax for b in boxes])
+    dy = _span([b.ymin for b in boxes], [b.ymax for b in boxes])
+    dz = _span([b.zmin for b in boxes], [b.zmax for b in boxes])
+
+    extent = (dx**2 + dy**2 + dz**2) ** 0.5
     return extent if extent > 1.0 else 100.0
 
 
