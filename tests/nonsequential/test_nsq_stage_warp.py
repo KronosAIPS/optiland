@@ -607,6 +607,7 @@ def test_each_kernel_is_a_module_of_its_own_with_the_stage_options():
         for name, kernel in stage._KERNELS[dtype].items():
             options = kernel.module.options
             assert options["fuse_fp"] is False
+            assert options["cuda_output"] == "cubin"
             assert options["enable_backward"] is (name in stage.TAPE_KINDS)
             assert len(kernel.module.kernels) == 1
 

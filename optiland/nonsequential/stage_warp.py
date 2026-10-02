@@ -200,9 +200,20 @@ def _kernel(fn, name: str, bits: int, backward: bool = False):
     backward pass. The expressions, and so the numbers, are the same as in
     one module: the module options are the stage's (no floating-point
     contraction).
+
+    On CUDA the modules compile to CUBIN, machine code for the device's
+    architecture, rather than to PTX, which the driver would translate again
+    on every fresh machine: a kernel cache written ahead of time
+    (:func:`compile_cache`) is then loaded as it is. The arithmetic is the
+    same either way (every operation is a rounded IEEE operation with
+    contraction off; the PTX path only moves the final translation into the
+    driver). Where the device's architecture has no CUBIN target, Warp uses
+    PTX.
     """
     module = _kernel_module_name(name, bits)
-    wp.set_module_options({"fuse_fp": False, "enable_backward": bool(backward)}, module=module)
+    wp.set_module_options(
+        {"fuse_fp": False, "enable_backward": bool(backward), "cuda_output": "cubin"}, module=module
+    )
     return wp.kernel(fn, module=wp.get_module(module))
 
 
@@ -1905,9 +1916,10 @@ def compile_cache(arch, kinds=None, dtypes=(torch.float64, torch.float32)) -> li
 
     Writes Warp's kernel cache (``warp.config.kernel_cache_dir``, which the
     ``WARP_CACHE_PATH`` environment variable sets) for the compute
-    capability ``arch`` (80 for an A100), as CUBIN and as PTX, in the
-    layout a load reads: a later process on a device of that architecture
-    finds every kernel compiled and compiles nothing. Meant for a container
+    capability ``arch`` (80 for an A100), as CUBIN (the format the modules
+    load, :func:`_kernel`), in the layout a load reads: a later process on
+    a device of that architecture finds every kernel compiled and compiles
+    nothing. Meant for a container
     image's build step (research repository issue 85: a fresh CUDA
     container otherwise compiles the stage on its first trace). A module's
     file names carry a hash of its kernels' source and options only, not of
@@ -1925,8 +1937,7 @@ def compile_cache(arch, kinds=None, dtypes=(torch.float64, torch.float32)) -> li
     arches = [arch] if isinstance(arch, int) else list(arch)
     paths = []
     for module in kernel_modules(kinds, dtypes):
-        for use_ptx in (False, True):
-            paths += wp.compile_aot_module(module, arch=arches, use_ptx=use_ptx)
+        paths += wp.compile_aot_module(module, arch=arches, use_ptx=False)
     return paths
 
 
