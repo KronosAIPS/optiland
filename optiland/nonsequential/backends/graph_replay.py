@@ -56,6 +56,7 @@ numbers are the eager fixed-width numbers.
 from __future__ import annotations
 
 import contextlib
+import sys
 import traceback
 from typing import TYPE_CHECKING, Any
 
@@ -194,13 +195,56 @@ def _engine_site() -> str:
     return inner if engine in (None, inner) else f"{inner}, from {engine}"
 
 
+def _is_compiler_guard_read(tensor: Any) -> bool:
+    """Whether a read is a guard ``torch.compile`` evaluates on a CPU tensor.
+
+    Before it runs a compiled program, dynamo evaluates the program's guards.
+    For a 0-dim float tensor on the CPU it treats the value as an unspecialized
+    float and installs ``not math.isnan(L[name].item())`` (its "implicit guard
+    for float input due to NaN specialization"), a Python guard generated as
+    source (a function ``guard`` in ``<string>``) and called from the compiled
+    function's wrapper in ``torch._dynamo`` -- directly, or with the frame of
+    the compiled function between the two (both seen in the asphere test
+    file's run). On the CPU the tensor is host memory already, so the read
+    copies nothing. A CUDA tensor gets no such guard
+    (dynamo specializes only CPU scalars this way), and the capture on an A100
+    recorded the compiled refinement without refusal (the research
+    repository's issue 104, 2026-10-02), so only CPU reads are exempt; every
+    other read, a guard's on a device tensor included, is still recorded.
+
+    Args:
+        tensor: The tensor being read.
+
+    Returns:
+        True when ``tensor`` is on the CPU and the reader is a generated
+        ``guard`` with a ``torch._dynamo`` frame among its next three callers.
+    """
+    device = getattr(tensor, "device", None)
+    if device is None or device.type != "cpu":
+        return False
+    # 0: this function, 1: the read wrapper, 2: the reader
+    frame = sys._getframe(2)
+    code = frame.f_code
+    if code.co_name != "guard" or not code.co_filename.startswith("<"):
+        return False
+    caller = frame.f_back
+    for _ in range(3):
+        if caller is None:
+            return False
+        if "/torch/_dynamo/" in caller.f_code.co_filename.replace("\\", "/"):
+            return True
+        caller = caller.f_back
+    return False
+
+
 @contextlib.contextmanager
 def host_transfer_check():
     """Record every host transfer made inside the block, without changing any.
 
     Wraps the entry points of :data:`_READS` and :data:`_UPLOADS` for the
     block's duration; each call still runs as before and is recorded as
-    ``(kind, site)``. Nothing is raised inside the block -- a transfer inside
+    ``(kind, site)``, except a compiled program's own guard reading a CPU
+    tensor (:func:`_is_compiler_guard_read`), which copies nothing. Nothing is raised inside the block -- a transfer inside
     a ``try`` of the engine could not be swallowed and the values stay the
     eager ones -- the caller judges the list afterwards.
 
@@ -217,7 +261,8 @@ def host_transfer_check():
         saved.append((torch.Tensor, name, original))
 
         def read(tensor, *a, _original=original, _name=name, **k):
-            seen.append((f"reads a tensor to the host ({_name})", _engine_site()))
+            if not _is_compiler_guard_read(tensor):
+                seen.append((f"reads a tensor to the host ({_name})", _engine_site()))
             return _original(tensor, *a, **k)
 
         setattr(torch.Tensor, name, read)
