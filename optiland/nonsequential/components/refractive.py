@@ -31,7 +31,7 @@ from optiland.nonsequential.components.sampling_support import (
     scatter_branch,
 )
 from optiland.nonsequential.materials.nsq_material import medium_stack_id_value
-from optiland.nonsequential.polarization import fresnel_stokes
+from optiland.nonsequential.polarization import coating_sp, fresnel_stokes
 from optiland.nonsequential.ray_bundle import (
     MEDIUM_STACK_EMPTY,
     MEDIUM_STACK_MAX_DEPTH,
@@ -365,13 +365,22 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         # R = 1, as before.
         from_substrate = None
         coated_tir = coating_holds_beyond_critical(self.coating)
+        sp = None
         if self.coating is not None:
             from_substrate = from_substrate_mask(
                 self._coating_incident_front(), entering_back
             )
-            R_used, T_used = evaluate_transmissive_coating(
-                self.coating, wl, cos_theta_i, from_substrate=from_substrate
-            )
+            if rays.pol_q is not None:
+                # Stokes mode: the coating's s and p terms, formed once; the
+                # scalar R and T are their means, the values evaluate gives,
+                # bit for bit (polarization.coating_sp)
+                sp = coating_sp(self.coating, wl, cos_theta_i, from_substrate)
+            if sp is not None:
+                R_used, T_used = 0.5 * (sp.Rs + sp.Rp), 0.5 * (sp.Ts + sp.Tp)
+            else:
+                R_used, T_used = evaluate_transmissive_coating(
+                    self.coating, wl, cos_theta_i, from_substrate=from_substrate
+                )
         else:
             R_used = R_fresnel
             T_used = 1.0 - R_fresnel
@@ -389,7 +398,7 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             stokes = fresnel_stokes(
                 rays, dirs, normals, n1, n2, cos_theta_i, sin2_t, tir, rs, rp,
                 R_used, T_used, coating=self.coating, wavelength=wl,
-                from_substrate=from_substrate, coated_tir=coated_tir,
+                from_substrate=from_substrate, coated_tir=coated_tir, sp=sp,
             )
             R_used, T_used = stokes.R_eff, stokes.T_eff
 

@@ -757,6 +757,38 @@ def thin_film_sp(stack, wavelength_um, cos_theta_i, reverse=None) -> SPCoefficie
     )
 
 
+def coating_sp(coating, wavelength, cos_i, from_substrate=None):
+    """A coating's s and p terms for a Stokes event, or ``None`` for a coating without them.
+
+    A thin-film coating (``coating.stack``): :func:`thin_film_sp`. A coating table
+    (``optiland.coatings.TabulatedCoating``, with its phase grids; it refuses
+    without them): its own ``sp``. Anything else (a ``SimpleCoating``, a
+    constant) has no s and p split: ``None``.
+
+    The scalar ``R`` and ``T`` of the same coating are ``(R_s + R_p) / 2`` and
+    ``(T_s + T_p) / 2`` of these terms, bit for bit: the thin-film adapter's
+    ``evaluate`` and :func:`thin_film_sp` clip the cosine, take its arccos and
+    evaluate the stack for s and for p with the same operations, and the
+    table's ``evaluate`` and ``sp`` read the same lookup. A Stokes event uses
+    that to evaluate the coating once (the operation trim of 2026-10-02).
+
+    Args:
+        coating: The surface's coating.
+        wavelength: Per-ray wavelength [um].
+        cos_i: Per-ray ``|cos theta_i|``.
+        from_substrate: Per-ray mask of the rays arriving from the substrate
+            side, or ``None``.
+
+    Returns:
+        :class:`SPCoefficients` or ``None``.
+    """
+    if hasattr(coating, "stack"):
+        return thin_film_sp(coating.stack, wavelength, cos_i, reverse=from_substrate)
+    if callable(getattr(coating, "sp", None)):
+        return coating.sp(wavelength, cos_i, from_substrate)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # The Stokes event at a refractive interface (build item 5)
 # ---------------------------------------------------------------------------
@@ -912,7 +944,7 @@ def incidence_frame(rays, dirs, normals):
 
 def fresnel_stokes(
     rays, dirs, normals, n1, n2, cos_i, sin2_t, tir, rs, rp, R_used, T_used,
-    coating=None, wavelength=None, from_substrate=None, coated_tir=False,
+    coating=None, wavelength=None, from_substrate=None, coated_tir=False, sp=None,
 ) -> FresnelStokes:
     """The Stokes half of a refractive interface, before the branch is drawn.
 
@@ -946,6 +978,10 @@ def fresnel_stokes(
             meeting an absorbing coating in total internal reflection reads
             ``R_s`` or ``R_p`` rather than their mean. ``False`` (a bare face,
             a side-blind coating) keeps ``M01 = 0`` there, as before.
+        sp: The coating's :class:`SPCoefficients` when the caller has already
+            formed them (:func:`coating_sp`; the refractive face does, and
+            takes its scalar ``R`` and ``T`` from the same terms, so the stack
+            is evaluated once per event, not twice); ``None`` forms them here.
 
     Returns:
         A :class:`FresnelStokes`.
@@ -954,22 +990,28 @@ def fresnel_stokes(
 
     zero = be.zeros_like(R_used)
     if coating is None:
+        # Only the elements the event uses, each squared amplitude formed once
+        # (the operation trim of 2026-10-02): the same operations on the same
+        # operands as reflection_mueller and transmission_mueller, less the
+        # reflection's m00 and the transmission's m01, which the engine's
+        # R_used and -M_r01 replace; every value is bit-identical.
         phase = tir_relative_phase(n1, n2, cos_i, sin2_t, tir)
-        m_r = reflection_mueller(rs, rp, tir, phase)
-        m_r = InterfaceMueller(R_used, m_r.m01, m_r.m22, m_r.m23)
-        m_t = transmission_mueller(1.0 - rs**2, 1.0 - rp**2, m00=T_used)
+        rs2, rp2 = rs**2, rp**2
+        m01 = be.where(tir, be.zeros_like(rs2), 0.5 * (rp2 - rs2))
+        m22 = rp * rs
+        m_r = InterfaceMueller(
+            R_used, m01, be.where(tir, phase[0], m22), be.where(tir, phase[1], be.zeros_like(m22))
+        )
+        amp = _masked_sqrt((1.0 - rs2) * (1.0 - rp2))
         m_t = InterfaceMueller(
             T_used,
-            be.where(tir, zero, -m_r.m01),
-            be.where(tir, zero, m_t.m22),
+            be.where(tir, zero, -m01),
+            be.where(tir, zero, amp),
             zero,
         )
-    elif hasattr(coating, "stack") or callable(getattr(coating, "sp", None)):
-        if hasattr(coating, "stack"):
-            sp = thin_film_sp(coating.stack, wavelength, cos_i, reverse=from_substrate)
-        else:
-            # a coating table with its phase grids (it refuses without them)
-            sp = coating.sp(wavelength, cos_i, from_substrate)
+    elif sp is not None or hasattr(coating, "stack") or callable(getattr(coating, "sp", None)):
+        if sp is None:
+            sp = coating_sp(coating, wavelength, cos_i, from_substrate)
         if coated_tir:
             # issue 96: beyond the critical angle the coating keeps its own
             # s and p reflectances (R_used there is (R_s + T_s + R_p + T_p) / 2,
@@ -983,7 +1025,8 @@ def fresnel_stokes(
         else:
             m01 = be.where(tir, zero, 0.5 * (sp.Rp - sp.Rs))
         m_r = InterfaceMueller(R_used, m01, sp.xr_re, sp.xr_im)
-        t = sp.transmission()
+        # m00 is the engine's T_used: the element's own (T_s + T_p) / 2 is not formed
+        t = transmission_mueller(sp.Ts, sp.Tp, m00=T_used, phase=(sp.xt_cos, sp.xt_sin))
         m_t = InterfaceMueller(
             T_used, be.where(tir, zero, t.m01), be.where(tir, zero, t.m22),
             be.where(tir, zero, t.m23),
