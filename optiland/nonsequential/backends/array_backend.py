@@ -454,6 +454,7 @@ def bounce_body(backend, ctx: _BounceContext, rays: NSQRayBundle):
         ray_id_allocator=ctx.allocator,
         skip_unhit=backend.host_reads_free,
         hit_counts=ctx.hit_counts,
+        interact_fn=backend.interaction_hook(),
     )
 
     # --- escape -----------------------------------------
@@ -784,6 +785,15 @@ class ArrayBackend(TracerBackend):
         if not self.host_reads_free:
             return False
         return not bool(be.any(mask))
+
+    def interaction_hook(self):
+        """The function that runs a component's interaction in place of its own ``interact``, or None.
+
+        None here: every component runs its own ``interact``. The torch
+        backend returns its Warp interaction stage when a trace asked for it
+        (``TorchBackend(interact_kernel="warp")``).
+        """
+        return None
 
     def intersect_scene(
         self,

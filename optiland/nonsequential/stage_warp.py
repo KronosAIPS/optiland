@@ -1478,8 +1478,18 @@ def _make_kernels(FT, fma, ulp, flipsign):
     kernels["mm_probe"] = k_mm_probe
     kernels["absmax"] = k_absmax
     kernels["merge"] = k_merge
+    # The shared functions, for the other stages' kernels (stage_warp_interact):
+    # one definition of each torch order, whichever stage reproduces it.
+    _FUNCS[bits] = {
+        "sum3": _sum3, "rdiv": _rdiv, "row_code": _row_code, "mm": _mm, "to_local": _to_local,
+        "dir_local": _dir_local, "to_global_normal": _to_global_normal, "max_nan": _max_nan,
+        "fma": fma, "ulp": ulp, "neg": flipsign,
+    }
     return kernels
 
+
+#: The functions of :func:`_make_kernels` per float width (64, 32).
+_FUNCS: dict = {}
 
 _KERNELS = {
     torch.float64: _make_kernels(wp.float64, _fma64, _ulp64, _neg64),
