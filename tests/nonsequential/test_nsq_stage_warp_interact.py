@@ -147,6 +147,7 @@ def _bundle(n: int, seed: int, placement: str) -> NSQRayBundle:
     return NSQRayBundle(
         x=arr(p[:, 0]), y=arr(p[:, 1]), z=arr(p[:, 2]), L=arr(d[:, 0]), M=arr(d[:, 1]), N=arr(d[:, 2]),
         wavelength=arr(np.full(n, 0.55)), flux=arr(g.uniform(0.1, 2.0, n)), n_current=arr(np.ones(n)),
+        k_current=arr(np.zeros(n)),
         bounce=arr(g.integers(0, 7, n), torch.int32), alive=arr(g.uniform(size=n) > 0.1, torch.bool),
         ray_id=arr(np.arange(n) * 3 + seed, torch.int64),
     )
