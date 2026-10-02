@@ -732,9 +732,26 @@ class TabulatedCoating(BaseCoating):
     issue 83); its relative phases are ``phase_t`` and
     ``2 phase_t - phase_r`` (the Stokes relations of a lossless coating).
     Beyond the critical angle from the substrate (``sin theta_0 >= 1``) the
-    ray reads ``R = 1``, ``T = 0``. A table of an absorbing coating seen from
-    both sides needs a second table for the far side, attached as the
-    coating of that side.
+    ray reads ``R = 1``, ``T = 0``.
+
+    **The reverse-side table** (optional, ``reverse=``). An absorbing coating
+    reflects differently from its two sides, and beyond the critical angle
+    from the substrate it absorbs (frustrated total internal reflection), so
+    the far side of its table cannot be inferred from the near side. A second
+    table, the interface as the substrate sees it, removes the approximation:
+    a mapping with the same field names (``wavelength_nm``, ``angle_deg``,
+    ``r_s``, ``r_p``, ``t_s``, ``t_p`` and optionally the two phase grids),
+    its ``angle_deg`` the angle of incidence *in the substrate*, 0 to 90
+    degrees, beyond the critical angle included. A ray from the substrate
+    then reads that table at its own angle, with no Snell mapping, no
+    reciprocity and no forced total reflection; a ray from the incident side
+    reads the near table exactly as without it, bit for bit. Which rule the
+    far side follows is stated by :attr:`far_side` (``"reverse table"`` or
+    ``"reciprocity"``) and :attr:`far_side_exact` (True with a reverse table,
+    and without one only when every grid node is lossless, ``R + T = 1``
+    within the energy tolerance). The shared library's coating-table record
+    has no field for the reverse side yet; the engine carries it as an
+    argument.
 
     Device residency: the grids are uploaded once per (dtype, device) on
     first use and kept; inside the bounce loop the lookup is backend
@@ -756,6 +773,11 @@ class TabulatedCoating(BaseCoating):
             ``"air"`` default.
         incident_side: ``"auto"``, ``"front"`` or ``"back"``.
         name: An optional label.
+        reverse: Optional reverse-side table: a mapping of the fields above
+            (``wavelength_nm``, ``angle_deg`` in the substrate, the four power
+            grids, optionally the two phase grids), or a
+            :class:`TabulatedCoating` whose incident medium is this table's
+            substrate. ``lossless`` applies to a mapping as to this table.
     """
 
     def __init__(
@@ -774,6 +796,7 @@ class TabulatedCoating(BaseCoating):
         incident_material=None,
         incident_side: str = "auto",
         name: str = "",
+        reverse=None,
     ):
         import numpy as np  # noqa: PLC0415
 
@@ -837,6 +860,58 @@ class TabulatedCoating(BaseCoating):
         self.incident_side = _check_incident_side(incident_side)
         self.name = name
         self._resident: dict = {}
+        self.reverse = self._reverse_table(reverse) if reverse is not None else None
+
+    def _reverse_table(self, reverse) -> TabulatedCoating:
+        """The reverse-side table as a :class:`TabulatedCoating` seen from the substrate."""
+        if isinstance(reverse, TabulatedCoating):
+            if reverse.reverse is not None:
+                raise ValueError("a reverse-side table carries no reverse table of its own")
+            table = reverse
+        else:
+            fields = ("wavelength_nm", "angle_deg", *TABLE_POWER_FIELDS, *TABLE_PHASE_FIELDS)
+            unknown = sorted(set(reverse) - set(fields))
+            if unknown:
+                raise ValueError(f"the reverse-side table has unknown fields {unknown}")
+            table = TabulatedCoating(
+                **{k: reverse[k] for k in fields if k in reverse},
+                lossless=self.lossless,
+                substrate_material=self.incident_material,
+                incident_material=self.substrate_material,
+                name=f"{self.name} (reverse side)" if self.name else "reverse side",
+            )
+        if bool(table.phases) != bool(self.phases):
+            raise ValueError(
+                "give the phase grids on both sides or on neither: a Stokes trace reads "
+                "the side each ray meets"
+            )
+        return table
+
+    # ----- which rule the far side follows -----
+    @property
+    def far_side(self) -> str:
+        """``"reverse table"`` when a reverse-side table is attached, else ``"reciprocity"``."""
+        return "reverse table" if self.reverse is not None else "reciprocity"
+
+    @property
+    def far_side_exact(self) -> bool:
+        """Whether a ray from the substrate reads exact values.
+
+        True with a reverse-side table. Without one, the far side's ``T`` is
+        exact by reciprocity and its ``R`` is exact only for a lossless coating:
+        True when every node has ``R + T = 1`` within the energy tolerance for
+        both polarizations, False when any node absorbs (the far side's ``R``,
+        and its total reflection beyond the critical angle, are then
+        approximations).
+        """
+        if self.reverse is not None:
+            return True
+        import numpy as np  # noqa: PLC0415
+
+        return all(
+            np.all(np.abs(self.grids[f"r_{p}"] + self.grids[f"t_{p}"] - 1.0) <= _TABLE_ENERGY_TOL)
+            for p in ("s", "p")
+        )
 
     # ----- construction from the shared library's records -----
     @classmethod
@@ -845,9 +920,14 @@ class TabulatedCoating(BaseCoating):
 
         The table's fields are this class's arguments by name, so nothing is
         translated: ``cls(**table.arrays(), **kwargs)``. ``kwargs`` carries
-        what the record type does not (the media, ``lossless``, the phases).
+        what the record type does not (the media, ``lossless``, the phases,
+        the reverse-side table: ``reverse=`` takes another ``CoatingTable``
+        or its ``arrays()`` dict as well as a mapping).
         """
         arrays = table.arrays() if hasattr(table, "arrays") else dict(table)
+        reverse = kwargs.get("reverse")
+        if reverse is not None and hasattr(reverse, "arrays"):
+            kwargs["reverse"] = reverse.arrays()
         return cls(**arrays, **kwargs)
 
     @classmethod
@@ -960,13 +1040,22 @@ class TabulatedCoating(BaseCoating):
             cos_theta_i: Per-ray ``|cos theta|`` in the medium the ray arrives
                 from.
             from_substrate: Optional per-ray mask of the rays arriving from the
-                substrate side (read at the Snell angle in the incident
-                medium; see the class docstring).
+                substrate side (read from the reverse-side table at their own
+                angle when one is attached, else at the Snell angle in the
+                incident medium; see the class docstring).
 
         Returns:
             ``{"r_s", "r_p", "t_s", "t_p"}`` per ray, and with phase grids
             ``"xr_cos", "xr_sin", "xt_cos", "xt_sin"`` (normalised).
         """
+        if from_substrate is not None and self.reverse is not None:
+            # the far side from its own table, at the ray's own angle in the
+            # substrate; the near side exactly as with no mask
+            near = self.lookup(wavelength_um, cos_theta_i)
+            far = self.reverse.lookup(wavelength_um, cos_theta_i)
+            return {
+                name: be.where(from_substrate, far[name], near[name]) for name in near
+            }
         c = be.clip(be.abs(cos_theta_i), 0.0, 1.0)
         far_tir = None
         if from_substrate is not None:
@@ -1099,6 +1188,14 @@ class TabulatedCoating(BaseCoating):
         d["substrate_material"] = self.substrate_material.to_dict()
         d["incident_side"] = self.incident_side
         d["name"] = self.name
+        if self.reverse is not None:
+            r = self.reverse
+            d["reverse"] = {
+                "wavelength_nm": r.wavelength_nm.tolist(),
+                "angle_deg": r.angle_deg.tolist(),
+                **{f: r.grids[f].tolist() for f in TABLE_POWER_FIELDS},
+                **{f: r.phases[f].tolist() for f in TABLE_PHASE_FIELDS if f in r.phases},
+            }
         return d
 
     @classmethod
@@ -1115,4 +1212,5 @@ class TabulatedCoating(BaseCoating):
             substrate_material=BaseMaterial.from_dict(data["substrate_material"]),
             incident_side=data.get("incident_side", "auto"),
             name=data.get("name", ""),
+            reverse=data.get("reverse"),
         )
