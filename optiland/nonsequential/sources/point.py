@@ -16,7 +16,11 @@ from optiland.nonsequential._utils import as_attachable_param, host_float
 from optiland.nonsequential.components.base import _get_transform
 from optiland.nonsequential.ray_bundle import NSQRayBundle
 from optiland.nonsequential.rng import EventSlot
-from optiland.nonsequential.sources.base import BaseNSQSource, Spectrum
+from optiland.nonsequential.sources.base import (
+    BaseNSQSource,
+    Spectrum,
+    medium_index_on_host,
+)
 
 if TYPE_CHECKING:
     from optiland.coordinate_system import CoordinateSystem
@@ -109,12 +113,7 @@ class PointSource(BaseNSQSource):
         # Initialize n_current/k_current from medium if provided
         medium = getattr(self, "medium", None)
         if medium is not None:
-            n_init = np.asarray(medium.n(wavelengths), dtype=float)
-            if np.ndim(n_init) == 0:
-                n_init = np.full(num_rays, float(n_init))
-            k_init = np.asarray(medium.k(wavelengths), dtype=float)
-            if np.ndim(k_init) == 0:
-                k_init = np.full(num_rays, float(k_init))
+            n_init, k_init = medium_index_on_host(medium, wavelengths, num_rays)
         else:
             n_init = np.ones(num_rays)
             k_init = np.zeros(num_rays)
