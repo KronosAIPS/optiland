@@ -168,3 +168,45 @@ class TestRenderers3D:
         )
         ((_, y, z),) = self._captured(mirror_renderers.MirrorRenderer3D().render, m)
         np.testing.assert_array_equal(z, _kind_sag(m.surfaces[0], y))
+
+
+class TestNurbsMirror:
+    """A NURBS mirror is drawn from its surface, sampled along the section by the
+    kind's own intersection (KronosNSRT issue 88), not as the config's base conic.
+
+    The face is the revolved parabola of the NURBS tests, z = r^2 / (4 f) exactly
+    (a polynomial quadratic Bezier arc, so the patch is the paraboloid with no
+    representation error): every drawn point lies on it to the kind's root
+    accuracy, over the patches' extent (10 mm), where the config's radius 0
+    would draw a flat line."""
+
+    F = 50.0
+
+    def _mirror(self):
+        from tests.nonsequential.test_nsq_nurbs import contract, revolved  # noqa: PLC0415
+
+        h = 10.0
+        arrays = contract([revolved([0, 0, 0, 1, 1, 1], [[0, 0], [h / 2, 0], [h, h * h / (4 * self.F)]], [1, 1, 1], 2)
+                           + (False,)])
+        return Mirror("M", CoordinateSystem(), MirrorConfig(radius=0.0, reflectance=1.0, nurbs=arrays))
+
+    def test_2d_points_lie_on_the_surface(self):
+        m = self._mirror()
+        (line,) = _drawn_lines(mirror_renderers.MirrorRenderer2D().render, m)
+        z, y = line[:, 0], line[:, 1]
+        ok = np.isfinite(z)
+        # drawn over the part of the section on the patches: from the probe's first hit to its last,
+        # within one probe step (2 x 10 sqrt(2) mm / 512) of the rim at 10 mm
+        assert ok.all()
+        assert -y.min() > 10.0 - 0.06 and y.max() > 10.0 - 0.06 and np.abs(y).max() <= 10.0
+        # the kind's own surface, z = y^2 / (4 f): within the kind's root tolerance
+        # (32 u at the coordinate scale, about 2 * 10 mm with the ray's start below)
+        np.testing.assert_allclose(z[ok], y[ok] ** 2 / (4 * self.F), rtol=0, atol=64 * 2.0**-53 * 40.0)
+        # and not the config's base conic (radius 0: flat), which the drawing used before
+        assert np.max(np.abs(z[ok] - _base_conic(0.0, 0.0, y[ok]))) > 0.4
+
+    def test_3d_contour_lies_on_the_surface(self):
+        m = self._mirror()
+        ((_, y, z),) = TestRenderers3D._captured(mirror_renderers.MirrorRenderer3D().render, m)
+        assert np.all(np.isfinite(z)) and 10.0 - 0.06 < y.max() <= 10.0
+        np.testing.assert_allclose(z, y**2 / (4 * self.F), rtol=0, atol=64 * 2.0**-53 * 40.0)

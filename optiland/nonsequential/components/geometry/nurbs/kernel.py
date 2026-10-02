@@ -35,7 +35,10 @@ Per call (one chunk of rays at a time, the chunk size fixed by the ray count):
 4. **Acceptance:** residual at most ``k_tol`` (32) units of the working dtype at
    the larger of the leaf's scale and the ray's coordinate scale; ``(s, r)``
    inside the leaf's Bezier piece within ``4 tol / |S_s|`` (a root beyond the
-   leaf but inside the piece is the same polynomial's root); a collapsed edge
+   leaf but inside the piece is the same polynomial's root; one just beyond
+   the piece is too, and its normal and adjoint are taken at its own ``(s,
+   r)`` while its patch parameters for the bounds and trim tests are clamped
+   into the piece, issue 108); a collapsed edge
    (the whole leaf moves the point by less than ``tol`` along a parameter)
    clamps that parameter; beyond the start ``t0``; for a ray leaving the
    surface, beyond ``4 tol / |cos|``, the self root's own uncertainty; inside
@@ -58,6 +61,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
+
+from optiland.nonsequential.components.geometry.nurbs import trim as _trim
 
 #: Fixed Newton iteration count (the prototype's 16; its measured maximum to
 #: convergence was 14 on the sphere and 16 on the bicubic patch in float64).
@@ -230,6 +235,7 @@ class DeviceLeaves:
     tedge: Any = None  # (n_pieces, K, E, 4) polygon edges (a_u, a_v, b_u, b_v) per piece and v slab, zero-padded
     tslab: Any = None  # (n_pieces, 2) each piece's slab origin in v and slabs per unit v
     ttrim: Any = None  # (n_pieces,) bool the piece's patch is trimmed
+    tband: Any = None  # (n_pieces, K, E) each edge's band in the working dtype, < 0: none (issue 107)
 
 
 def upload(leaves, to_array, pad_ulps: float = 8.0, u: float = 2.0**-53, to_index=None) -> DeviceLeaves:
@@ -262,12 +268,19 @@ def upload(leaves, to_array, pad_ulps: float = 8.0, u: float = 2.0**-53, to_inde
         if to_index is None:
             def to_index(x):
                 return np.asarray(x, dtype=np.int64)
+        # the band on the device: the host's bound on the curve's departure from
+        # the edge plus the working dtype's rounding of the vertices, the hit's
+        # (u, v) and the distance (trim.BAND_ROUNDING_K units at the patch's
+        # parameter scale); an edge with no band (along the rectangle, padding) stays -1
+        hb = lv.piece_bands
+        band = np.where(hb >= 0.0, hb + _trim.BAND_ROUNDING_K * u * lv.piece_scale[:, None, None], -1.0)
         trim = {
             "piece": to_index(lv.piece),
             # a padded edge (0, 0, 0, 0) never straddles: both ends compare alike
             "tedge": to_array(lv.piece_edges),
             "tslab": to_array(lv.piece_slab),
             "ttrim": to_index(lv.piece_trimmed.astype(np.int64)) > 0,
+            "tband": to_array(band),
         }
     return DeviceLeaves(
         to_array(net), to_array(lv.centre), to_array(lv.frame), to_array(half), to_array(scale),
@@ -508,6 +521,14 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
     es = eps_s * ws
     er = eps_r * wr
     dom = (sp >= -es) & (sp <= 1.0 + es) & (rp >= -er) & (rp <= 1.0 + er)
+    # The hit's own (s, r) for the normal and the adjoint (issue 108): a root up to
+    # 4 tol / |S_k| beyond its piece lies on the same polynomial continued, and its
+    # normal is taken there, not at the piece's edge up to 4 tol away. The same round
+    # trip through the piece as before, without the clip, so (s, r) are the bits they
+    # were wherever the clamp does not fire. The patch parameters (uu, vv) of the
+    # bounds and trim tests stay clamped into the piece.
+    s_hit = (sp - sb[:, 0]) / ws
+    r_hit = (rp - sb[:, 2]) / wr
     s = (ops.clip(sp, 0.0, 1.0) - sb[:, 0]) / ws
     r = (ops.clip(rp, 0.0, 1.0) - sb[:, 2]) / wr
     ttot = tpre + tl
@@ -521,7 +542,7 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
     ok = ok & (uu >= ub[:, 0]) & (uu <= ub[:, 1]) & (vv >= ub[:, 2]) & (vv <= ub[:, 3])
     if dl.tedge is not None:
         pc = dl.piece[lane_leaf]
-        ok = ok & (_in_trim(ops, dl.tedge, dl.tslab, pc, uu, vv) | ~dl.ttrim[pc])
+        ok = ok & (_in_trim(ops, dl.tedge, dl.tslab, pc, uu, vv, dl.tband) | ~dl.ttrim[pc])
     # -- 5. one winner per ray ----------------------------------------------------
     tt = ops.where(ok, ttot, ops.full_like(ttot, inf))
 
@@ -542,8 +563,8 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
         "hit": hit,
         "leaf": ops.where(hit, leaf, ops.zeros_like(leaf) - 1),
         "leaf_safe": ops.where(hit, leaf, ops.zeros_like(leaf)),
-        "s": pick(s),
-        "r": pick(r),
+        "s": pick(s_hit),
+        "r": pick(r_hit),
         "u": pick(uu),
         "v": pick(vv),
         "tpre": pick(tpre),
@@ -562,8 +583,9 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
 _MAX_TRIM_PAIRS = 1 << 21
 
 
-def _in_trim(ops, tedge, tslab, pc, uu, vv):
-    """Whether each lane's ``(uu, vv)`` lies inside its piece's trim polygons.
+def _in_trim(ops, tedge, tslab, pc, uu, vv, tband=None):
+    """Whether each lane's ``(uu, vv)`` lies inside its piece's trim polygons
+    and outside every edge's band.
 
     The library's even-odd rule (``kgeom.nurbs.point_in_trim``), written in the
     same operations and order: a ray from the point toward ``+u`` counts the
@@ -573,6 +595,14 @@ def _in_trim(ops, tedge, tslab, pc, uu, vv):
     slab index is clipped, and the host's slack covers its rounding). Fixed
     shapes, no host read: the slab's edges are gathered per lane in fixed-size
     chunks of the padded edge axis.
+
+    The band (issue 107): a point within an edge's band of it, ``|p - e| <=
+    band`` with ``band`` at least how far the trim curve can lie from the edge,
+    is on the trim curve as far as the polygon can tell, and is treated as on the
+    adjacent face's side: not inside. So no point beyond the true curve is kept
+    (the polygon's chords cannot open a solid there); points inside it within
+    the band are given to the cut. An edge along the patch's rectangle has no
+    band (``< 0``): the rectangle is tested exactly.
     """
     lanes = uu.shape[0]
     n_slabs = int(tedge.shape[1])
@@ -584,6 +614,7 @@ def _in_trim(ops, tedge, tslab, pc, uu, vv):
     pu = uu[:, None]
     pv = vv[:, None]
     count = None
+    near = None
     for e0 in range(0, E, step):
         ed = tedge[pc, k, e0 : min(E, e0 + step)]
         au, av, bu, bv = ed[..., 0], ed[..., 1], ed[..., 2], ed[..., 3]
@@ -591,7 +622,19 @@ def _in_trim(ops, tedge, tslab, pc, uu, vv):
         cross_u = au + (pv - av) * (bu - au) / (bv - av)
         c = (straddle & (pu < cross_u)).sum(-1)
         count = c if count is None else count + c
-    return (count % 2) == 1
+        if tband is not None:
+            tb = tband[pc, k, e0 : min(E, e0 + step)]
+            eu, ev = bu - au, bv - av
+            qu, qv = pu - au, pv - av
+            l2 = eu * eu + ev * ev
+            pos = l2 > 0.0
+            sp = ops.where(pos, (qu * eu + qv * ev) / ops.where(pos, l2, l2 + 1.0), l2 * 0.0)
+            sp = ops.clip(sp, 0.0, 1.0)
+            du, dv = qu - sp * eu, qv - sp * ev
+            n = ((tb >= 0.0) & (du * du + dv * dv <= tb * tb)).sum(-1) > 0
+            near = n if near is None else (near | n)
+    inside = (count % 2) == 1
+    return inside if near is None else inside & ~near
 
 
 def _rounds(ops, dl, o, d, t0, n_iter, k_tol, C, A):

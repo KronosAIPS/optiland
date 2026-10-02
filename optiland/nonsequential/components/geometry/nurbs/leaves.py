@@ -119,6 +119,9 @@ class LeafSet:
     piece_trimmed: np.ndarray | None = None  # (n_pieces,) bool: the piece's patch is trimmed
     piece_edges: np.ndarray | None = None  # (n_pieces, K, E, 4) padded polygon edges per piece and v slab
     piece_slab: np.ndarray | None = None  # (n_pieces, 2) the slabs' v origin and 1 / height
+    piece_bands: np.ndarray | None = None  # (n_pieces, K, E) each edge's band on the host, -1: none
+    #                                        (an edge along the rectangle, or padding); issue 107
+    piece_scale: np.ndarray | None = None  # (n_pieces,) the patch's parameter scale max |uv_bounds|
     patch_trimmed: np.ndarray | None = None  # (n_patches,) bool
     trim_polygons: dict | None = None  # patch index -> [(points (k, 2), outer), ...]
     n_dropped: int = 0  # leaves wholly in a trimmed-away region, not kept
@@ -461,8 +464,9 @@ def build_leaves(
             _loops_on_domain_boundary(arrays, i, domains[i])
         ):
             patch_trimmed[i] = True
-            polys[i] = T.trim_polygons(arrays, i, uvb[i])
-            edges_of[i] = T.polygon_edges(polys[i])
+            polys[i], bands = T.trim_polygons_and_bands(arrays, i, uvb[i])
+            # the band travels with its edge through the piece and slab filters as a fifth column
+            edges_of[i] = np.column_stack([T.polygon_edges(polys[i]), bands])
     piece_uv: list = []
     piece_patch: list = []
     piece_trimmed: list = []
@@ -482,6 +486,7 @@ def build_leaves(
             t_edges = edges_of[i]
             t_scale = max(abs(float(x)) for x in uvb[i])
             t_margin = 2.0 * T.trim_tolerance(uvb[i]) + 1e-12 * max(t_scale, 1.0)
+            b_margin = T.band_filter_margin(t_edges[:, 4], t_scale)
         ku = np.asarray(arrays["knots_u"][int(arrays["patch_knot_u_offset"][i]) : int(arrays["patch_knot_u_offset"][i + 1])])
         kv = np.asarray(arrays["knots_v"][int(arrays["patch_knot_v_offset"][i]) : int(arrays["patch_knot_v_offset"][i + 1])])
         sl = slice(int(off[i]), int(off[i + 1]))
@@ -591,7 +596,7 @@ def build_leaves(
                 piece_patch.append(i)
                 piece_trimmed.append(trimmed_i)
                 piece_edge_list.append(
-                    T.piece_edges(t_edges, (ua, ub, va, vb), t_scale) if trimmed_i else np.zeros((0, 4))
+                    T.piece_edges(t_edges, (ua, ub, va, vb), t_scale, b_margin) if trimmed_i else np.zeros((0, 5))
                 )
                 piece_id += 1
 
@@ -610,17 +615,23 @@ def build_leaves(
                 slabs.append([e] * n_slabs)
             else:
                 p_scale = max(abs(float(x)) for x in uvb[int(piece_patch[k])])
-                slabs.append(T.slab_edges(e, va_k, vb_k, n_slabs, p_scale))
+                slabs.append(T.slab_edges(e, va_k, vb_k, n_slabs, p_scale,
+                                          T.band_filter_margin(e[:, 4], p_scale)))
         e_max = max(1, max(x.shape[0] for sl in slabs for x in sl))
         padded = np.zeros((piece_id, n_slabs, e_max, 4))
+        padded_band = np.full((piece_id, n_slabs, e_max), -1.0)
         for k, sl in enumerate(slabs):
             for j, x in enumerate(sl):
-                padded[k, j, : x.shape[0]] = x
+                padded[k, j, : x.shape[0]] = x[:, :4]
+                padded_band[k, j, : x.shape[0]] = x[:, 4]
+        piece_scale = np.array([max(abs(float(x)) for x in uvb[int(piece_patch[k])]) for k in range(piece_id)])
         trim_kw = {
             "piece_uv": np.array(piece_uv, dtype=np.float64).reshape(-1, 4),
             "piece_trimmed": np.array(piece_trimmed, dtype=bool),
             "piece_edges": padded,
             "piece_slab": slab_geo,
+            "piece_bands": padded_band,
+            "piece_scale": piece_scale,
             "patch_trimmed": patch_trimmed,
             "trim_polygons": polys,
             "n_dropped": n_dropped,

@@ -478,3 +478,170 @@ def test_flux_band_bound_of_the_hole():
     share = band_area / (2 * L_PLATE) ** 2
     assert length == pytest.approx(2 * math.pi * HOLE_RHO, rel=1e-6)
     assert share < 3e-6
+
+
+# ---------------------------------------------------------------------------
+# The band about a trim curve (issue 107): no kept point beyond the true curve
+# ---------------------------------------------------------------------------
+
+
+def _near_curve_rays(kind, n, seed, reach):
+    """Rays at (x, y) within ``reach`` (in (u, v)) of the true trim curve, and the
+    exact inside test of the true region at their (u, v)."""
+    rng = np.random.default_rng(seed)
+    if kind == "hole":
+        c, rho = np.array(HOLE_C), HOLE_RHO
+        th = rng.uniform(0, 2 * math.pi, n)
+        rr = rho + rng.uniform(-reach, reach, n)
+        uv = c + rr[:, None] * np.column_stack([np.cos(th), np.sin(th)])
+
+        def inside(q):
+            return np.hypot(q[:, 0] - c[0], q[:, 1] - c[1]) > rho
+    else:
+        c, rho = np.array(DCUT_C), DCUT_RHO
+        x_chord = c[0] + rho * math.cos(DCUT_ALPHA)
+        half = rho * math.sin(DCUT_ALPHA)
+        m = n // 2
+        th = rng.uniform(DCUT_ALPHA, 2 * math.pi - DCUT_ALPHA, m)
+        rr = rho + rng.uniform(-reach, reach, m)
+        arc_uv = c + rr[:, None] * np.column_stack([np.cos(th), np.sin(th)])
+        chord_uv = np.column_stack([x_chord + rng.uniform(-reach, reach, n - m),
+                                    c[1] + rng.uniform(-0.95 * half, 0.95 * half, n - m)])
+        uv = np.concatenate([arc_uv, chord_uv])
+
+        def inside(q):
+            return (np.hypot(q[:, 0] - c[0], q[:, 1] - c[1]) < rho) & (q[:, 0] < x_chord)
+    return uv, inside
+
+
+class TestBand:
+    """Inside the polygonisation band the kind refuses the hit (issue 107): a
+    point within its edge's band of a trim polygon edge is on the trim curve as
+    far as the polygon can tell and is given to the adjacent face. So no point
+    beyond the true curve is ever kept, at either precision: the chords cannot
+    open a solid. Points inside the curve within the band are refused."""
+
+    N = 20000
+
+    @pytest.mark.parametrize("kind", ["hole", "dcut"])
+    @pytest.mark.parametrize(("backend", "precision"), CONFIGS)
+    def test_no_kept_point_lies_beyond_the_true_curve(self, kind, backend, precision):
+        _set(backend, precision)
+        a = holed_plate() if kind == "hole" else dcut_plate()
+        tol = T.trim_tolerance((0, 1, 0, 1))
+        uv, inside = _near_curve_rays(kind, self.N, 41, 3.0 * tol)
+        xy = 2 * L_PLATE * uv - L_PLATE
+        o = np.column_stack([xy, np.full(self.N, 5.0)])
+        d = np.tile([0.0, 0.0, -1.0], (self.N, 1))
+        O, D = _cast(backend, precision, o, d)
+        # the exact region at the (u, v) of the rays as the dtype holds them
+        held = (_np(O)[:, :2].astype(np.float64) + L_PLATE) / (2 * L_PLATE)
+        g = NurbsGeometry(a)
+        _, _, hit, _ = g.ray_intersect(O, D)
+        hit = _np(hit)
+        truth = inside(held)
+        assert not np.any(hit & ~truth)
+        # the hole's polygon is inscribed in its circle, so the polygon alone keeps points
+        # inside the circle (beyond the curve): the band is what refuses them
+        if kind == "hole":
+            poly_in = T.even_odd(T.polygon_edges(g.leaves.trim_polygons[0]), held[:, 0], held[:, 1])
+            assert np.any(poly_in & ~truth)
+        # a refused point inside the true curve lies within the band of the curve
+        lost = truth & ~hit
+        dist = np.abs(np.hypot(held[lost, 0] - (HOLE_C if kind == "hole" else DCUT_C)[0],
+                               held[lost, 1] - (HOLE_C if kind == "hole" else DCUT_C)[1])
+                      - (HOLE_RHO if kind == "hole" else DCUT_RHO))
+        if kind == "dcut":
+            x_chord = DCUT_C[0] + DCUT_RHO * math.cos(DCUT_ALPHA)
+            dist = np.minimum(dist, np.abs(held[lost, 0] - x_chord))
+        assert np.all(dist <= 2.0 * tol + T.BAND_ROUNDING_K * _u(precision) + 1e-12)
+
+    @pytest.mark.parametrize("make", [holed_plate, dcut_plate])
+    def test_each_band_bounds_its_curve(self, make):
+        # 2,001 points of the curve between the ends of every chord lie within that chord's band
+        a = make()
+        polys, bands = T.trim_polygons_and_bands(a, 0, a["patch_uv_bounds"][0])
+        assert all(np.array_equal(p, q) for (p, _), (q, _) in zip(polys, T.trim_polygons(a, 0, (0, 1, 0, 1))))
+        tol = T.trim_tolerance((0, 1, 0, 1))
+        k = 0
+        for curves, _ in T.patch_loops(a, 0):
+            for c in curves:
+                pts, t = T.curve_polyline(c, tol, return_params=True)
+                own = T.chord_bands(c, pts, t) if not T._on_rectangle(c, (0, 1, 0, 1)) else None
+                for j in range(pts.shape[0] - 1):
+                    q = c.evaluate(np.linspace(t[j], t[j + 1], 2001))
+                    dev = T._point_segment_distance(q, np.repeat(pts[j:j + 1], 2001, 0),
+                                                    np.repeat(pts[j + 1:j + 2], 2001, 0)).max()
+                    if own is not None:
+                        assert dev <= own[j]
+                        assert own[j] <= 1.01 * tol
+                k += pts.shape[0] - 1
+        assert bands.shape[0] == T.polygon_edges(polys).shape[0]
+
+    def test_edges_along_the_rectangle_have_no_band(self):
+        # the capped sphere's loop: three sides on the domain's rectangle, the cut v = V_CUT inside it
+        a = capped_sphere()
+        polys, bands = T.trim_polygons_and_bands(a, 0, a["patch_uv_bounds"][0])
+        e = T.polygon_edges(polys)
+        on_cut = (np.abs(e[:, 1] - V_CUT) < 1e-15) & (np.abs(e[:, 3] - V_CUT) < 1e-15)
+        assert np.all(bands[~on_cut] < 0.0)
+        assert np.all((bands[on_cut] >= 0.0) & (bands[on_cut] < 1e-14))
+
+
+# ---------------------------------------------------------------------------
+# The normal at the hit's own parameters (issue 108)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalAtTheHit:
+    """A root just beyond its lane's Bezier piece is accepted (the same polynomial
+    continued); its (s, r) are returned unclamped, so the normal and the adjoint
+    are evaluated at the hit, not at the piece's edge. Checked on rays aimed at
+    the exact sphere's piece seams (azimuths at multiples of 90 degrees, the
+    equator), where rounding puts many roots just beyond a piece: the residual
+    at the returned (s, r) is the Newton's own final residual to the round trip's
+    rounding, at every hit."""
+
+    @staticmethod
+    def _seam_rays(n=20000, seed=108):
+        rng = np.random.default_rng(seed)
+        az = rng.integers(0, 4, n) * (math.pi / 2) + rng.normal(0, 1e-7, n)
+        lat = rng.uniform(-1.4, 1.4, n)
+        eq = rng.uniform(size=n) < 0.3
+        lat = np.where(eq, rng.normal(0, 1e-7, n), lat)
+        az = np.where(eq, rng.uniform(0, 2 * math.pi, n), az)
+        p = R_SPHERE * np.column_stack([np.cos(lat) * np.cos(az), np.cos(lat) * np.sin(az), np.sin(lat)])
+        w = rng.normal(size=(n, 3))
+        w /= np.linalg.norm(w, axis=1, keepdims=True)
+        w = np.where(((w * p).sum(1) < 0.2 * R_SPHERE)[:, None], w + 1.5 * p / R_SPHERE, w)
+        w /= np.linalg.norm(w, axis=1, keepdims=True)
+        return p + 30.0 * w, -w
+
+    @pytest.mark.parametrize(("backend", "precision"), CONFIGS)
+    def test_returned_parameters_are_the_root(self, backend, precision):
+        from optiland.nonsequential import _tol  # noqa: PLC0415
+        from optiland.nonsequential.components.geometry.nurbs import kernel as K  # noqa: PLC0415
+
+        _set(backend, precision)
+        o, d = self._seam_rays()
+        O, D = _cast(backend, precision, o, d)
+        g = NurbsGeometry(contract(*sphere_net(), []))
+        ops = K._Ops(O)
+        with torch.no_grad():
+            dl, _ = g._device(O)
+            t0 = ops.zeros_like(O[:, 0]) + float(_tol.accept_t_min(float(np.abs(_np(O)).max())))
+            out = K.intersect(ops, dl, O, D, t0)
+            leaf, hit = out["leaf_safe"], out["hit"]
+            S, _, _ = K.eval_leaf(ops, dl.net[leaf], out["s"], out["r"], dl.P, dl.Q)
+            F = S + dl.pivot[leaf] - O - out["t"][:, None] * D
+            res = ops.amax_abs(F)
+            tol = 32.0 * ops.u * ops.maximum(dl.scale[leaf], ops.amax_abs(O) + ops.amax_abs(dl.centre[leaf]))
+            sb = dl.sub[leaf]
+            sp = sb[:, 0] + out["s"] * (sb[:, 1] - sb[:, 0])
+            rp = sb[:, 2] + out["r"] * (sb[:, 3] - sb[:, 2])
+        hit = _np(hit)
+        assert hit.all()
+        beyond = hit & _np((sp < 0) | (sp > 1) | (rp < 0) | (rp > 1))
+        assert beyond.any()
+        gap = np.abs(_np(res).astype(float) - _np(out["residual"]).astype(float)) / _np(tol).astype(float)
+        assert gap[hit].max() <= 0.1
