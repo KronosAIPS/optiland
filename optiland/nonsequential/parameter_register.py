@@ -174,6 +174,7 @@ CONTRACT: dict[str, tuple[str, str]] = {
     "sellmeier_resonance_um2": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
     "buchdahl_n0": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
     "buchdahl_nu": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
+    "formula4_coefficients": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
     "table_n": (INTERIOR_BOUNDARY, "Fresnel, Snell and Beer-Lambert (the record's n(lambda))"),
     "table_k": (INTERIOR_BOUNDARY, "Beer-Lambert and Fresnel (the record's k(lambda))"),
 }
