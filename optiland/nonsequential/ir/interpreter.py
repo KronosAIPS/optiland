@@ -191,6 +191,7 @@ def apply_primitive_interactions(
     ray_id_allocator: RayIdAllocator | None = None,
     skip_unhit: bool = True,
     hit_counts: object | None = None,
+    interact_fn: Callable | None = None,
 ) -> NSQRayBundle | None:
     """Apply each hit primitive's interaction to ``rays``, in-place.
 
@@ -252,6 +253,13 @@ def apply_primitive_interactions(
             on the device and read once per trace (the unreached-geometry
             list, and the per-surface hit counter of
             ``docs/theory/10_ledger_and_diagnostics.md`` R-10-6).
+        interact_fn: Optional ``(component, rays, t, normals, mask, rng,
+            bsdf_ir, n_geom, sampling=...)`` that runs a primitive's
+            single-branch interaction in place of ``component.interact``:
+            the torch backend's Warp interaction stage
+            (:mod:`optiland.nonsequential.stage_warp_interact`), which
+            computes the same numbers. ``None`` (the default) calls the
+            component's own ``interact``. Bounded splitting always does.
 
     Returns:
         A new :class:`NSQRayBundle` of transmit-branch children spawned by
@@ -291,6 +299,19 @@ def apply_primitive_interactions(
             and primitive.component_kind == "refractive"
         )
         if not splitting:
+            if interact_fn is not None:
+                interact_fn(
+                    component,
+                    rays,
+                    t_min,
+                    hit_normals,
+                    mask_i,
+                    rng,
+                    primitive.bsdf,
+                    hit_n_geom,
+                    sampling=ir.sampling,
+                )
+                continue
             component.interact(
                 rays,
                 t_min,

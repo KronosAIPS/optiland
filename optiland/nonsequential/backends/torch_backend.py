@@ -365,6 +365,18 @@ class TorchBackend(ArrayBackend):
             ``intersect_kernel_note``, and ``intersect_kernel_routed`` (the
             component intersections handed to torch, by reason) when any
             were.
+        interact_kernel: Which implementation of the components'
+            interaction is asked for: ``"torch"`` (the default: every
+            component's own ``interact``) or ``"warp"`` (a prototype: a
+            reflective component -- a mirror, or a Lambertian lobe -- in one
+            Warp launch, :mod:`optiland.nonsequential.stage_warp_interact`;
+            every other component, and gradients, keep the component's own
+            ``interact``). Used only when ``warp`` imports and the device is
+            CUDA; otherwise the torch stage runs, silently. With ``"warp"``
+            the environment records ``interact_kernel``,
+            ``interact_kernel_requested``, on a fallback
+            ``interact_kernel_note``, and ``interact_kernel_routed`` when any
+            interaction was handed to torch.
         compile_step: Run each bounce through ``torch.compile`` of the
             bounce body (:func:`compiled_bounce_body`) instead of eagerly:
             True on every device, a device type (``"mps"``) on that device
@@ -398,6 +410,7 @@ class TorchBackend(ArrayBackend):
 
     RNG_KERNELS: tuple[str, ...] = ("torch", "warp")
     INTERSECT_KERNELS: tuple[str, ...] = ("torch", "warp")
+    INTERACT_KERNELS: tuple[str, ...] = ("torch", "warp")
 
     def __init__(
         self,
@@ -412,6 +425,7 @@ class TorchBackend(ArrayBackend):
         compile_step: bool | str | None = None,
         compile_options: dict | None = None,
         polarization: str | bool | None = None,
+        interact_kernel: Literal["torch", "warp"] = "torch",
     ) -> None:
         """Initialize TorchBackend.
 
@@ -437,6 +451,8 @@ class TorchBackend(ArrayBackend):
                 docstring. The choice is made at the start of each trace,
                 when the device is known.
             intersect_kernel: ``"torch"`` (default) or ``"warp"``; see the
+                class docstring. Chosen at the start of each trace.
+            interact_kernel: ``"torch"`` (default) or ``"warp"``; see the
                 class docstring. Chosen at the start of each trace.
             compile_step: Run the bounce compiled (see the class
                 docstring): True for every device, a device type
@@ -479,6 +495,11 @@ class TorchBackend(ArrayBackend):
                 f"intersect_kernel must be one of {self.INTERSECT_KERNELS}, "
                 f"got {intersect_kernel!r}"
             )
+        if interact_kernel not in self.INTERACT_KERNELS:
+            raise ValueError(
+                f"interact_kernel must be one of {self.INTERACT_KERNELS}, "
+                f"got {interact_kernel!r}"
+            )
         if graph_replay and compile_step is not None and _normalise_compile_step(compile_step):
             raise ValueError(
                 "graph_replay (CUDA) and compile_step (the Apple GPU) are two ways "
@@ -500,6 +521,9 @@ class TorchBackend(ArrayBackend):
         self.intersect_kernel = intersect_kernel
         self.intersect_kernel_in_use: str | None = None
         self._intersect_kernel_note: str | None = None
+        self.interact_kernel = interact_kernel
+        self.interact_kernel_in_use: str | None = None
+        self._interact_kernel_note: str | None = None
         # The current batch's replay buffers, between _graph_handover_depth and
         # _replay_bounces (graph_replay only).
         self._graph_static: dict | None = None
@@ -558,8 +582,8 @@ class TorchBackend(ArrayBackend):
             # The Warp generator is CUDA's fused draw; the two fusions are
             # not combined (and the pair is unmeasured): the eager bounce.
             return bounce_body
-        if self.intersect_kernel_in_use == "warp":
-            # The same for the Warp intersection kernels.
+        if self.intersect_kernel_in_use == "warp" or self.interact_kernel_in_use == "warp":
+            # The same for the Warp stage kernels.
             return bounce_body
         if self._grad_requested():
             raise CompiledStepError(
@@ -650,6 +674,7 @@ class TorchBackend(ArrayBackend):
             The generator for this trace.
         """
         self._choose_intersect_kernel()
+        self._choose_interact_kernel()
         self._rng_kernel_note = None
         if self.rng_kernel == "warp":
             note = self._warp_rng_unavailable()
@@ -692,6 +717,32 @@ class TorchBackend(ArrayBackend):
             stage_warp.reset_routed()
         else:
             self._intersect_kernel_note = note
+
+    def _choose_interact_kernel(self) -> None:
+        """Decide, at the start of a trace, which interaction stage runs (as for the intersection)."""
+        self._interact_kernel_note = None
+        self.interact_kernel_in_use = "torch"
+        if self.interact_kernel != "warp":
+            return
+        try:
+            from optiland.nonsequential import stage_warp_interact  # noqa: PLC0415
+        except Exception as exc:  # noqa: BLE001 - not installed, or it failed to load
+            self._interact_kernel_note = f"warp is not importable ({type(exc).__name__})"
+            return
+        note = stage_warp_interact.availability(be.get_device())
+        if note is None:
+            self.interact_kernel_in_use = "warp"
+            stage_warp_interact.reset_routed()
+        else:
+            self._interact_kernel_note = note
+
+    def interaction_hook(self):
+        """The Warp interaction stage when this trace runs it, else None (each component's own ``interact``)."""
+        if self.interact_kernel_in_use == "warp":
+            from optiland.nonsequential import stage_warp_interact  # noqa: PLC0415
+
+            return stage_warp_interact.interact_component
+        return None
 
     def intersect_scene(self, rays, components):
         """The nearest component hit: the torch stage, or the Warp kernels when chosen.
@@ -745,6 +796,17 @@ class TorchBackend(ArrayBackend):
                     # component's own intersect, by reason (host-side
                     # counts; a CUDA-graph replay repeats without counting).
                     env["intersect_kernel_routed"] = routed
+        if self.interact_kernel != "torch":
+            env["interact_kernel"] = self.interact_kernel_in_use
+            env["interact_kernel_requested"] = self.interact_kernel
+            if self._interact_kernel_note is not None:
+                env["interact_kernel_note"] = self._interact_kernel_note
+            if self.interact_kernel_in_use == "warp":
+                from optiland.nonsequential import stage_warp_interact  # noqa: PLC0415
+
+                routed = stage_warp_interact.routed_counts()
+                if routed:
+                    env["interact_kernel_routed"] = routed
         if self.graph_replay:
             mode = "emulate" if self.graph_replay == "emulate" else "cuda"
             env["graph_replay"] = mode if self.graph_replay_batches else "none"
