@@ -17,15 +17,32 @@ lies in its leaf's piece, and only the edges a horizontal ray from a point of
 that piece can cross are kept (:func:`piece_edges`), so the device tests a few
 edges per lane instead of every edge of the patch.
 
-The band. Inside the tolerance band around a trim curve the engine answers what
-the polygon says (the library's answer, to the bit at float64); the true curve
-may say otherwise. Between a chord and its arc the band is at most ``tol`` wide
-in ``(u, v)``, so the surface area it covers is at most ``tol`` times the loop's
-length in ``(u, v)`` times the largest ``|S_u x S_v|`` along it, and the flux the
-engine can assign to the wrong side of a trim curve is at most that area times
-the largest irradiance on it. On the device the polygon and the hit's ``(u, v)``
-are rounded to the working dtype; at float32 that widens the band by a few
-units of float32 at the parameters' scale (about 1e-7 for a unit domain).
+The band (KronosNSRT issue 107). Between a chord and its arc the polygon and the
+true curve disagree; where the chord lies beyond the curve (a hole's inscribed
+polygon, a D-cut cap's chords on the cut side) the polygon keeps a sliver of
+surface the solid does not have. A ray entering a closed CAD solid through that
+sliver is carried as inside glass while it is outside the solid, meets the cut
+face from outside at grazing incidence and is refracted into the glass at the
+critical angle, where it is trapped (case r1_41 of the research repository lost
+4, 1 and 2 of 1e5 rays at three seeds that way). The rule that closes the solid
+needs nothing beyond the contract: every edge of a curve that runs inside the
+patch's rectangle carries a band, a bound on how far its curve lies from it
+(:func:`chord_bands`: the departure sampled at 15 interior points plus the
+interpolation term, at most about ``tol``), and a point within its edge's band
+of any edge is on the trim curve as far as the polygon can tell and is refused
+(given to the adjacent face, the cut). The true curve lies inside the union of
+the bands, so no kept point lies beyond it: the faces can leave a gap of at
+most twice the band at a cut, never an overlap. Edges of curves along the
+rectangle (seams, poles, rims) carry no band; the rectangle is tested exactly
+by the patch's ``uv_bounds``. On the device the band grows by
+``BAND_ROUNDING_K`` units of the working dtype at the patch's parameter scale
+(the polygon's and the hit's ``(u, v)`` rounding).
+
+Outside the bands the engine answers what the library's polygon answers (to the
+bit at float64). The surface area of the bands is at most twice the loop's band
+times its length in ``(u, v)`` times the largest ``|S_u x S_v|`` along it, and the
+flux the engine can assign to the cut instead of the face is at most that area
+times the largest irradiance on it.
 """
 
 from __future__ import annotations
@@ -134,10 +151,12 @@ def _point_segment_distance(x: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.n
     return np.linalg.norm(x - (a + s[:, None] * ab), axis=-1)
 
 
-def curve_polyline(curve: TrimCurve, tol: float, max_rounds: int = 30) -> np.ndarray:
+def curve_polyline(curve: TrimCurve, tol: float, max_rounds: int = 30, return_params: bool = False):
     """``(k, 2)`` points along the curve whose chords pass within ``tol`` of the
     curve's point at each chord's middle parameter (the library's rule: four
-    chords per knot span to start, every failing chord halved)."""
+    chords per knot span to start, every failing chord halved). With
+    ``return_params`` also the ``(k,)`` curve parameters of the points (the
+    points are the same)."""
     a, b = curve.domain
     knots = np.unique(curve.knots[(curve.knots >= a) & (curve.knots <= b)])
     t = np.unique(np.concatenate([np.linspace(knots[i], knots[i + 1], 5) for i in range(knots.size - 1)]))
@@ -148,9 +167,146 @@ def curve_polyline(curve: TrimCurve, tol: float, max_rounds: int = 30) -> np.nda
         d = _point_segment_distance(mid, pts[:-1], pts[1:])
         bad = d > tol
         if not np.any(bad):
-            return pts
+            return (pts, t) if return_params else pts
         t = np.sort(np.concatenate([t, tm[bad]]))
-    return curve.evaluate(t)
+    pts = curve.evaluate(t)
+    return (pts, t) if return_params else pts
+
+
+# ---------------------------------------------------------------------------
+# The band about a trim curve (KronosNSRT issue 107)
+# ---------------------------------------------------------------------------
+
+#: Interior samples per chord for the band's measure.
+BAND_SAMPLES = 16
+
+#: Units of the working dtype, at the patch's parameter scale, added to an
+#: interior edge's band on the device: the rounding of the polygon's vertices
+#: on upload (``sqrt(2) u S``), of the hit's ``(u, v)`` formed from its leaf's
+#: range (about ``7 u S`` per coordinate: the range's two ends rounded, their
+#: difference, the product with ``s`` up to 1.25, the sum; ``7 sqrt(2) u S``),
+#: and of the point-to-edge distance's two differences (``2 u S``): 13.3,
+#: rounded up to 16.
+BAND_ROUNDING_K = 16.0
+
+
+def _on_rectangle(curve: TrimCurve, rect) -> bool:
+    """Whether every control point of the curve lies on one side line of the
+    rectangle ``(u0, u1, v0, v1)`` (the curve is then that side: a NURBS curve
+    lies in its control polygon's hull). The same rule as the leaf build's
+    test of loops along the domain."""
+    u0, u1, v0, v1 = (float(x) for x in rect)
+    tol = 1e-12 * max(u1 - u0, v1 - v0, abs(u0), abs(u1), abs(v0), abs(v1), 1.0)
+    p = curve.points
+    return bool(
+        np.all(np.abs(p[:, 0] - u0) <= tol)
+        or np.all(np.abs(p[:, 0] - u1) <= tol)
+        or np.all(np.abs(p[:, 1] - v0) <= tol)
+        or np.all(np.abs(p[:, 1] - v1) <= tol)
+    )
+
+
+def chord_bands(curve: TrimCurve, pts: np.ndarray, t: np.ndarray, m: int = BAND_SAMPLES) -> np.ndarray:
+    """``(k - 1,)`` a bound on how far the curve departs from each chord of its polyline.
+
+    For the chord from ``c(t_j)`` to ``c(t_{j+1})`` the departure is
+    ``f(t) = n . (c(t) - c(t_j))`` with ``n`` the chord's unit normal, zero at
+    both ends. It is sampled at ``m - 1`` equally spaced interior parameters;
+    between two samples spaced ``h`` the function exceeds the larger sample by at
+    most ``h^2 max|f''| / 8``, and ``h^2 |f''|`` is the samples' second
+    difference to first order, so the bound is the largest ``|f|`` sampled plus
+    a quarter of the largest second difference (twice the interpolation term,
+    for the change of ``f''`` between samples), plus the host's rounding of the
+    evaluation, ``8 u_h`` at the curve's coordinate scale.
+    """
+    k = pts.shape[0] - 1
+    if k <= 0:
+        return np.zeros(0)
+    frac = np.linspace(0.0, 1.0, m + 1)
+    ts = t[:-1, None] + (t[1:] - t[:-1])[:, None] * frac[None, :]  # (k, m + 1)
+    ts[:, 0], ts[:, -1] = t[:-1], t[1:]
+    c = curve.evaluate(ts.reshape(-1)).reshape(k, m + 1, 2)
+    a, b = pts[:-1], pts[1:]
+    e = b - a
+    ln = np.linalg.norm(e, axis=1)
+    nrm = np.stack([-e[:, 1], e[:, 0]], axis=1) / np.where(ln > 0, ln, 1.0)[:, None]
+    f = np.einsum("kmc,kc->km", c - a[:, None, :], nrm)
+    # a zero-length chord: the departure is the distance from its point
+    f = np.where((ln > 0)[:, None], f, np.linalg.norm(c - a[:, None, :], axis=2))
+    f[:, 0] = 0.0
+    f[:, -1] = 0.0
+    d2 = np.abs(f[:, 2:] - 2.0 * f[:, 1:-1] + f[:, :-2]).max(axis=1) if m >= 2 else np.zeros(k)
+    scale = max(float(np.abs(curve.points).max()), 1.0)
+    return np.abs(f).max(axis=1) + 0.25 * d2 + 8.0 * 2.0**-53 * scale
+
+
+def trim_polygons_and_bands(arrays: Mapping[str, Any], i: int, uv_bounds, tol: float | None = None):
+    """:func:`trim_polygons` (the same polygons, bit for bit) and, per edge in
+    :func:`polygon_edges`' order, the band about it on the host.
+
+    The band of an edge is how far the trim curve can lie from it
+    (:func:`chord_bands`), ``-1`` for an edge of a curve that runs along the
+    ``uv_bounds`` rectangle (a seam, a pole, a rim: the rectangle itself, which
+    the device tests exactly and which no adjacent face's edge needs to meet).
+    Where two curves of a loop meet, the edge into an interior curve also
+    carries the gap between the previous curve's end and its start; the closing
+    edge's band is its own length when a curve beside it is interior.
+    """
+    if tol is None:
+        tol = trim_tolerance(uv_bounds)
+    polys, bands = [], []
+    for curves, outer in patch_loops(arrays, i):
+        parts, pb = [], []
+        for c in curves:
+            pts, t = curve_polyline(c, tol, return_params=True)
+            parts.append(pts)
+            pb.append(np.full(pts.shape[0] - 1, -1.0) if _on_rectangle(c, uv_bounds) else chord_bands(c, pts, t))
+        pts = np.concatenate([parts[0]] + [q[1:] for q in parts[1:]], axis=0)
+        pts = np.concatenate([pts, pts[:1]], axis=0)
+        interior = [bool(b.size and b.max() >= 0.0) for b in pb]
+        band = [pb[0]]
+        for j in range(1, len(parts)):
+            b = pb[j].copy()
+            gap = float(np.linalg.norm(parts[j - 1][-1] - parts[j][0]))
+            if b.size and interior[j]:
+                b[0] = max(b[0], 0.0) + gap
+            band.append(b)
+        # the closing edge, from the last curve's end to the first curve's start
+        gap = float(np.linalg.norm(parts[-1][-1] - parts[0][0]))
+        band.append(np.array([gap if (interior[-1] or interior[0]) else -1.0]))
+        polys.append((pts, outer))
+        bands.append(np.concatenate(band))
+    return polys, (np.concatenate(bands) if bands else np.zeros(0))
+
+
+def band_filter_margin(bands: np.ndarray, scale: float) -> float:
+    """The edge filters' margin that keeps every edge whose band can reach a
+    point of a piece or slab, at either working dtype (the band on the device is
+    at most the host band plus ``BAND_ROUNDING_K`` units of float32)."""
+    b = float(bands.max()) if bands.size else -1.0
+    if b < 0.0:
+        return 0.0
+    return b + BAND_ROUNDING_K * 2.0**-24 * max(scale, 1.0)
+
+
+def in_band(edges: np.ndarray, bands: np.ndarray, u, v) -> np.ndarray:
+    """Host float64: whether each point lies within its band of any edge
+    (a band ``< 0`` never holds). The device kernel applies the same expression."""
+    u = np.asarray(u, dtype=np.float64).reshape(-1)
+    v = np.asarray(v, dtype=np.float64).reshape(-1)
+    if edges.shape[0] == 0:
+        return np.zeros(u.shape[0], dtype=bool)
+    au, av, bu, bv = (edges[None, :, k] for k in range(4))
+    pu, pv = u[:, None], v[:, None]
+    eu, ev = bu - au, bv - av
+    qu, qv = pu - au, pv - av
+    l2 = eu * eu + ev * ev
+    with np.errstate(invalid="ignore", divide="ignore"):
+        s = np.where(l2 > 0, (qu * eu + qv * ev) / np.where(l2 > 0, l2, 1.0), 0.0)
+    s = np.clip(s, 0.0, 1.0)
+    du, dv = qu - s * eu, qv - s * ev
+    b = bands[None, :]
+    return np.any((b >= 0.0) & (du * du + dv * dv <= b * b), axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -245,14 +401,18 @@ def box_meets_edges(edges: np.ndarray, box, margin: float) -> bool:
     return bool(np.any(overlap & ~one_side))
 
 
-def slab_edges(edges: np.ndarray, v_lo: float, v_hi: float, n_slabs: int, scale: float) -> list[np.ndarray]:
+def slab_edges(edges: np.ndarray, v_lo: float, v_hi: float, n_slabs: int, scale: float,
+               margin: float = 0.0) -> list[np.ndarray]:
     """The piece's edges cut into ``n_slabs`` equal slabs of ``v`` over ``[v_lo, v_hi]``.
 
     A point in a slab can only cross an edge whose ``v``-range meets the slab,
     so the parity over a slab's edges equals the parity over the piece's. The
-    device finds a lane's slab from its ``v`` and tests that slab only.
+    device finds a lane's slab from its ``v`` and tests that slab only. With a
+    ``margin`` (the band's, :func:`band_filter_margin`) a slab also keeps every
+    edge within it, so the band test sees every edge whose band can reach it.
+    Extra columns of ``edges`` (the band) travel with their edge.
     """
-    m = _FILTER_SLACK * max(scale, 1.0)
+    m = max(_FILTER_SLACK * max(scale, 1.0), float(margin))
     h = (v_hi - v_lo) / n_slabs
     lo_e = np.minimum(edges[:, 1], edges[:, 3])
     hi_e = np.maximum(edges[:, 1], edges[:, 3])
@@ -263,7 +423,7 @@ def slab_edges(edges: np.ndarray, v_lo: float, v_hi: float, n_slabs: int, scale:
     return out
 
 
-def piece_edges(edges: np.ndarray, piece_uv, scale: float) -> np.ndarray:
+def piece_edges(edges: np.ndarray, piece_uv, scale: float, margin: float = 0.0) -> np.ndarray:
     """The edges a horizontal ray (toward ``+u``) from a point of the piece
     ``(u0, u1, v0, v1)`` can count.
 
@@ -272,10 +432,12 @@ def piece_edges(edges: np.ndarray, piece_uv, scale: float) -> np.ndarray:
     largest ``u`` is not left of the piece). The rest contribute nothing to any
     point of the piece, and the parity over the kept edges equals the parity
     over all of them; the slack keeps that true for a point an ulp outside.
+    A ``margin`` larger than the slack (the band's) keeps the edges within it
+    of the piece as well; an edge kept that cannot be crossed changes no parity.
     """
     if edges.shape[0] == 0:
         return edges
-    m = _FILTER_SLACK * max(scale, 1.0)
+    m = max(_FILTER_SLACK * max(scale, 1.0), float(margin))
     u0, _u1, v0, v1 = (float(x) for x in piece_uv)
     keep = (
         (np.maximum(edges[:, 1], edges[:, 3]) >= v0 - m)

@@ -38,10 +38,12 @@ inside a trimmed-away region are not built. Loops that run along the domain's
 rectangle (every face of the CAD study's lenses) keep the whole domain and add
 no test, so an untrimmed set runs exactly the code it ran before.
 
-Inside the polygonisation band (1e-6 of the ``uv_bounds`` diagonal from a trim
-curve; KronosLIB issue 286) the engine answers what the polygon answers, which
-the true curve may not; :mod:`.trim` bounds the flux that can move across a
-trim curve that way. The trim test is a detached mask: the adjoint is
+Inside the polygonisation band (at most about 1e-6 of the ``uv_bounds``
+diagonal from a trim curve inside the rectangle; KronosLIB issues 286 and 412)
+the polygon cannot tell the sides apart, and the engine refuses the hit: the
+point is given to the adjacent face, so no kept point lies beyond the true
+curve and a trimmed solid is not opened by the polygon's chords (issue 107;
+:mod:`.trim` states the rule and bounds the flux it moves). The trim test is a detached mask: the adjoint is
 unchanged away from a trim curve, and at the curve itself the visibility
 boundary's contribution (the research repository's issue 3) is not modelled.
 
