@@ -140,7 +140,7 @@ def _new_bin_accumulator(size: int):
     sizes this one is too. The buffer is added into in place and never
     rebound, as before. Where the widest float is float32 (Apple's ``mps``)
     the buffer is the flat one of :func:`_new_flat_accumulator`, accumulated
-    by the grouped scatter-add as before.
+    in a fixed order by :func:`_ordered_index_add_`.
 
     Args:
         size: Number of bins.
@@ -281,7 +281,7 @@ def _accumulate_into(buffer, flat_np, contribution, key=None) -> None:
             rows_key = None if key is None else _flat_index_like(buffer, key)
             buffer.view(-1).index_add_(0, _row_flat_index(buffer, idx, rows_key), src)
         elif buffer.dtype == torch.float32:
-            _grouped_index_add_(buffer, idx, src)
+            _ordered_index_add_(buffer, idx, src)
         else:
             buffer.index_add_(0, idx, src)
         return
@@ -305,6 +305,10 @@ _GROUPED_ACC_MIN_CONTRIBUTIONS = 64
 
 def _grouped_index_add_(buffer, idx, src) -> None:
     """Scatter-add into a float32 buffer with a bounded rounding error.
+
+    No longer called by :func:`_accumulate_into`, which uses
+    :func:`_ordered_index_add_` (the same bound or better, and a fixed order:
+    research repository issue 69); kept for the comparison and its tests.
 
     A bare ``index_add_`` into a float32 buffer rounds the running sum once
     per contribution, so a bin that receives ``K`` contributions carries an
@@ -352,6 +356,75 @@ def _grouped_index_add_(buffer, idx, src) -> None:
             scratch = torch.cat([scratch, torch.zeros_like(scratch[:1])], dim=0)
         scratch = scratch[0::2] + scratch[1::2]
     buffer.add_(scratch[0])
+
+
+def _ordered_index_add_(buffer, idx, src) -> None:
+    """Scatter-add into a float32 buffer in a fixed order: bit-reproducible.
+
+    The float32 accumulator exists only on Apple's ``mps`` (see
+    :func:`accumulator_dtype`), and there every scatter-add torch offers
+    (``index_add_``, ``index_put_`` with ``accumulate=True``, ``scatter_add_``,
+    ``scatter_reduce``, ``bincount`` with weights) adds a bin's colliding
+    contributions with atomics in whatever order the GPU's threads arrive:
+    six repetitions of one ``index_add_`` of 200,000 contributions into 64
+    bins gave six different results, and so did each of the others (torch
+    2.14.0, Apple silicon GPU, 2026-10-02); ``torch.use_deterministic_algorithms
+    (True)`` refuses ``index_add_``, ``index_put_`` and ``scatter_add_`` on
+    ``mps`` for that reason. The grouped scatter-add of
+    :func:`_grouped_index_add_` bounds the rounding but keeps the atomics, so
+    the same trace gave a different detector image each time it ran, in one
+    process or in two (research repository issue 69).
+
+    Here no two contributions meet in an atomic. The contributions are
+    ordered by bin with a stable sort (the order of equal bins is their order
+    in the call); each one's rank inside its bin's run is its position less
+    the run's start; then a pairwise tree over each run adds element ``r +
+    s`` into element ``r`` for ``r`` a multiple of ``2 s``, ``s = 1, 2, 4,
+    ...``, ``ceil(log2 K)`` levels of elementwise operations, until each run's
+    first element holds the run's sum. Those sums go into a zero vector at
+    distinct bins (the other elements are sent to one discarded slot) and the
+    vector is added to ``buffer``. Every step is a sort, a gather, an
+    elementwise operation or a write to distinct addresses, so the result is
+    fixed by the inputs.
+
+    The rounding per call is that of a pairwise sum, at most ``ceil(log2 K)``
+    roundings of a bin's partial sums plus one for the addition into
+    ``buffer`` (the grouped form's bound is ``K / G + log2 G + 1``), and every
+    step is an ordinary differentiable operation, so autograd through the
+    detector is unchanged.
+
+    Args:
+        buffer: The persistent float32 accumulation buffer, shape (size,).
+        idx: Flat bin index per contribution, a LongTensor on the buffer's
+            device, shape (K,).
+        src: Contributions, float32 on the buffer's device, shape (K,).
+    """
+    import torch  # noqa: PLC0415
+
+    k = int(src.shape[0])
+    if k == 0:
+        return
+    size = int(buffer.shape[0])
+    order = torch.argsort(idx, stable=True)
+    bins = idx[order]
+    values = src[order]
+    position = torch.arange(k, device=idx.device, dtype=idx.dtype)
+    rank = position - torch.searchsorted(bins, bins)
+    # The bins padded with k entries of -1, so the run test at every level is
+    # a comparison with a shifted view (no bin is -1).
+    padded_bins = torch.cat([bins, bins.new_full((k,), -1)])
+    zero = values.new_zeros((k,))
+    step = 1
+    while step < k:
+        next_value = torch.cat([values[step:], zero[:step]])
+        take = ((rank & (2 * step - 1)) == 0) & (padded_bins[step : step + k] == bins)
+        values = torch.where(take, values + next_value, values)
+        step *= 2
+    head = rank == 0
+    target = torch.where(head, bins, bins.new_full((k,), size))
+    dense = torch.zeros(size + 1, dtype=buffer.dtype, device=buffer.device)
+    dense = dense.index_add(0, target, torch.where(head, values, zero))
+    buffer.add_(dense[:size])
 
 
 class BaseDetector(ABC):

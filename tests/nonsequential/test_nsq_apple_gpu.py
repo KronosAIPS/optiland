@@ -406,3 +406,138 @@ class TestHostToDeviceGradient:
         x = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64, requires_grad=True)
         x.to(device="mps", dtype=torch.float32).sum().backward()
         assert float(x.grad.abs().sum()) == 0.0
+
+
+def _singlet_scene():
+    """Issue 69's scene: an N-BK7 singlet (R = +-100 mm, 1 mm thick), a collimated
+    2 mm beam, a 1 mm detector of 128 x 128 pixels 98.5 mm behind the lens."""
+    from optiland.coordinate_system import CoordinateSystem
+    from optiland.nonsequential import (
+        CollimatedSourceConfig,
+        IrradianceDetectorConfig,
+        LensConfig,
+        NSQScene,
+        Spectrum,
+    )
+
+    scene = NSQScene()
+    scene.add_source("S1", CoordinateSystem(), CollimatedSourceConfig(
+        spectrum=Spectrum.monochromatic(0.5876), total_flux=1.0, aperture_radius=1.0))
+    scene.add_lens("L1", CoordinateSystem(z=10.0), LensConfig(
+        r1=100.0, r2=-100.0, thickness=1.0, material="N-BK7", front_aperture_radius=5.0))
+    scene.add_detector("D1", CoordinateSystem(z=109.5), IrradianceDetectorConfig(
+        width=1.0, height=1.0, num_pixels_x=128, num_pixels_y=128))
+    return scene
+
+
+def _other_scene():
+    """A different trace to run in between: a wider beam, another wavelength."""
+    from optiland.coordinate_system import CoordinateSystem
+    from optiland.nonsequential import (
+        CollimatedSourceConfig,
+        IrradianceDetectorConfig,
+        NSQScene,
+        Spectrum,
+    )
+
+    scene = NSQScene()
+    scene.add_source("S1", CoordinateSystem(), CollimatedSourceConfig(
+        spectrum=Spectrum.monochromatic(0.45), total_flux=2.0, aperture_radius=3.0))
+    scene.add_detector("D1", CoordinateSystem(z=5.0), IrradianceDetectorConfig(
+        width=8.0, height=8.0, num_pixels_x=32, num_pixels_y=32))
+    return scene
+
+
+_SINGLET_RAYS = 200_000
+
+#: One trace of the singlet on the Apple GPU at float32 in a fresh process; prints
+#: the detector image's bytes as hex digest.
+_FRESH_PROCESS = """
+import hashlib, numpy as np
+import optiland.backend as be
+from tests.nonsequential.test_nsq_apple_gpu import _singlet_scene, _SINGLET_RAYS
+be.set_backend("torch"); be.set_device("cpu"); be.set_precision("float32"); be.set_device("mps")
+res = _singlet_scene().trace(num_rays=_SINGLET_RAYS, seed=1)
+img = np.asarray(be.to_numpy(res.detectors["D1"].irradiance), dtype=np.float64)
+print(hashlib.sha256(img.tobytes()).hexdigest())
+"""
+
+
+def _image(result):
+    return np.asarray(be.to_numpy(result.detectors["D1"].irradiance), dtype=np.float64)
+
+
+class TestReproducibleTraceOnTheAppleGpu:
+    """A float32 trace on the Apple GPU gives the same bits whatever ran before it.
+
+    Research repository issue 69. The trace itself was already reproducible
+    (every accumulation's contributions and bins were bit-identical across
+    repeats); the detector's float32 scatter-add was not: every scatter-add
+    torch has on ``mps`` adds colliding contributions with atomics in arrival
+    order. The float32 accumulator now adds in a fixed order
+    (``_ordered_index_add_``).
+    """
+
+    @needs_mps
+    def test_two_traces_in_one_process_and_a_fresh_process_agree_to_the_bit(
+        self, torch_backend_state
+    ):
+        import hashlib
+        import os
+        import pathlib
+        import subprocess
+        import sys
+
+        be.set_backend("torch")
+        be.set_device("cpu")
+        be.set_precision("float32")
+        be.set_device("mps")
+        first = _image(_singlet_scene().trace(num_rays=_SINGLET_RAYS, seed=1))
+        _other_scene().trace(num_rays=50_000, seed=7)
+        second = _image(_singlet_scene().trace(num_rays=_SINGLET_RAYS, seed=1))
+        assert first.sum() > 0.0
+        assert np.array_equal(first, second)
+
+        root = pathlib.Path(__file__).resolve().parents[2]
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join([str(root), env.get("PYTHONPATH", "")])
+        fresh = subprocess.run(
+            [sys.executable, "-c", _FRESH_PROCESS], cwd=root, env=env,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip().splitlines()[-1]
+        assert fresh == hashlib.sha256(first.tobytes()).hexdigest()
+
+    @needs_mps
+    def test_the_ordered_accumulation_is_the_cpus_to_the_bit(self):
+        from optiland.nonsequential.detectors.base import _ordered_index_add_
+
+        g = torch.Generator().manual_seed(3)
+        idx = (torch.rand(50_000, generator=g) ** 3 * 512).long()
+        src = torch.rand(50_000, generator=g) * 1e-3
+        on_cpu = torch.zeros(512)
+        _ordered_index_add_(on_cpu, idx, src)
+        for _ in range(3):
+            on_mps = torch.zeros(512, device="mps")
+            _ordered_index_add_(on_mps, idx.to("mps"), src.to("mps"))
+            assert torch.equal(on_mps.cpu(), on_cpu)
+
+    @needs_mps
+    def test_control_the_native_scatter_add_is_unordered(self):
+        """The device's property, on this torch: repeated scatter-adds of the same
+        colliding contributions give different bits, and torch's deterministic
+        mode refuses the operation on mps. If this starts failing, torch has an
+        ordered scatter-add on mps and the fixed-order form can be revisited."""
+        g = torch.Generator().manual_seed(0)
+        idx = torch.randint(0, 64, (200_000,), generator=g).to("mps")
+        src = (torch.rand(200_000, generator=g) * 1e-3 + 1.0).to("mps")
+        results = {
+            torch.zeros(4096, device="mps").index_add_(0, idx, src).cpu().numpy().tobytes()
+            for _ in range(10)
+        }
+        assert len(results) > 1
+        torch.use_deterministic_algorithms(True)
+        try:
+            with pytest.raises(RuntimeError, match="deterministic"):
+                torch.zeros(4096, device="mps").index_add_(0, idx, src)
+        finally:
+            torch.use_deterministic_algorithms(False)
