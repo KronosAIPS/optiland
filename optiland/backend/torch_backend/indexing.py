@@ -20,6 +20,23 @@ if TYPE_CHECKING:
     from torch import Tensor
 
 
+def _is_complex_input(x: Any) -> bool:
+    """True for a complex tensor, a Python complex or a complex NumPy array.
+
+    Lists and tuples are looked into, element by element, so that a nested
+    sequence of complex numbers counts as complex. No tensor is read.
+    """
+    if isinstance(x, torch.Tensor):
+        return x.is_complex()
+    if isinstance(x, complex):
+        return True
+    if isinstance(x, np.ndarray | np.generic):
+        return np.iscomplexobj(x)
+    if isinstance(x, list | tuple):
+        return any(_is_complex_input(v) for v in x)
+    return False
+
+
 class IndexingMixin:
     """Array utilities, shape, and indexing operations."""
 
@@ -219,6 +236,16 @@ class IndexingMixin:
     def stack(self, xs: Sequence[Any], axis: int = 0) -> Tensor:
         """Join a sequence of tensors along a new axis.
 
+        Every element is cast to the working precision on the working device.
+        When any element is complex (a complex tensor, a Python complex, a
+        complex NumPy array) every element is cast to the complex dtype of the
+        working precision instead (``get_complex_precision``: complex128 at
+        float64, complex64 at float32), as ``numpy.stack`` keeps a complex
+        input. Until 2026-10-02 a complex element was cast to the real dtype,
+        which dropped its imaginary part with only a ``UserWarning`` (the
+        research repository's issue 97). A stack of real elements is the cast
+        it always was, so no real result changes.
+
         Args:
             xs: Sequence of tensors.
             axis: Axis along which to stack.
@@ -226,6 +253,13 @@ class IndexingMixin:
         Returns:
             Tensor: Stacked tensor.
         """
+        xs = list(xs)
+        if any(_is_complex_input(x) for x in xs):
+            dtype = self.get_complex_precision()
+            device = self._device()
+            return torch.stack(
+                [to_device_dtype(x, device, dtype) for x in xs], dim=axis
+            )
         return torch.stack([self.cast(x) for x in xs], dim=axis)
 
     def concatenate(self, arrays: Sequence[Any], axis: int = 0) -> Tensor:

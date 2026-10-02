@@ -20,6 +20,35 @@ if TYPE_CHECKING:
     from optiland.nonsequential.rng import NSQRng
 
 
+def medium_index_on_host(medium, wavelengths, num_rays: int) -> tuple[np.ndarray, np.ndarray]:
+    """``(n, k)`` of the medium a source is embedded in, per ray, as host float64 arrays.
+
+    The sources build their bundles in NumPy, but ``medium.n`` and ``medium.k``
+    return the backend's own arrays: on a torch device the material memo holds
+    device tensors, and ``np.asarray`` of a CUDA tensor raises, so a source
+    placed inside a glass crashed on CUDA (the research repository's issue
+    70). The index is read to the host with ``to_numpy`` (``detach``,
+    ``cpu``, ``numpy``) and then cast as before; on the CPU the values are
+    the ones ``np.asarray(..., dtype=float)`` gave, bit for bit. It is read
+    once per generated batch, at the source, never inside a bounce.
+
+    Args:
+        medium: The source's medium (``n`` and ``k`` of a wavelength array).
+        wavelengths: The sampled wavelengths [um].
+        num_rays: The batch's ray count, for a scalar index.
+
+    Returns:
+        ``(n_init, k_init)``, each of shape ``(num_rays,)``.
+    """
+    n_init = np.asarray(to_numpy(medium.n(wavelengths)), dtype=float)
+    if np.ndim(n_init) == 0:
+        n_init = np.full(num_rays, float(n_init))
+    k_init = np.asarray(to_numpy(medium.k(wavelengths)), dtype=float)
+    if np.ndim(k_init) == 0:
+        k_init = np.full(num_rays, float(k_init))
+    return n_init, k_init
+
+
 @dataclass
 class Spectrum:
     """Wavelength distribution for Monte Carlo sampling.

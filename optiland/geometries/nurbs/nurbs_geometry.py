@@ -904,9 +904,47 @@ class NurbsGeometry(BaseGeometry):
         # is a step backwards, and reporting it as an equal step forward puts the
         # ray on the wrong side of itself. A plain trace rarely looks back, but an
         # iterative aimer probes both ways, and no line search recovers from that.
-        t = be.sum((self.get_value(u, v).T - P0) * d, axis=1)
+        S = self.get_value(u, v).T
+        t = be.sum((S - P0) * d, axis=1)
 
-        return t
+        return self._attached_distance(u, v, S, P0, d, t)
+
+    def _attached_distance(self, u, v, S, P0, d, t):
+        """``t`` with the implicit derivative of the root, its value unchanged.
+
+        On the torch backend the basis is evaluated in NumPy, so the converged
+        ``(u*, v*)`` carry no gradient and ``(S(u*, v*) - P0) . d`` differentiates
+        as if the hit point stayed at the same ``(u, v)``: for a sphere that is
+        the true derivative times ``cos^2`` of the incidence angle, and on a
+        bicubic rational patch it was 2.6 percent off at the median and 35
+        percent at most (the research repository's issue 72). The
+        non-sequential NURBS kind's pattern (its "ticket D") is used here: one
+        Newton step on ``F(u, v, t) = S(u, v) - P0 - t d`` at the root, with the
+        Jacobian ``J = [S_u, S_v, -d]`` detached and ``F`` in zero-valued form,
+
+            t = t* - [J^-1 (F(x*; theta) - stopgrad F(x*; theta))]_t,
+
+        so the value is ``t*`` to the bit and the derivative is the implicit
+        one, ``dt/dtheta = -[J^-1 dF/dtheta]_t``, for every attached input
+        (control points, weights, the ray's origin and direction). ``J`` is
+        solved for its third component by Cramer's rule; a ray whose ``J`` is
+        singular or not finite keeps the earlier derivative. NumPy, and a
+        ``t`` that carries no gradient, return ``t`` itself.
+        """
+        if be.get_backend() != "torch" or not getattr(t, "requires_grad", False):
+            return t
+        import torch  # noqa: PLC0415
+
+        S_u = self.get_derivative(u, v, order_u=1, order_v=0).T.detach()
+        S_v = self.get_derivative(u, v, order_u=0, order_v=1).T.detach()
+        F = S - P0 - t.detach()[:, None] * d
+        Fz = F - F.detach()
+        minus_d = -d.detach()
+        det = be.sum(S_u * torch.linalg.cross(S_v, minus_d), axis=1)
+        num = be.sum(S_u * torch.linalg.cross(S_v, Fz), axis=1)
+        good = (det != 0.0) & torch.isfinite(det)
+        step = torch.where(good, num / torch.where(good, det, 1.0), 0.0 * num)
+        return torch.where(good, t.detach() - step, t)
 
     def surface_normal(self, rays):
         """Computes the surface normal.

@@ -85,6 +85,17 @@ def _complex_index(material: BaseMaterial, wavelength_um: float | Array) -> Arra
     return be.to_complex(n) + 1j * be.to_complex(k)
 
 
+#: The level below which a negative imaginary part of the radicand
+#: ``w = N^2 - s0^2`` is rounding noise, relative to ``|N|^2 + |s0|^2``. It is
+#: the research repository's ``knsrt.analytic.ROOT_NOISE_RELATIVE`` (its
+#: chapter 06 section 6.0, "The branch of the root"), mirrored here: the
+#: material library's agreement band for published rounded pole forms is
+#: 1e-9, so an extinction coefficient a record carries below that band (a
+#: page's ``k = -2.6e-11``, say) is data rounding, not gain. Evaluation
+#: rounding alone is at most ``(sqrt(5) + 1) u`` of the same scale.
+ROOT_NOISE_RELATIVE = 1.0e-9
+
+
 def _snell_cos(n0, theta0, n):
     """Transmitted angle cosine with forward-branch selection.
 
@@ -97,6 +108,21 @@ def _snell_cos(n0, theta0, n):
     ``exact_complex_sqrt``) the layer's attenuation would vanish. Where the
     native root is exact, ``be.csqrt`` is that root, unchanged.
 
+    The branch (the research repository's chapter 06 section 6.0): the
+    ``exp(-i omega t)`` root of ``w = N^2 - s0^2`` is the limit of the
+    principal root of ``w + i 0``, which lies in the first quadrant; where
+    ``Im w`` is positive (a lossy medium) it is the decaying root. A negative
+    ``Im w`` no larger in magnitude than :data:`ROOT_NOISE_RELATIVE`
+    ``* (|N|^2 + |s0|^2)`` is rounding noise of a lossless medium and is
+    taken as zero, which gives the forward root ``Re > 0`` below the critical
+    angle and ``+i kappa`` beyond it. Until 2026-10-02 any negative ``Im w``
+    flipped the root, which turned a forward wave into a backward one for a
+    record with ``k`` of order ``-1e-11``. A negative ``Im w`` beyond that
+    level (a gain medium, outside the passive theory) keeps the earlier rule.
+    Where ``Im w >= 0`` or is exactly ``-0.0`` every value is the one the
+    earlier rule gave, bit for bit (the same operations selected by
+    ``where``).
+
     Args:
         n0 (complex): Incident medium complex refractive index.
         theta0 (float): Angle of incidence in radians.
@@ -107,10 +133,16 @@ def _snell_cos(n0, theta0, n):
     """
     nr = n.real
     k = n.imag
-    root = be.csqrt(nr**2 - k**2 - (n0 * be.sin(theta0)) ** 2 + 2j * nr * k)
+    s0 = n0 * be.sin(theta0)
+    w = nr**2 - k**2 - s0**2 + 2j * nr * k
+    w_im = be.imag(w)
+    noise = ROOT_NOISE_RELATIVE * (nr**2 + k**2 + be.real(s0 * be.conj(s0)))
+    w = be.where((w_im < 0) & (-w_im <= noise), be.real(w) + 0j, w)
+    root = be.csqrt(w)
     # exp(-i omega t): the root with Im >= 0. The principal root already is,
     # except beyond the critical angle of a lossless medium, where the
-    # radicand is a negative real whose imaginary zero may carry either sign.
+    # radicand is a negative real whose imaginary zero may carry either sign,
+    # and for a gain medium beyond the noise level.
     root = be.where(be.imag(root) < 0, -root, root)
     return root / n
 

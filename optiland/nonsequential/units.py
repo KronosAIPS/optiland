@@ -57,6 +57,34 @@ def _photopic_table() -> tuple[np.ndarray, np.ndarray]:
     return wl_um, v
 
 
+def _scotopic_table_1nm() -> tuple[np.ndarray, np.ndarray]:
+    """The CIE scotopic V'(lambda) at 1 nm, 380 to 780 nm, in micrometres.
+
+    Frozen in ``optiland/colorimetry/scotopic_data_1nm.json`` beside the
+    photopic data: the CIE dataset "CIE spectral luminous efficiency for
+    scotopic vision" (DOI 10.25039/CIE.DS.gr6w4b5g; CIE 018:2019, Table 2),
+    licensed CC BY-SA 4.0, which the file states with its source. Its values
+    reproduce the CIE's CSV byte for byte (the SHA-256 the CIE publishes).
+    V'(507 nm) = 1 (the table is 1 from 506 to 508 nm), and
+    ``683 / V'(555.016 nm)`` = 1700.06 lm/W, the CIE's K'_m.
+
+    The research repository's issue 89: the 10 nm table below has nodes 500
+    and 510 nm (0.982, 0.997) around the peak, so linear interpolation gives
+    V'(507 nm) = 0.9925. This loader is the 1 nm table; switching
+    :func:`_table` to it changes the expectation of one existing test (the
+    scotopic grid's 41 nodes), which waits for the maintainer's ruling.
+    """
+    import json  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    path = Path(__file__).resolve().parents[1] / "colorimetry" / "scotopic_data_1nm.json"
+    data = json.loads(path.read_text())
+    first, last = data["wavelength_nm_first"], data["wavelength_nm_last"]
+    wl_um = np.arange(first, last + 1, dtype=np.float64) / 1000.0
+    v = np.asarray([float(x) for x in data["values"]], dtype=np.float64)
+    return wl_um, v
+
+
 # CIE photopic V(lambda) at 1 nm (see :func:`_photopic_table`), and CIE 1951
 # scotopic V'(lambda) tabulated at 10 nm from 380-780 nm (standard reference
 # values). optiland.nonsequential uses micrometres everywhere else, so
