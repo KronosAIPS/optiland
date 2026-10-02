@@ -93,17 +93,12 @@ class SimulationResult:
             times 2**-24; :func:`optiland.nonsequential.rng.uniform_bits`).
             A float32 record without it was drawn with the earlier
             construction, the 32-bit output rounded to float32.
-            ``polarization`` is present only in a Stokes trace, as
-            ``"stokes"`` (:mod:`optiland.nonsequential.polarization`). A
-            scalar trace carries no ``polarization`` key: absent means off.
-            That is the maintainer's ruling of 2026-09-27 on the research
-            repository's issue 5, for now: the key is to be written for
-            every trace when the record also states the conditions under
-            which a scalar trace equals a Stokes one (the scalar-equivalence
-            conditions of chapter 06 section 6.9, test T-06-19), so that the
-            record of a scalar run says what its numbers assume; until then
-            a key saying only ``"off"`` would add a field to every existing
-            record without saying anything more than its absence does.
+            ``polarization`` is the mode that traced, ``"stokes"`` or ``"off"``
+            (:mod:`optiland.nonsequential.polarization`). A record made before
+            the key existed has none and reads as off (the maintainer's
+            ruling 2 of 2026-09-27 on the research repository's issue 5). The
+            record of which scalar-equivalence conditions (chapter 06 section
+            6.9, test T-06-19) a scalar trace relies on is not built yet.
             ``materials`` is present only when a medium of the scene came
             from a record of the shared material library
             (:class:`~optiland.nonsequential.materials.record_material.RecordMaterial`,

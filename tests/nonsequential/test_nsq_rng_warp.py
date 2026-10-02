@@ -632,6 +632,7 @@ def test_the_default_backend_records_the_limb_path(torch_backend_state):
         "precision": "float64",
         "rng_kernel": "torch",
         "rng_kernel_requested": "torch",
+        "polarization": "off",
     }
 
 
@@ -644,6 +645,7 @@ def test_the_numpy_backend_records_its_own_generator():
         "device": "cpu",
         "precision": "float64",
         "rng_kernel": "numpy",
+        "polarization": "off",
     }
 
 

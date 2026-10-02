@@ -485,7 +485,7 @@ class TestScalarEquivalence:
         _configure(*leg)
         off = build().trace(num_rays=2000, seed=5, max_depth=300, backend=_backend(leg[0], "off"))
         on = build().trace(num_rays=2000, seed=5, max_depth=300, backend=_backend(leg[0], "stokes"))
-        assert on.environment.get("polarization") == "stokes" and "polarization" not in off.environment
+        assert on.environment.get("polarization") == "stokes" and off.environment.get("polarization") == "off"
         a, b = _ledger(off), _ledger(on)
         assert a == b, sorted(k for k in a if a[k] != b.get(k))
 

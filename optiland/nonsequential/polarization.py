@@ -48,16 +48,14 @@ acting on ``flux`` alone, and a trace with polarization off carries no extra
 field and does no extra operation. With an unpolarized state (``q = 0``) the
 flux factor ``g`` is ``m00`` exactly, the scalar coefficient, bit for bit.
 
-The run record. A Stokes trace records ``polarization: "stokes"`` in
-``SimulationResult.environment``; a scalar trace (``"off"``, the default)
-carries no ``polarization`` key at all: absent means off. That is the
-maintainer's ruling of 2026-09-27 on issue 5, for now. The key is to be
-written for every trace, ``"off"`` included, in one change with the
-record's statement of the scalar-equivalence conditions (chapter 06 section
-6.9, test T-06-19): a scalar run's record then says which conditions its
-numbers rely on, which a bare ``"off"`` would not. Chapter 06 section 6.14
-specifies that record (the conditions measured on the trace's own paths, a
-per-ray count of polarizing events since the last depolarizing lobe); it is
+The run record. Every trace records ``polarization`` in
+``SimulationResult.environment``: ``"stokes"`` or ``"off"`` (the scalar
+trace, the default). A record made before the key existed (2026-10-02)
+carries none and reads as off: absent means off, the maintainer's ruling 2
+of 2026-09-27 on issue 5. Chapter 06 section 6.14 also specifies, for
+T-06-19, the record of which scalar-equivalence conditions (section 6.9) a
+scalar run's numbers rely on, measured on the trace's own paths by a per-ray
+count of polarizing events since the last depolarizing lobe; that part is
 not built yet.
 
 What each kind does with the state, the scalar-equivalence guarantee, the
