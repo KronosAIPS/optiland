@@ -586,3 +586,62 @@ class TestBand:
         on_cut = (np.abs(e[:, 1] - V_CUT) < 1e-15) & (np.abs(e[:, 3] - V_CUT) < 1e-15)
         assert np.all(bands[~on_cut] < 0.0)
         assert np.all((bands[on_cut] >= 0.0) & (bands[on_cut] < 1e-14))
+
+
+# ---------------------------------------------------------------------------
+# The normal at the hit's own parameters (issue 108)
+# ---------------------------------------------------------------------------
+
+
+class TestNormalAtTheHit:
+    """A root just beyond its lane's Bezier piece is accepted (the same polynomial
+    continued); its (s, r) are returned unclamped, so the normal and the adjoint
+    are evaluated at the hit, not at the piece's edge. Checked on rays aimed at
+    the exact sphere's piece seams (azimuths at multiples of 90 degrees, the
+    equator), where rounding puts many roots just beyond a piece: the residual
+    at the returned (s, r) is the Newton's own final residual to the round trip's
+    rounding, at every hit."""
+
+    @staticmethod
+    def _seam_rays(n=20000, seed=108):
+        rng = np.random.default_rng(seed)
+        az = rng.integers(0, 4, n) * (math.pi / 2) + rng.normal(0, 1e-7, n)
+        lat = rng.uniform(-1.4, 1.4, n)
+        eq = rng.uniform(size=n) < 0.3
+        lat = np.where(eq, rng.normal(0, 1e-7, n), lat)
+        az = np.where(eq, rng.uniform(0, 2 * math.pi, n), az)
+        p = R_SPHERE * np.column_stack([np.cos(lat) * np.cos(az), np.cos(lat) * np.sin(az), np.sin(lat)])
+        w = rng.normal(size=(n, 3))
+        w /= np.linalg.norm(w, axis=1, keepdims=True)
+        w = np.where(((w * p).sum(1) < 0.2 * R_SPHERE)[:, None], w + 1.5 * p / R_SPHERE, w)
+        w /= np.linalg.norm(w, axis=1, keepdims=True)
+        return p + 30.0 * w, -w
+
+    @pytest.mark.parametrize(("backend", "precision"), CONFIGS)
+    def test_returned_parameters_are_the_root(self, backend, precision):
+        from optiland.nonsequential import _tol  # noqa: PLC0415
+        from optiland.nonsequential.components.geometry.nurbs import kernel as K  # noqa: PLC0415
+
+        _set(backend, precision)
+        o, d = self._seam_rays()
+        O, D = _cast(backend, precision, o, d)
+        g = NurbsGeometry(contract(*sphere_net(), []))
+        ops = K._Ops(O)
+        with torch.no_grad():
+            dl, _ = g._device(O)
+            t0 = ops.zeros_like(O[:, 0]) + float(_tol.accept_t_min(float(np.abs(_np(O)).max())))
+            out = K.intersect(ops, dl, O, D, t0)
+            leaf, hit = out["leaf_safe"], out["hit"]
+            S, _, _ = K.eval_leaf(ops, dl.net[leaf], out["s"], out["r"], dl.P, dl.Q)
+            F = S + dl.pivot[leaf] - O - out["t"][:, None] * D
+            res = ops.amax_abs(F)
+            tol = 32.0 * ops.u * ops.maximum(dl.scale[leaf], ops.amax_abs(O) + ops.amax_abs(dl.centre[leaf]))
+            sb = dl.sub[leaf]
+            sp = sb[:, 0] + out["s"] * (sb[:, 1] - sb[:, 0])
+            rp = sb[:, 2] + out["r"] * (sb[:, 3] - sb[:, 2])
+        hit = _np(hit)
+        assert hit.all()
+        beyond = hit & _np((sp < 0) | (sp > 1) | (rp < 0) | (rp > 1))
+        assert beyond.any()
+        gap = np.abs(_np(res).astype(float) - _np(out["residual"]).astype(float)) / _np(tol).astype(float)
+        assert gap[hit].max() <= 0.1

@@ -35,7 +35,10 @@ Per call (one chunk of rays at a time, the chunk size fixed by the ray count):
 4. **Acceptance:** residual at most ``k_tol`` (32) units of the working dtype at
    the larger of the leaf's scale and the ray's coordinate scale; ``(s, r)``
    inside the leaf's Bezier piece within ``4 tol / |S_s|`` (a root beyond the
-   leaf but inside the piece is the same polynomial's root); a collapsed edge
+   leaf but inside the piece is the same polynomial's root; one just beyond
+   the piece is too, and its normal and adjoint are taken at its own ``(s,
+   r)`` while its patch parameters for the bounds and trim tests are clamped
+   into the piece, issue 108); a collapsed edge
    (the whole leaf moves the point by less than ``tol`` along a parameter)
    clamps that parameter; beyond the start ``t0``; for a ray leaving the
    surface, beyond ``4 tol / |cos|``, the self root's own uncertainty; inside
@@ -518,6 +521,14 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
     es = eps_s * ws
     er = eps_r * wr
     dom = (sp >= -es) & (sp <= 1.0 + es) & (rp >= -er) & (rp <= 1.0 + er)
+    # The hit's own (s, r) for the normal and the adjoint (issue 108): a root up to
+    # 4 tol / |S_k| beyond its piece lies on the same polynomial continued, and its
+    # normal is taken there, not at the piece's edge up to 4 tol away. The same round
+    # trip through the piece as before, without the clip, so (s, r) are the bits they
+    # were wherever the clamp does not fire. The patch parameters (uu, vv) of the
+    # bounds and trim tests stay clamped into the piece.
+    s_hit = (sp - sb[:, 0]) / ws
+    r_hit = (rp - sb[:, 2]) / wr
     s = (ops.clip(sp, 0.0, 1.0) - sb[:, 0]) / ws
     r = (ops.clip(rp, 0.0, 1.0) - sb[:, 2]) / wr
     ttot = tpre + tl
@@ -552,8 +563,8 @@ def _chunk(ops, dl: DeviceLeaves, o, d, t0, n_iter, k_tol, n_cand, n_amb):
         "hit": hit,
         "leaf": ops.where(hit, leaf, ops.zeros_like(leaf) - 1),
         "leaf_safe": ops.where(hit, leaf, ops.zeros_like(leaf)),
-        "s": pick(s),
-        "r": pick(r),
+        "s": pick(s_hit),
+        "r": pick(r_hit),
         "u": pick(uu),
         "v": pick(vv),
         "tpre": pick(tpre),
