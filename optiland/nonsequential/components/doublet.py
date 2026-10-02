@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from optiland.nonsequential._utils import as_float
 from optiland.nonsequential.components.compound import CompoundComponent
 from optiland.nonsequential.components.configs import DoubletConfig, InteractionType
 from optiland.nonsequential.components.geometry.analytic.frustum import (
@@ -175,14 +176,24 @@ class Doublet(CompoundComponent):
         # 4. Crown edge (cylindrical frustum, absorbing) -- front face to
         #    the cemented interface, so the crown element's own boundary
         #    closes without the flint element.
+        #    The edges are absorbing bookkeeping geometry, as the lens's edge
+        #    is: built from host floats, so a gradient-carrying thickness or
+        #    aperture radius reaches the faces' placements and apertures only.
+        #    (Built from the tensors, a thickness made the absorbing edges'
+        #    own derived parameters, raised as zero by structure, and an
+        #    aperture radius gained a path through the never-hit edges'
+        #    intersection: a silent zero; chapter 09 section 9.14.2 of the
+        #    research repository.) The values are the same floats.
         sag_front = _face_rim_sag(front_geom, cfg.r1, cfg.conic1, r)
         sag_cemented = _face_rim_sag(cemented_geom, cfg.r2, cfg.conic2, r)
         sag_back = _face_rim_sag(back_geom, cfg.r3, cfg.conic3, r)
+        r_edge = as_float(r)
+        thickness1 = as_float(cfg.thickness1)
         crown_edge_geom = CylindricalFrustumGeometry(
-            r_front=r,
-            r_back=r,
+            r_front=r_edge,
+            r_back=r_edge,
             z_front=sag_front,
-            z_back=cfg.thickness1 + sag_cemented,
+            z_back=thickness1 + sag_cemented,
         )
         surfaces.append(
             _make_surface(
@@ -197,11 +208,11 @@ class Doublet(CompoundComponent):
         )
 
         # 5. Flint edge -- cemented interface to back face.
-        total_thickness = cfg.thickness1 + cfg.thickness2
+        total_thickness = thickness1 + as_float(cfg.thickness2)
         flint_edge_geom = CylindricalFrustumGeometry(
-            r_front=r,
-            r_back=r,
-            z_front=cfg.thickness1 + sag_cemented,
+            r_front=r_edge,
+            r_back=r_edge,
+            z_front=thickness1 + sag_cemented,
             z_back=total_thickness + sag_back,
         )
         surfaces.append(
