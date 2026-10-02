@@ -201,6 +201,32 @@ def test_the_stage_is_the_components_own_interact(torch_state, device, precision
     _assert_bits(ref, got)
 
 
+def _run_twice(si, through_stage):
+    """Two interactions of one component in a row: the second adds into the device tallies (one launch)."""
+    comp = _component("lobe-mixed", "moved")
+    comp.reset_ledger()
+    rng = NSQRng(5)
+    bsdf_ir = _lower_bsdf(comp.bsdf)
+    for seed in (5, 6):
+        rays = _bundle(4_000, seed, "moved")
+        t, normals, hit, n_geom = comp.intersect(rays)
+        if through_stage:
+            si.interact_component(comp, rays, t, normals, hit, rng, bsdf_ir, n_geom)
+        else:
+            comp.interact(rays, t, normals, hit, rng, bsdf_ir, n_geom)
+    tallies = (comp._tally("_coating_loss"), comp._tally("_sampling_residual"))
+    return {f"{name}_{part}": to_numpy(getattr(tally, part)).reshape(1)
+            for name, tally in zip(("coat", "res"), tallies, strict=True) for part in ("_dev", "_dev_comp")}
+
+
+@pytest.mark.parametrize("device", _DEVICES)
+@pytest.mark.parametrize("precision", ["float64", "float32"])
+def test_the_ledger_adds_into_the_tallies_as_tally_add_does(torch_state, device, precision):
+    _, si = torch_state
+    _use(device, precision)
+    _assert_bits(_run_twice(si, through_stage=False), _run_twice(si, through_stage=True))
+
+
 @pytest.mark.parametrize("device", _DEVICES)
 @pytest.mark.parametrize("precision", ["float64", "float32"])
 def test_a_bundle_the_component_did_not_intersect_takes_the_plain_advance(torch_state, device, precision):

@@ -314,6 +314,42 @@ _KERNELS = {
     for it, wit, ibits in ((torch.int32, wp.int32, 32), (torch.int64, wp.int64, 64))
 }
 _INT_TYPES = (torch.int32, torch.int64)
+
+
+def _tally_k(FT):
+    @wp.func
+    def _add(dev: wp.array(dtype=FT), comp: wp.array(dtype=FT), term: FT):
+        # Tally.add of a device term (Neumaier): new = old + term; the error
+        # two_sum_error(old, term, new) into the compensation; the term into
+        # the total -- each the torch statement's rounded operation.
+        old = dev[0]
+        new = old + term
+        err = (term - new) + old
+        if wp.abs(old) >= wp.abs(term):
+            err = (old - new) + term
+        comp[0] = comp[0] + err
+        dev[0] = old + term
+
+    def k(
+        t1: wp.array(dtype=FT), t2: wp.array(dtype=FT), t3: wp.array(dtype=FT),
+        d1: wp.array(dtype=FT), c1: wp.array(dtype=FT), d2: wp.array(dtype=FT), c2: wp.array(dtype=FT),
+        lobe: int,
+    ):
+        # The bookings in the torch stage's order: the coating loss, then
+        # (with a lobe) the sampling residual and the lobe's loss.
+        _add(d1, c1, t1[0])
+        if lobe == 1:
+            _add(d2, c2, t2[0])
+            _add(d1, c1, t3[0])
+
+    return k
+
+
+#: The ledger's compensated additions of one interaction, one launch.
+_TALLY = {
+    torch.float64: _kernel(_tally_k(wp.float64), "tally", 64),
+    torch.float32: _kernel(_tally_k(wp.float32), "tally", 32),
+}
 _WP_FLOAT = {torch.float64: wp.float64, torch.float32: wp.float32}
 _NP_FLOAT = {torch.float64: np.float64, torch.float32: np.float32}
 
@@ -396,7 +432,11 @@ _prepared: set = set()
 
 def kernel_modules(dtypes=(torch.float64, torch.float32)) -> list:
     """The Warp modules of this stage (one per float type, and the trig probe's)."""
-    return [_KERNELS[(d, i)].module for d in dtypes for i in _INT_TYPES] + [_TRIG_PROBE[d].module for d in dtypes]
+    return (
+        [_KERNELS[(d, i)].module for d in dtypes for i in _INT_TYPES]
+        + [_TRIG_PROBE[d].module for d in dtypes]
+        + [_TALLY[d].module for d in dtypes]
+    )
 
 
 def compile_cache(arch, dtypes=(torch.float64, torch.float32)) -> list:
@@ -609,6 +649,45 @@ def _placement(component, like: torch.Tensor) -> torch.Tensor:
     return xf
 
 
+@torch.library.custom_op("optiland_nsq::tally_add", mutates_args=("d1", "c1", "d2", "c2"))
+def _op_tally(
+    t1: torch.Tensor, t2: torch.Tensor, t3: torch.Tensor, d1: torch.Tensor, c1: torch.Tensor, d2: torch.Tensor,
+    c2: torch.Tensor, lobe: int,
+) -> None:
+    kwargs = sw._launch_kwargs(t1, 1)
+    kwargs["inputs"] = [*(wp.from_torch(v.reshape(1)) for v in (t1, t2, t3, d1, c1, d2, c2)), int(lobe)]
+    wp.launch(_TALLY[t1.dtype], **kwargs)
+
+
+@_op_tally.register_fake
+def _(t1, t2, t3, d1, c1, d2, c2, lobe):
+    return None
+
+
+def _device_tally(tally, like: torch.Tensor) -> bool:
+    """Whether ``tally`` adds in place on the device in ``like``'s dtype (after its first term)."""
+    dev, comp = tally._dev, tally._dev_comp
+    return (
+        sw._is_tensor(dev) and sw._is_tensor(comp) and dev.dtype == like.dtype and comp.dtype == like.dtype
+        and dev.shape == () and comp.shape == () and not dev.requires_grad and dev.device == like.device
+    )
+
+
+def _book(component, sums, lobe: int, like: torch.Tensor) -> None:
+    """Add the interaction's bookings to the component's tallies: one launch, or Tally.add on a first term."""
+    coat = component._tally("_coating_loss")
+    res = component._tally("_sampling_residual")
+    if _device_tally(coat, like) and (not lobe or _device_tally(res, like)):
+        d2, c2 = (res._dev, res._dev_comp) if lobe else (coat._dev, coat._dev_comp)
+        t2, t3 = (sums[1], sums[2]) if lobe else (sums[0], sums[0])
+        torch.ops.optiland_nsq.tally_add(sums[0], t2, t3, coat._dev, coat._dev_comp, d2, c2, int(lobe))
+        return
+    coat.add(sums[0])
+    if lobe:
+        res.add(sums[1])
+        coat.add(sums[2])
+
+
 def interact_component(component, rays, t, normals, hit_mask, rng, bsdf_ir, n_geom, sampling=None):
     """``ReflectiveComponent.interact`` for one component, through the kernel where it is covered.
 
@@ -672,10 +751,8 @@ def interact_component(component, rays, t, normals, hit_mask, rng, bsdf_ir, n_ge
     rays.bounce = bo
     # The ledger, as book_loss / book_residual / book_lobe add to it:
     # masked_sum is be.sum(where(hit, flux * fraction, 0)), the kernel's terms.
-    component._tally("_coating_loss").add(be.sum(loss1))
-    if lobe:
-        component._tally("_sampling_residual").add(be.sum(resid))
-        component._tally("_coating_loss").add(be.sum(loss2))
+    sums = [be.sum(loss1)] + ([be.sum(resid), be.sum(loss2)] if lobe else [])
+    _book(component, sums, lobe, like)
 
 
 __all__ = [
