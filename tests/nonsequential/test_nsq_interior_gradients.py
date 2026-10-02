@@ -810,10 +810,11 @@ class TestFloat32PlacementGradients:
     Over three decades of ray count, at the working precision float32 (the
     placement tensors float64, the device build of the transform in float32).
     The lens scenes are not here: at float32 the singlet placed at z = 50 mm
-    is refused at construction by the volume's rim-coincidence check, whose
-    1e-6 mm tolerance is below float32's resolution there (about 3.8e-6 mm at
+    was refused at construction by the volume's rim-coincidence check, whose
+    1e-6 mm tolerance was below float32's resolution there (about 3.8e-6 mm at
     55 mm), with or without a gradient (the research repository's build log
-    B6_gradients_2 files it). Measured on the development machine (Apple
+    B6_gradients_2 files it). Issue 80's derived tolerance builds it; the lens
+    rows are :class:`TestFloat32LensGradients`, with a bound. Measured on the development machine (Apple
     silicon, CPU, seed 3): every gradient finite; float32 against float64 at
     a median 1.5e-7 to 3.2e-7 relative and at worst 5.4e-5 (mirror tilt about
     x at 20,000 rays), reported, not graded.
@@ -835,3 +836,102 @@ class TestFloat32PlacementGradients:
         (grad,) = torch.autograd.grad(_centroid(data.double(), width), param)
         assert torch.isfinite(grad), f"{owner}-{key} at {num_rays} rays: {grad.item()}"
         assert grad.item() != 0.0
+
+
+# -- T-09-10: the lens rows at float32 (issue 80's derived rim tolerance builds them) ----
+
+_U32 = 2.0**-24
+
+_FLOAT32_LENS_ROWS = [
+    *((f"lens-{k}", k) for k in ("x", "y", "z", "rx", "ry")),
+    ("lens-thickness", "thickness"),
+]
+
+
+def _lens_build(key):
+    """``build(value) -> (scene, width)`` for one lens row: a placement field or the thickness."""
+
+    def build(value):
+        if key == "thickness":
+            return _lens_scene(dict(_LENS), thickness=value)
+        p = dict(_LENS)
+        p[key] = value
+        return _lens_scene(p)
+
+    return build
+
+
+def _float32_bound_inputs(build, value, num_rays):
+    """The float64 inputs of chapter 09 section 9.14.1's bound, from the engine's entry split.
+
+    Returns ``(A, E, M, J)``: the sum of absolute contributions, the number of
+    live entry elements, ``max_b |X_b - L| / S`` (the largest derivative of the
+    centroid with respect to a bin) and ``sum_b |d d_b / d theta|``.
+    """
+    from optiland.nonsequential.parameter_register import entry_split
+
+    width = build(value)[1]
+    split = entry_split(
+        lambda v: build(v)[0],
+        value,
+        trace=lambda scene: scene.trace(num_rays=num_rays, seed=_SEED, max_depth=8),
+    )
+    bins = split.image()
+    weights = _centroid_bin_weights(width)
+    total = bins.sum()
+    dloss = (weights - (bins * weights).sum() / total) / total
+    tangent = torch.zeros_like(bins)
+    for hits in split.by_element:
+        for flat, t in hits:
+            tangent.index_add_(0, flat, t)
+    a = split.absolute_sum(dloss)
+    return a, len(split.elements), dloss.abs().max().item(), tangent.abs().sum().item()
+
+
+class TestFloat32LensGradients:
+    """R-09-10, T-09-10: the lens rows at float32, and their agreement with float64.
+
+    Chapter 09 section 9.14.1 of the research repository (written and
+    committed before this ran). The singlet at z = 50 mm builds at float32
+    since issue 80's derived rim tolerance. Each row asserts T-09-10 (the
+    gradient finite and non-zero) and the bound of section 9.14.1:
+
+        |g32 - g64| <= u32 [(K + N + E) A + 2 K M J],
+
+    ``u32 = 2**-24``, ``K`` the scene's operation count (:data:`_K_PER_SCENE`),
+    ``N`` rays, and ``A`` (the sum of absolute contributions over rays and
+    entry elements), ``E`` (live entry elements), ``M`` (the largest
+    derivative of the centroid with respect to a bin) and ``J`` (the sum of
+    the bins' absolute derivatives) from the float64 trace of the same scene,
+    seed and ray count. The chain term is a model (one rounding per operation,
+    no amplification); the reduction term is a worst-case bound, loose at
+    20,000 rays by design.
+    """
+
+    @pytest.mark.parametrize("num_rays", [200, 2_000, 20_000])
+    @pytest.mark.parametrize(("row", "key"), _FLOAT32_LENS_ROWS, ids=[r for r, _ in _FLOAT32_LENS_ROWS])
+    def test_finite_and_within_the_bound(self, row, key, num_rays):
+        build = _lens_build(key)
+        value = 5.0 if key == "thickness" else _LENS[key]
+
+        def gradient():
+            param = _g(value)
+            scene, width = build(param)
+            data = scene.trace(num_rays=num_rays, seed=_SEED, max_depth=8).detectors["D1"].data
+            (grad,) = torch.autograd.grad(_centroid(data.double(), width), param)
+            return grad.item()
+
+        be.set_precision("float64")
+        g64 = gradient()
+        a, e, m, j = _float32_bound_inputs(build, value, num_rays)
+        be.set_precision("float32")
+        g32 = gradient()
+        assert np.isfinite(g32), f"{row} at {num_rays} rays: {g32}"
+        assert g32 != 0.0
+        k = _K_PER_SCENE[row]
+        bound = _U32 * ((k + num_rays + e) * a + 2.0 * k * m * j)
+        gap = abs(g32 - g64)
+        assert gap <= bound, (
+            f"{row} at {num_rays} rays: |g32 - g64| = {gap:.3e} > {bound:.3e} "
+            f"({gap / (_U32 * a):.1f} u32 of A = {a:.4e}; g64 = {g64:.6e})"
+        )
