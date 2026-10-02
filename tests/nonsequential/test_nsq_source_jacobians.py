@@ -32,7 +32,12 @@ derivative in the geometry (``attach_source_geometry``'s docstring). T-09-8's
 case of an area that changes at fixed total flux is
 :class:`TestFixedTotalFlux`: the total flux on a detector that catches every
 ray has a derivative of zero, which fails if the factor enters unnormalised
-(it would be ``2 Phi / a`` for a disc of radius ``a``).
+(it would be ``2 Phi / a`` for a disc of radius ``a``). That is the clause as
+the maintainer's ruling of 2026-10-01 rewords it (chapter 09, T-09-8): for a
+source given by its total flux the factor cancels identically, so the test
+asserts the zero derivative of the total flux. A source kind given by its
+exitance or radiance (none today) would keep the factor in its weight and
+need the clause as first written, a case that fails if the factor is missing.
 """
 
 from __future__ import annotations
