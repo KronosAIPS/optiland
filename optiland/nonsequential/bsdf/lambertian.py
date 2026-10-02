@@ -7,14 +7,17 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
-from optiland.nonsequential._utils import refuse_gradients
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential.bsdf.base import BaseBSDF
-from optiland.nonsequential.components.sampling_support import detached
+from optiland.nonsequential.components.sampling_support import (
+    attachable_fraction,
+    detached,
+    lobe_branch_gate,
+)
 from optiland.nonsequential.ray_bundle import backend_bool_full
 from optiland.nonsequential.rng import EventSlot
 
@@ -49,16 +52,17 @@ class LambertianBSDF(BaseBSDF):
                 May be a torch Tensor with requires_grad=True for autograd.
             transmissive_fraction: Probability in [0, 1] that a scatter
                 event lands in the transmissive hemisphere rather than the
-                reflective one.
+                reflective one. A tensor that carries a derivative is kept:
+                the branch is drawn with its host value and each branch's
+                weight carries its share (the research repository's chapter
+                09 section 9.14.3); such a fraction must lie strictly
+                between 0 and 1.
         """
         # Intentionally not float()-cast so torch tensors remain attached.
         self.reflectance_value = reflectance_value
-        refuse_gradients(
-            "LambertianBSDF",
-            "the reflect-or-transmit split is read as a number on the host",
-            transmissive_fraction=transmissive_fraction,
+        self.transmissive_fraction, self._tau = attachable_fraction(
+            "LambertianBSDF", "transmissive_fraction", transmissive_fraction
         )
-        self.transmissive_fraction = float(transmissive_fraction)
 
     def sample(
         self,
@@ -101,9 +105,9 @@ class LambertianBSDF(BaseBSDF):
         # elementwise arithmetic that runs wherever the ray state lives.
         normals_be = detached(normals)
 
-        if self.transmissive_fraction > 0.0:
+        if self._tau > 0.0:
             u_lobe = rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH)
-            transmitted = u_lobe < self.transmissive_fraction
+            transmitted = u_lobe < self._tau
             hemisphere = be.where(transmitted[:, None], -normals_be, normals_be)
         else:
             transmitted = backend_bool_full(
@@ -134,6 +138,13 @@ class LambertianBSDF(BaseBSDF):
         # be.ones * reflectance_value preserves the autograd graph when
         # reflectance_value is a torch Tensor with requires_grad=True.
         weights_be = be.ones(num_rays) * self.reflectance_value
+        # The branch's share, attached when the fraction carries a gradient
+        # (exactly 1 in value, so the weight keeps its bits).
+        gate = lobe_branch_gate(
+            self.transmissive_fraction, self._tau, transmitted, weights_be
+        )
+        if gate is not None:
+            weights_be = weights_be * gate
 
         return scattered, weights_be, transmitted
 

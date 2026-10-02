@@ -7,17 +7,25 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
-from optiland.nonsequential._utils import refuse_gradients
 from typing import TYPE_CHECKING
 
 import numpy as np
 
 import optiland.backend as be
 from optiland.nonsequential import _tol
-from optiland.nonsequential._utils import clamp_int
+from optiland.nonsequential._utils import (
+    as_attachable_param,
+    clamp_int,
+    host_float,
+    refuse_gradients,
+)
 from optiland.nonsequential.bsdf.base import BaseBSDF
 from optiland.nonsequential.components.base import resident_table
-from optiland.nonsequential.components.sampling_support import detached
+from optiland.nonsequential.components.sampling_support import (
+    attachable_fraction,
+    detached,
+    lobe_branch_gate,
+)
 from optiland.nonsequential.ray_bundle import backend_bool_full
 from optiland.nonsequential.rng import EventSlot
 
@@ -130,20 +138,37 @@ class HarveyShackBSDF(BaseBSDF):
             transmissive_fraction: Probability in [0, 1] that a scatter
                 event blurs the straight-through ray instead of the
                 specular reflection.
+
+        Gradients (the research repository's chapter 09 section 9.14.3):
+        ``l0``, ``s`` and ``transmissive_fraction`` may be tensors that carry
+        a derivative. The direction is still drawn from their host values
+        (detached); the weight carries the lobe's dependence on them at the
+        drawn direction, ``w * d log f / d theta`` (the likelihood-ratio
+        path), and each branch its share of the fraction. Every value is the
+        same bit as with plain numbers. ``b0`` is refused: the lobe is
+        normalised over the reachable directions, so ``b0`` cancels from
+        the drawn direction and from the weight, and its derivative is zero
+        by structure.
         """
         refuse_gradients(
             "HarveyShackBSDF",
-            "the lobe's parameters and the reflect-or-transmit split are read as "
-            "numbers on the host",
+            "zero by structure: the lobe is normalised over the reachable "
+            "directions, so b0 cancels from the drawn direction and from the "
+            "weight (the scatter level enters through the surface's "
+            "scatter_fraction)",
             b0=b0,
-            l0=l0,
-            s=s,
-            transmissive_fraction=transmissive_fraction,
         )
         self.b0 = float(b0)
-        self.l0 = float(l0)
-        self.s = float(s)
-        self.transmissive_fraction = float(transmissive_fraction)
+        self.l0 = as_attachable_param(l0)
+        self.s = as_attachable_param(s)
+        self._l0 = host_float(l0)
+        self._s = host_float(s)
+        self.transmissive_fraction, self._tau = attachable_fraction(
+            "HarveyShackBSDF", "transmissive_fraction", transmissive_fraction
+        )
+        # d log T / d(l0, s) per incidence row, built beside the TIS table
+        # only when l0 or s carries a derivative.
+        self._dlog_tis: tuple[np.ndarray, np.ndarray] | None = None
         self._beta_grid: np.ndarray | None = None
         self._cdf_grid: np.ndarray | None = None
         self._tis: float | None = None
@@ -160,7 +185,25 @@ class HarveyShackBSDF(BaseBSDF):
         Returns:
             BSDF value [sr^-1].
         """
-        return self.b0 / (1.0 + (beta / self.l0) ** self.s)
+        return self.b0 / (1.0 + (beta / self._l0) ** self._s)
+
+    def _dlog_abg(self, beta: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """``d log BSDF / d l0`` and ``d log BSDF / d s`` at an offset, on the host.
+
+        With ``x = (beta / l0)^s``: ``(s / l0) x / (1 + x)`` and
+        ``-ln(beta / l0) x / (1 + x)``; both 0 at ``beta = 0``.
+        """
+        beta = np.asarray(beta, dtype=np.float64)
+        pos = beta > 0.0
+        safe = np.where(pos, beta, 1.0)
+        frac = np.where(pos, 1.0 / (1.0 + (self._l0 / safe) ** self._s), 0.0)
+        d_l0 = (self._s / self._l0) * frac
+        d_s = np.where(pos, -np.log(safe / self._l0) * frac, 0.0)
+        return d_l0, d_s
+
+    @property
+    def _score_attached(self) -> bool:
+        return be.is_torch_tensor(self.l0) or be.is_torch_tensor(self.s)
 
     def _radial_nodes(self) -> np.ndarray:
         """Nodes of the radial table: 0, a geometric ladder to 2, and 1.
@@ -171,7 +214,7 @@ class HarveyShackBSDF(BaseBSDF):
         so the normal-incidence reach ``|beta - beta0| = 1`` is read off the
         table without interpolation.
         """
-        lo = 1e-4 * min(self.l0, 1.0)
+        lo = 1e-4 * min(self._l0, 1.0)
         ladder = np.geomspace(lo, _BETA_MAX, _TABLE_SIZE - 2)
         nodes = np.unique(np.concatenate([[0.0, 1.0, _BETA_MAX], ladder]))
         return nodes
@@ -245,6 +288,24 @@ class HarveyShackBSDF(BaseBSDF):
         hemi[0] = self._cdf_grid[i_one]
         self._incidence_grid = g
         self._hemi_grid = hemi
+
+        if self._score_attached:
+            # d log T / d(l0, s) per incidence row (chapter 09 section
+            # 9.14.3): the same Gauss-Legendre cells for d C / d theta, the
+            # same azimuth midpoints and the same interpolation in the
+            # offset, divided by the row's T from the same quadrature.
+            d_l0_t, d_s_t = self._dlog_abg(t)
+            base = self._abg(t) * 2.0 * np.pi * t
+            dlog = []
+            for d_t in (d_l0_t, d_s_t):
+                dcell = 0.5 * h[:, 0] * ((base * d_t) @ w_gl)
+                dcdf = np.concatenate([[0.0], np.cumsum(dcell)])
+                num = np.interp(dmax, beta, dcdf).mean(axis=1)
+                den = np.interp(dmax, beta, cdf).mean(axis=1)
+                row = num / den
+                row[0] = dcdf[i_one] / cdf[i_one]
+                dlog.append(row)
+            self._dlog_tis = (dlog[0], dlog[1])
 
     def _inverse_cdf(self, u):
         """Radial offset for a uniform draw, from the tabulated inverse CDF.
@@ -417,9 +478,9 @@ class HarveyShackBSDF(BaseBSDF):
         # Per-ray reflective-vs-transmissive lobe draw: the reference
         # ray the ABg blur is centred on. d_be itself (unrefracted) is
         # already a unit vector; only d_spec needs the below norm-guard.
-        if self.transmissive_fraction > 0.0:
+        if self._tau > 0.0:
             u_lobe = rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH)
-            transmitted = u_lobe < self.transmissive_fraction
+            transmitted = u_lobe < self._tau
             d_ref = be.where(transmitted[:, None], d_be, d_spec)
         else:
             transmitted = backend_bool_full((n_be.shape[0],), False, like=n_be)
@@ -511,7 +572,57 @@ class HarveyShackBSDF(BaseBSDF):
         # :attr:`total_integrated_scatter` is the natural value.
         flux_weights = be.where(valid, weight, be.zeros_like(weight))
 
+        if self._score_attached:
+            flux_weights = flux_weights + flux_weights * self._score(delta, g)
+        # The branch's share, attached when the fraction carries a gradient
+        # (exactly 1 in value, so the weight keeps its bits).
+        gate = lobe_branch_gate(
+            self.transmissive_fraction, self._tau, transmitted, flux_weights
+        )
+        if gate is not None:
+            flux_weights = flux_weights * gate
+
         return scattered, flux_weights, transmitted
+
+    def _score(self, delta, g):
+        """The weight's attached dependence on ``l0`` and ``s``, zero in value.
+
+        ``sum_k (theta_k - sg(theta_k)) * D_k`` with ``D_k = d log f / d
+        theta_k`` at the drawn offset ``delta`` and the incidence ``g =
+        |beta0|``, evaluated detached at the host values: ``d log BSDF``
+        minus ``d log TIS`` (chapter 09 section 9.14.3). The factor
+        ``theta - sg(theta)`` is exactly zero, so ``w + w * score`` is ``w``
+        to the bit, and its derivative is ``w * D_k`` (the likelihood-ratio
+        path: the direction stays drawn at the host values).
+
+        Args:
+            delta: Drawn radial offsets, shape (N,), detached.
+            g: Incidence ``|beta0|`` per ray, shape (N,), detached.
+
+        Returns:
+            The score, shape (N,).
+        """
+        if self._dlog_tis is None:
+            self._build_tables()
+        l0, s = self._l0, self._s
+        pos = delta > 0.0
+        safe = be.where(pos, delta, be.ones_like(delta))
+        frac = be.where(
+            pos, 1.0 / (1.0 + (l0 / safe) ** s), be.zeros_like(delta)
+        )
+        grid = resident_table(self, "incidence", self._incidence_grid)
+        size = self._incidence_grid.size
+        score = be.zeros_like(delta)
+        if be.is_torch_tensor(self.l0):
+            table = resident_table(self, "dlog_tis_l0", self._dlog_tis[0])
+            d_l0 = (s / l0) * frac - _lerp(grid, table, g, size)
+            score = score + (self.l0 - detached(self.l0)) * d_l0
+        if be.is_torch_tensor(self.s):
+            table = resident_table(self, "dlog_tis_s", self._dlog_tis[1])
+            log_ratio = be.where(pos, be.log(safe / l0), be.zeros_like(delta))
+            d_s = -log_ratio * frac - _lerp(grid, table, g, size)
+            score = score + (self.s - detached(self.s)) * d_s
+        return score
 
     def reflectance(
         self,

@@ -93,3 +93,62 @@ def scatter_branch(
         )
     sf_gate = be.where(scatters, weight_scatter_branch, weight_nonscatter_branch)
     return scatters, sf_gate
+
+
+def attachable_fraction(owner: str, name: str, value):
+    """A reflect-or-transmit fraction: ``(the value kept, its host float)``.
+
+    A fraction that carries a derivative (``requires_grad`` or a forward-mode
+    tangent) is kept as given so the lobe's weight can attach to it
+    (:func:`lobe_branch_gate`); any other value is read as a float. The
+    research repository's chapter 09 section 9.14.3: the branch is drawn with
+    the detached probability ``p`` (the host float) and each branch's weight
+    carries its share ``tau / p`` or ``(1 - tau) / (1 - p)``. A fraction of
+    exactly 0 or 1 never draws one of the two branches, so the estimator would
+    have no sample for that branch's derivative: a gradient-carrying fraction
+    of 0 or 1 is refused.
+
+    Raises:
+        NotImplementedError: For a gradient-carrying fraction of 0 or 1.
+    """
+    from optiland.nonsequential._utils import (  # noqa: PLC0415
+        _carries_derivative,
+        host_float,
+    )
+
+    host = host_float(value)
+    if not _carries_derivative(value):
+        return host, host
+    if not 0.0 < host < 1.0:
+        raise NotImplementedError(
+            f"{owner}.{name} = {host} carries a gradient, but a fraction of exactly 0 "
+            "or 1 never draws one of its two branches, so the derivative of the "
+            "branch it never draws has no sample (chapter 09 section 9.14.3). Use a "
+            "value strictly between 0 and 1, or a plain number."
+        )
+    return value, host
+
+
+def lobe_branch_gate(fraction, host: float, transmitted, like):
+    """The attached share of a lobe's reflect-or-transmit branch, or None.
+
+    ``tau / p`` on the transmissive branch and ``(1 - tau) / (1 - p)`` on the
+    reflective one, with ``p = host`` the detached probability the branch was
+    drawn with and ``tau`` the fraction itself (chapter 09 sections 9.2 and
+    9.14.3). Both are exactly 1 in value, so a weight multiplied by the gate
+    keeps its bits; their derivatives are ``1 / p`` and ``-1 / (1 - p)``.
+
+    Args:
+        fraction: The fraction as kept by :func:`attachable_fraction`.
+        host: Its host float.
+        transmitted: The per-ray branch mask, shape (N,).
+        like: The weights the gate multiplies, for the dtype.
+
+    Returns:
+        The gate, shape (N,), in ``like``'s dtype; None when ``fraction`` is a
+        plain number (nothing to attach).
+    """
+    if not be.is_torch_tensor(fraction):
+        return None
+    gate = be.where(transmitted, fraction / host, (1.0 - fraction) / (1.0 - host))
+    return gate.to(like.dtype)

@@ -253,7 +253,20 @@ GEOMETRIES = {
 
 # -- scatter models (constructor arguments) -------------------------------------------------
 
-_TRANSMISSIVE = refused("the reflect-or-transmit split is read as a number on the host")
+# Chapter 09 section 9.14.3 of the research repository (issue 93): the branch
+# is drawn with the fraction's host value and each branch's weight carries its
+# share; the lobe's width and slope enter the weight through d log f at the
+# drawn direction (the likelihood-ratio path), the direction staying detached.
+_TRANSMISSIVE = attached(
+    IN,
+    "the scatter weight: each branch's share of the reflect-or-transmit split "
+    "(tau / p, (1 - tau) / (1 - p)), drawn with the detached p",
+)
+_LOBE_SHAPE = attached(
+    IN,
+    "the scatter weight: w d log f / d theta at the drawn direction (the "
+    "likelihood-ratio path; the direction is drawn detached)",
+)
 
 BSDFS = {
     "lambertian": {
@@ -261,9 +274,12 @@ BSDFS = {
         "transmissive_fraction": _TRANSMISSIVE,
     },
     "harvey_shack": {
-        "b0": refused("the lobe's parameters are read as numbers: its weight and direction are host-built"),
-        "l0": refused("the lobe's parameters are read as numbers: its weight and direction are host-built"),
-        "s": refused("the lobe's parameters are read as numbers: its weight and direction are host-built"),
+        "b0": refused(
+            "zero by structure: the lobe is normalised over the reachable directions, "
+            "so b0 cancels from the drawn direction and from the weight"
+        ),
+        "l0": _LOBE_SHAPE,
+        "s": _LOBE_SHAPE,
         "transmissive_fraction": _TRANSMISSIVE,
     },
     "tabulated": {"path": detached("a file"), "transmissive_fraction": _TRANSMISSIVE},
