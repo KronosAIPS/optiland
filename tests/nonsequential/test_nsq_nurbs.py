@@ -28,6 +28,11 @@ What each class pins, and the route it uses:
   the host.
 - ``TestRegistration``: the kind, its lowering, the parameter register's
   contract, the value unchanged in gradient mode.
+- ``TestAppleGPU``: the kind at float32 on the Apple GPU (research repository
+  issue 99): the sphere against the same rays on the CPU, and reverse mode
+  reaching float64 host parameters, with a control of the torch defect behind
+  the second. Skipped where the device is not reachable; the upload's host
+  rounding is checked on the CPU.
 """
 
 from __future__ import annotations
@@ -733,3 +738,108 @@ class TestMirrorFace:
             assert np.array_equal(a[key], mine[key]), key
         d = scene_to_dict(self._scene(MirrorConfig(radius=-100.0, reflectance=1.0)))
         assert "nurbs" not in next(c for c in d["components"] if c["name"] == "M")["config"]
+
+
+# ---------------------------------------------------------------------------
+
+
+needs_mps = pytest.mark.skipif(
+    not torch.backends.mps.is_available(),
+    reason="the Apple GPU (torch mps) is not reachable on this host",
+)
+
+
+@pytest.fixture
+def _mps_float32():
+    be.set_backend("torch")
+    be.set_precision("float32")  # before the device: the Apple GPU refuses float64
+    be.set_device("mps")
+    yield
+    be.set_backend("torch")
+    be.set_device("cpu")
+    be.set_precision("float64")
+    be.set_backend("numpy")
+
+
+class TestAppleGPU:
+    """The kind at float32 on the Apple GPU (research repository issue 99).
+
+    The leaves were uploaded as a float64 tensor on the target device and cast
+    there; the Apple GPU holds no float64 tensor, so every trace raised before
+    the first stage ran. They are now rounded on the host and moved. The
+    attached Newton step cast and moved a float64 host parameter in one call,
+    whose backward is the device-to-host float64 copy of issue 54 (it writes
+    zeros); it now casts where the parameter lives, then moves.
+    """
+
+    N = 2000
+
+    def test_upload_rounds_on_the_host_as_numpy_does(self):
+        _set("torch", "float32")
+        g = NurbsGeometry(_arrays(sphere_surface(10.0)))
+        dl, adj = g._device(torch.zeros(1, dtype=torch.float32))
+        assert np.array_equal(_np(adj["mu"]), g.leaves.mu.astype(np.float32))
+        assert np.array_equal(_np(adj["sign"]), g.leaves.patch_sign[g.leaves.patch].astype(np.float32))
+
+    @needs_mps
+    def test_sphere_against_the_cpu(self, _mps_float32):
+        o, d, fam = sphere_rays(self.N)
+        oc, dc = o.astype(np.float32), d.astype(np.float32)
+        out = {}
+        for dev in ("mps", "cpu"):
+            be.set_device(dev)
+            O, D = torch.as_tensor(oc, device=dev), torch.as_tensor(dc, device=dev)
+            g = NurbsGeometry(_arrays(sphere_surface(10.0)))
+            t, _, hit, ng = g.ray_intersect(O, D, eps=_tol.accept_t_min(O.abs().amax(dim=1)))
+            assert g.overflow_count() == 0
+            out[dev] = (_np(t).astype(float), _np(hit), _np(ng).astype(float))
+        t, hit, ng = out["mps"]
+        tc, hc, ngc = out["cpu"]
+        assert np.isfinite(t[hit]).all() and np.isfinite(ng[hit]).all()
+        # hit sets: a ray may differ only where TestSphere allows a float32
+        # difference at all (a ray leaving the surface at grazing incidence)
+        differ = hit != hc
+        assert np.all(fam[differ] == 1) and differ.sum() <= 0.01 * (fam == 1).sum()
+        # roots: each device within TestSphere's bound of the root, so within
+        # twice it of each other
+        both = hit & hc
+        cos = np.abs((ngc * dc.astype(float)).sum(1))
+        bound = 2 * 64 * 2.0**-24 * 30.0 / np.maximum(cos, 1e-3)
+        assert np.all(np.abs(t[both] - tc[both]) <= bound[both])
+        ang = np.arccos(np.clip((unit(ng[both]) * unit(ngc[both])).sum(1), -1, 1))
+        assert ang.max() < 2e-4
+
+    @needs_mps
+    def test_reverse_mode_reaches_float64_host_parameters(self, _mps_float32):
+        """A lost gradient (zeros, or the uninitialised values the defect can
+        leave) fails by orders of magnitude; 1e-3 of the largest component is a
+        detection threshold, far above the two float32 legs' own differences."""
+        a = _arrays(wavy_surface())
+        o = [[1.0, -2.0, 40.0], [3.0, 2.0, 40.0]]
+        d = np.array([[0.0, 0.0, -1.0], [0.1, 0.0, -1.0]])
+        d = d / np.linalg.norm(d, axis=1, keepdims=True)
+        grads = {}
+        for dev in ("mps", "cpu"):
+            be.set_device(dev)
+            cp = torch.tensor(a["ctrl_points"], dtype=torch.float64, requires_grad=True)
+            w = torch.tensor(a["ctrl_weights"], dtype=torch.float64, requires_grad=True)
+            g = NurbsGeometry(a, control_points=cp, weights=w)
+            O = torch.tensor(o, dtype=torch.float32, device=dev)
+            D = torch.tensor(d, dtype=torch.float32, device=dev)
+            t, _, hit, _ = g.ray_intersect(O, D)
+            assert bool(hit.all())
+            t.sum().backward()
+            grads[dev] = (cp.grad.numpy().copy(), w.grad.numpy().copy())
+        for got, ref in zip(grads["mps"], grads["cpu"]):
+            scale = np.abs(ref).max()
+            assert scale > 0
+            assert np.abs(got - ref).max() <= 1e-3 * scale
+
+    @needs_mps
+    def test_control_the_one_call_cast_and_move_loses_the_gradient(self):
+        """The defect itself, on this torch. If this starts failing, torch has
+        fixed it, and the kind's two-step cast and this control can be dated and
+        retired."""
+        x = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64, requires_grad=True)
+        x.to(dtype=torch.float32, device="mps").sum().backward()
+        assert not torch.equal(x.grad, torch.ones_like(x))
