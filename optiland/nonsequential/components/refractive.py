@@ -175,9 +175,11 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
                 angle-of-incidence-dependent for
                 ``UnpolarizedThinFilmCoating``) replace the bare Fresnel R/T
                 so NSQ agrees with the sequential engine's coating model.
-                Must be unpolarized -- a ``BaseCoatingPolarized`` instance
-                raises ``NotImplementedError`` immediately, since NSQ rays
-                carry no polarization state. A coating that describes one
+                A Jones-matrix coating (``BaseCoatingPolarized``) raises
+                ``NotImplementedError`` immediately: the scalar mode reads
+                R and T and the Stokes mode reads the s and p terms of a
+                thin-film stack or a table (chapter 06 section 6.14 of the
+                research repository), neither a Jones matrix. A coating that describes one
                 side of the interface (a thin-film stack, a table) is
                 matched to this component's front or back once
                 (:func:`coating_support.coating_incident_is_front`), and a

@@ -55,7 +55,19 @@ maintainer's ruling of 2026-09-27 on issue 5, for now. The key is to be
 written for every trace, ``"off"`` included, in one change with the
 record's statement of the scalar-equivalence conditions (chapter 06 section
 6.9, test T-06-19): a scalar run's record then says which conditions its
-numbers rely on, which a bare ``"off"`` would not.
+numbers rely on, which a bare ``"off"`` would not. Chapter 06 section 6.14
+specifies that record (the conditions measured on the trace's own paths, a
+per-ray count of polarizing events since the last depolarizing lobe); it is
+not built yet.
+
+What each kind does with the state, the scalar-equivalence guarantee, the
+graded cases and their device legs are documented in the research
+repository's chapter 06 section 6.14. Two rules added on 2026-10-02: a coated
+refractive face met beyond the critical angle keeps its coating's own s and
+p reflectances there (issue 96, chapter 06 section 6.15); and a coated face
+evaluates its coating once per Stokes event (:func:`coating_sp`), its scalar
+``R`` and ``T`` the means of the s and p terms, bit for bit what the
+coating's ``evaluate`` returns.
 
 Every function works on whatever array library the arguments are (NumPy or
 torch, float32 or float64) through ``optiland.backend``, on real arrays only.

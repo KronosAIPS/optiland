@@ -32,9 +32,10 @@ if TYPE_CHECKING:
 def reject_polarized_coating(coating: object, *, surface_name: str) -> None:
     """Raise if ``coating`` is a Jones-matrix (polarized) coating.
 
-    NSQ rays carry no polarization state, so a polarized coating cannot be
-    evaluated correctly. Rather than silently falling back to some scalar
-    average of its Jones matrix, refuse it outright.
+    The scalar mode reads a coating's R and T, and the Stokes mode the s and
+    p terms and relative phases of a thin-film stack or a coating table
+    (``polarization.coating_sp``); neither reads a Jones matrix. Rather than
+    silently falling back to some scalar average of it, refuse it outright.
 
     ``UnpolarizedThinFilmCoating`` is not a ``BaseCoatingPolarized`` (it does
     not subclass the sequential-engine coating hierarchy at all), so it never
@@ -55,8 +56,10 @@ def reject_polarized_coating(coating: object, *, surface_name: str) -> None:
     if isinstance(coating, BaseCoatingPolarized):
         raise NotImplementedError(
             f"Surface {surface_name!r} was given a polarized coating "
-            f"({type(coating).__name__}); NSQ rays carry no polarization "
-            "state, so Jones-matrix coatings cannot be evaluated. Use an "
+            f"({type(coating).__name__}); the non-sequential engine reads R "
+            "and T, or in its Stokes mode the s and p terms of a thin-film "
+            "stack or a table, never a Jones matrix, so Jones-matrix "
+            "coatings cannot be evaluated. Use an "
             "unpolarized coating such as optiland.coatings.SimpleCoating, "
             "optiland.nonsequential.components.coating_support"
             ".UnpolarizedThinFilmCoating (angle- and wavelength-dependent, "
@@ -69,8 +72,8 @@ class UnpolarizedThinFilmCoating:
     """Unpolarized, angle-dependent NSQ adapter around a ``ThinFilmStack``.
 
     ``optiland.coatings.ThinFilmCoating`` builds a Jones matrix from the same
-    stack and is rejected by :func:`reject_polarized_coating` -- NSQ rays
-    carry no polarization state. This adapter evaluates the stack's
+    stack and is rejected by :func:`reject_polarized_coating`. This adapter
+    evaluates the stack's
     characteristic-matrix (R, T) at each ray's own wavelength and angle of
     incidence and reduces s/p to the unpolarized average the theory chapter
     uses, :math:`\\bar R=(R_s+R_p)/2` (and the matching T), which is exactly
@@ -79,6 +82,11 @@ class UnpolarizedThinFilmCoating:
     ``RefractiveComponent.interact`` has on hand (a per-ray cosine of the
     angle of incidence, not an angle in radians) and gives the dispatch in
     :func:`evaluate_transmissive_coating` an ``evaluate`` method to find.
+
+    In the engine's Stokes mode a refractive face reads the same stack's s and
+    p terms and relative phases instead (``polarization.coating_sp``), and its
+    scalar (R, T) are their means, the values :meth:`evaluate` returns, bit
+    for bit.
 
     An empty stack (no layers) reduces to the bare unpolarized Fresnel
     reflectance of the incident/substrate interface, since the
