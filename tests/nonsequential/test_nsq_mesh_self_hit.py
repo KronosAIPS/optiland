@@ -133,3 +133,49 @@ def test_a_glass_box_mesh_passes_a_tilted_beam_parallel():
     # the sine of each ray's angle to the beam (arccos near 1 resolves only sqrt(2 u))
     sin = np.linalg.norm(np.cross(np.column_stack([L, M, N]), beam), axis=1)
     assert sin.max() < 1e-12
+
+
+# The torch backend (found by the Apple GPU audit of 2026-10-02): the kind handed
+# torch tensors to numpy arithmetic and raised on every torch device. trimesh is host
+# code, so a tensor is copied to the host, widened there, and the results are rounded
+# to the rays' dtype on the host and moved back.
+
+@pytest.mark.parametrize("offset", [0.0, 1e-9])
+def test_on_torch_float64_the_kind_returns_the_numpy_bits(offset):
+    torch = pytest.importorskip("torch")
+    g = MeshGeometry(_box())
+    yz, d = _leaving_rays()
+    o = np.column_stack([np.full(len(d), -HALF + offset), yz])
+    want = g.ray_intersect(o, d)
+    got = g.ray_intersect(torch.as_tensor(o), torch.as_tensor(d))
+    for w, x in zip(want, got):
+        assert torch.is_tensor(x) and x.device.type == "cpu"
+        assert np.array_equal(x.numpy(), w)
+    assert got[0].dtype == torch.float64 and got[2].dtype == torch.bool
+
+
+def test_on_torch_float32_the_kind_rounds_the_float64_answer_once():
+    torch = pytest.importorskip("torch")
+    g = MeshGeometry(_box())
+    yz, d = _leaving_rays()
+    o = np.column_stack([np.full(len(d), -HALF), yz]).astype(np.float32)
+    d = d.astype(np.float32)
+    want = g.ray_intersect(o.astype(np.float64), d.astype(np.float64))
+    got = g.ray_intersect(torch.as_tensor(o), torch.as_tensor(d))
+    assert got[0].dtype == torch.float32
+    assert np.array_equal(got[0].numpy(), want[0].astype(np.float32))
+    assert np.array_equal(got[2].numpy(), want[2])
+
+
+def test_on_the_apple_gpu_the_kind_returns_the_cpus_bits():
+    torch = pytest.importorskip("torch")
+    if not torch.backends.mps.is_available():
+        pytest.skip("the Apple GPU (torch mps) is not reachable on this host")
+    g = MeshGeometry(_box())
+    yz, d = _leaving_rays()
+    o = torch.as_tensor(np.column_stack([np.full(len(d), -HALF), yz]).astype(np.float32))
+    d = torch.as_tensor(d.astype(np.float32))
+    on_cpu = g.ray_intersect(o, d)
+    on_mps = g.ray_intersect(o.to("mps"), d.to("mps"))
+    for a, b in zip(on_cpu, on_mps):
+        assert b.device.type == "mps" and torch.equal(a, b.cpu())

@@ -46,10 +46,25 @@ def to_device_dtype(x: Any, device: Any, dtype: torch.dtype | None) -> Tensor:
     a 2.14 regression; measured on an Apple silicon GPU on 2026-09-24/25.)
 
     So a tensor that leaves a device for the host is copied to the host first,
-    in its own dtype, and cast there. Every other case -- a tensor staying on its
-    device, a host tensor going to a device, a non-tensor -- is the one-call
-    conversion it always was, so no result changes on the CPU or CUDA: a cast
-    after the copy rounds exactly as a cast before it.
+    in its own dtype, and cast there.
+
+    The other direction has the same defect in reverse mode (research
+    repository issue 102): the backward of the one-call
+    ``x_cpu_f64.to(device="mps", dtype=torch.float32)`` is that same
+    device-to-host float64 copy, so the gradient reaching a float64 host
+    tensor through it is zeros (``[0, 0, 0]`` for ``.sum()`` of three values;
+    measured with torch 2.14.0 on an Apple silicon GPU, 2026-10-02). So a host
+    tensor bound for a device with a dtype change is cast on the host first and
+    then moved; its backward is then a same-dtype copy back to the host followed
+    by a cast on the host, which is right.
+
+    Every cast therefore happens on the host, and every other case -- a tensor
+    staying on its device, a move without a dtype change, a non-tensor -- is
+    the one-call conversion it always was. No value changes on the CPU or on
+    CUDA: a conversion between floating, complex and integer dtypes rounds the
+    same way (round to nearest even, or truncation toward zero for an integer
+    target) on the host as on the device, so casting before the copy gives the
+    bits of casting after it, forward and backward.
 
     Args:
         x: A tensor or anything ``torch.as_tensor`` accepts.
@@ -66,6 +81,13 @@ def to_device_dtype(x: Any, device: Any, dtype: torch.dtype | None) -> Tensor:
     target = x.device if device is None else torch.device(device)
     if target.type == "cpu" and x.device.type != "cpu":
         x = x.to(device=target)
+    elif (
+        target.type != "cpu"
+        and x.device.type == "cpu"
+        and dtype is not None
+        and dtype != x.dtype
+    ):
+        x = x.to(dtype=dtype)
     return x.to(device=target, dtype=dtype)
 
 

@@ -65,7 +65,11 @@ class MeshGeometry(AnalyticGeometry):
             rule) closed mesh.
         """
         xp = _get_xp(origins)
-        # Bring to CPU for trimesh
+        # Bring to CPU for trimesh: a torch tensor (any device) is copied to the
+        # host in its own dtype and widened there to float64 (the Apple GPU's
+        # one-call copy to a float64 host array writes zeros, the research
+        # repository's issue 54). Before this the torch backend raised here.
+        like = origins if _is_torch(origins) else None
         o_np = _to_numpy(origins)
         d_np = _to_numpy(directions)
         N = o_np.shape[0]
@@ -133,6 +137,25 @@ class MeshGeometry(AnalyticGeometry):
 
         hit_mask_np = t_out < np.inf
 
+        if like is not None:
+            # Back to the rays' dtype and device, rounded on the host and then
+            # moved; the mesh kind carries no gradient (trimesh is host code).
+            from optiland.backend.torch_backend.capabilities import (  # noqa: PLC0415
+                to_device_dtype,
+            )
+
+            import torch  # noqa: PLC0415
+
+            def back(a, dtype):
+                return to_device_dtype(torch.from_numpy(np.ascontiguousarray(a)), like.device, dtype)
+
+            return (
+                back(t_out, like.dtype),
+                back(normals_out, like.dtype),
+                back(hit_mask_np, torch.bool),
+                back(n_geom_out, like.dtype),
+            )
+
         if xp is not np:
             t_out = xp.array(t_out)
             normals_out = xp.array(normals_out)
@@ -157,7 +180,17 @@ class MeshGeometry(AnalyticGeometry):
         return AABB(verts_global.min(axis=0), verts_global.max(axis=0))
 
 
+def _is_torch(arr) -> bool:
+    try:
+        import torch  # noqa: PLC0415
+    except ImportError:
+        return False
+    return isinstance(arr, torch.Tensor)
+
+
 def _to_numpy(arr: np.ndarray) -> np.ndarray:
+    if _is_torch(arr):
+        return arr.detach().cpu().numpy().astype(np.float64)
     try:
         import cupy  # type: ignore[import]
 

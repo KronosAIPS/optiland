@@ -17,6 +17,7 @@ from optiland.nonsequential.components.sampling_support import (
     attachable_fraction,
     detached,
     lobe_branch_gate,
+    onto_apple_gpu,
 )
 from optiland.nonsequential.ray_bundle import backend_bool_full
 from optiland.nonsequential.rng import EventSlot
@@ -137,7 +138,8 @@ class LambertianBSDF(BaseBSDF):
 
         # be.ones * reflectance_value preserves the autograd graph when
         # reflectance_value is a torch Tensor with requires_grad=True.
-        weights_be = be.ones(num_rays) * self.reflectance_value
+        ones = be.ones(num_rays)
+        weights_be = ones * onto_apple_gpu(self.reflectance_value, ones)
         # The branch's share, attached when the fraction carries a gradient
         # (exactly 1 in value, so the weight keeps its bits).
         gate = lobe_branch_gate(
@@ -164,7 +166,8 @@ class LambertianBSDF(BaseBSDF):
         Returns:
             Array of reflectance_value, shape (N,).
         """
-        return be.ones(incident_dirs.shape[0]) * self.reflectance_value
+        ones = be.ones(incident_dirs.shape[0])
+        return ones * onto_apple_gpu(self.reflectance_value, ones)
 
 
 def _orthonormal_basis(n: np.ndarray, frame=None) -> tuple[np.ndarray, np.ndarray]:

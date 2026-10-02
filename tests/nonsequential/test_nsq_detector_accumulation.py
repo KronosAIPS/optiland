@@ -346,3 +346,108 @@ class TestGradientThroughInPlaceAccumulation:
             assert width.grad.abs().item() > 0.0
         finally:
             _reset_backend()
+
+
+def _skewed_contributions(k=50_000, size=512, seed=3):
+    """Contributions piled into a few heavy bins (bin = size * u^3) and spread thinly."""
+    g = torch.Generator().manual_seed(seed)
+    idx = (torch.rand(k, generator=g) ** 3 * size).long()
+    src = torch.rand(k, generator=g) * 1e-3
+    return idx, src
+
+
+def _pairwise_reference(idx, src, size):
+    """The ordered accumulation written out per bin in plain Python: each bin's
+    contributions in call order, summed by the pairwise tree in float32."""
+    out = np.zeros(size, dtype=np.float32)
+    idx_np, src_np = idx.numpy(), src.numpy().astype(np.float32)
+    for b in np.unique(idx_np):
+        vals = list(src_np[idx_np == b])
+        step = 1
+        while step < len(vals):
+            for r in range(0, len(vals) - step, 2 * step):
+                vals[r] = np.float32(vals[r] + vals[r + step])
+            step *= 2
+        out[b] = np.float32(out[b] + vals[0])
+    return out
+
+
+class TestOrderedFloat32Accumulation:
+    """The float32 accumulator's scatter-add in a fixed order (research repository
+    issue 69): a sort by bin, a pairwise tree per bin, one write per bin.
+
+    The rounding bound per bin is ``(ceil(log2 K_b) + 1) u32`` relative for
+    ``K_b`` non-negative contributions: the pairwise tree has depth
+    ``ceil(log2 K_b)`` and each level rounds a partial sum once (the standard
+    bound for pairwise summation), plus the addition into the buffer."""
+
+    def test_it_is_the_pairwise_sum_of_each_bin_in_call_order_to_the_bit(self):
+        from optiland.nonsequential.detectors.base import _ordered_index_add_
+
+        idx, src = _skewed_contributions(k=6000, size=64)
+        buf = torch.zeros(64, dtype=torch.float32)
+        _ordered_index_add_(buf, idx, src)
+        assert np.array_equal(buf.numpy(), _pairwise_reference(idx, src, 64))
+
+    def test_every_bin_is_within_the_pairwise_bound(self):
+        import math
+
+        from optiland.nonsequential.detectors.base import _ordered_index_add_
+
+        idx, src = _skewed_contributions()
+        buf = torch.zeros(512, dtype=torch.float32)
+        _ordered_index_add_(buf, idx, src)
+        exact = torch.zeros(512, dtype=torch.float64).index_add_(0, idx, src.double())
+        counts = torch.bincount(idx, minlength=512)
+        hit = counts > 0
+        bound = torch.tensor(
+            [math.ceil(math.log2(c)) + 1 for c in counts[hit].tolist()], dtype=torch.float64
+        ) * 2.0**-24
+        rel = (buf.double()[hit] - exact[hit]).abs() / exact[hit]
+        assert bool((rel <= bound).all())
+        assert float(buf[~hit].abs().sum()) == 0.0
+        assert int(counts.max()) > 5000  # a heavy bin is in the test
+
+    def test_equal_contributions_into_one_bin(self):
+        """The grouped test's case (20,000 equal terms, one bin): bound 16 u32."""
+        from optiland.nonsequential.detectors.base import _ordered_index_add_
+
+        src = torch.full((20_000,), 5.0e-5, dtype=torch.float32)
+        idx = torch.zeros(20_000, dtype=torch.int64)
+        exact = float(src.double().sum())
+        buf = torch.zeros(8, dtype=torch.float32)
+        _ordered_index_add_(buf, idx, src)
+        assert abs(float(buf[0]) - exact) / exact <= 16 * 2.0**-24
+        assert float(buf[1:].abs().sum()) == 0.0
+
+    def test_it_adds_to_what_the_buffer_holds_and_ignores_an_empty_call(self):
+        from optiland.nonsequential.detectors.base import _ordered_index_add_
+
+        buf = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float32)
+        _ordered_index_add_(buf, torch.zeros(0, dtype=torch.int64), torch.zeros(0))
+        assert torch.equal(buf, torch.tensor([1.0, 2.0, 3.0]))
+        _ordered_index_add_(buf, torch.tensor([2, 0, 2]), torch.tensor([0.5, 0.25, 0.5]))
+        assert torch.equal(buf, torch.tensor([1.25, 2.0, 4.0]))
+
+    def test_it_keeps_the_gradient(self):
+        from optiland.nonsequential.detectors.base import _ordered_index_add_
+
+        src = torch.full((4096,), 1.0e-3, dtype=torch.float32, requires_grad=True)
+        idx = torch.arange(4096, dtype=torch.int64) % 3
+        buf = torch.zeros(3, dtype=torch.float32)
+        _ordered_index_add_(buf, idx, src)
+        (buf * torch.tensor([1.0, 2.0, 3.0])).sum().backward()
+        assert torch.equal(src.grad, (idx + 1).to(torch.float32))
+
+    def test_a_float32_buffer_is_accumulated_in_order_and_a_float64_one_as_before(self):
+        from optiland.nonsequential.detectors.base import _accumulate_into, _ordered_index_add_
+
+        idx, src = _skewed_contributions(k=5000, size=64)
+        via = torch.zeros(64, dtype=torch.float32)
+        _accumulate_into(via, idx.numpy(), src)
+        direct = torch.zeros(64, dtype=torch.float32)
+        _ordered_index_add_(direct, idx, src)
+        assert torch.equal(via, direct)
+        wide = torch.zeros(64, dtype=torch.float64)
+        _accumulate_into(wide, idx.numpy(), src)
+        assert torch.equal(wide, torch.zeros(64, dtype=torch.float64).index_add_(0, idx, src.double()))
