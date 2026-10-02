@@ -224,6 +224,28 @@ def coating_incident_is_front(
     return abs(n_f - n_inc) + abs(n_b - n_sub) <= abs(n_f - n_sub) + abs(n_b - n_inc)
 
 
+def coating_holds_beyond_critical(coating: object) -> bool:
+    """Whether a coating's own R and T hold beyond the critical angle (issue 96).
+
+    A side-aware coating (one with ``media()``: a thin-film stack, a table)
+    describes the whole interface, its two media included, so its reflectance
+    beyond the bare interface's critical angle is its own: a lossless stack
+    gives ``R = 1`` there to rounding, an absorbing layer in the evanescent
+    field gives ``R < 1`` (frustrated total internal reflection, the research
+    repository's chapter 06 section 6.15). A side-blind coating (a
+    ``SimpleCoating``, a constant) states one ``R`` and ``T`` for the
+    transmitting regime and says nothing about total internal reflection, so
+    the bare interface's ``R = 1`` stands for it.
+
+    Args:
+        coating: The attached coating, or None.
+
+    Returns:
+        True for a side-aware coating, False otherwise.
+    """
+    return coating is not None and callable(getattr(coating, "media", None))
+
+
 def from_substrate_mask(incident_is_front: bool | None, entering_back):
     """Per ray: does it arrive from the coating's substrate side?
 

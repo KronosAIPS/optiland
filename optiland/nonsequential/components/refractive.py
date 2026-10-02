@@ -17,6 +17,7 @@ from optiland.nonsequential import _tol
 from optiland.nonsequential._utils import resident_scalar
 from optiland.nonsequential.components.base import BaseComponent, _resident_transform
 from optiland.nonsequential.components.coating_support import (
+    coating_holds_beyond_critical,
     coating_incident_is_front,
     evaluate_transmissive_coating,
     from_substrate_mask,
@@ -181,7 +182,9 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
                 matched to this component's front or back once
                 (:func:`coating_support.coating_incident_is_front`), and a
                 ray arriving from its substrate side is evaluated as that
-                side sees it (the research repository's issue 83).
+                side sees it (the research repository's issue 83). Such a
+                coating also keeps its own reflectance beyond the critical
+                angle (issue 96; see :meth:`interact`).
         """
         reject_polarized_coating(coating, surface_name=name)
         self.coating = coating
@@ -234,9 +237,12 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         branch decision is drawn from a detached probability so stochastic
         choices do not block gradients; the throughput weight multiplier
         carries the attached reflectance so ∂flux/∂R is non-zero. When
-        ``self.coating`` is set, its R/T replace the bare Fresnel values
-        (still forced to R=1/T=0 under TIR, where no coating can restore a
-        transmitted wave).
+        ``self.coating`` is set, its R/T replace the bare Fresnel values.
+        Under TIR no coating can restore a transmitted wave, so T = 0; a
+        side-aware coating (a thin-film stack, a table) keeps its own
+        reflectance there and its absorptance is booked as coating loss
+        (frustrated total internal reflection, the research repository's
+        issue 96), while a bare face and a side-blind coating reflect R = 1.
 
         Args:
             rays: Ray bundle updated in-place.
@@ -337,14 +343,28 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         R_fresnel = be.where(tir, be.ones_like(rs), 0.5 * (rs**2 + rp**2))
 
         # A coating overrides the bare Fresnel R/T with its own (possibly
-        # wavelength- and angle-dependent, possibly lossy: R + T < 1) values
-        # -- except under TIR, where there is no real transmitted wave
-        # regardless of what the coating claims, so reflection stays forced
-        # to R=1, T=0. evaluate_transmissive_coating dispatches on what the
-        # coating exposes -- see coating_support.py -- so a scalar
-        # SimpleCoating and an angle-dependent UnpolarizedThinFilmCoating
-        # both flow through this one call.
+        # wavelength- and angle-dependent, possibly lossy: R + T < 1) values.
+        # evaluate_transmissive_coating dispatches on what the coating
+        # exposes -- see coating_support.py -- so a scalar SimpleCoating and
+        # an angle-dependent UnpolarizedThinFilmCoating both flow through
+        # this one call.
+        #
+        # Under TIR no transmitted wave leaves the face (T = 0). What is
+        # reflected depends on the coating (the research repository's issue
+        # 96, chapter 06 section 6.15): a side-aware coating (a stack, a
+        # table) describes the interface beyond its critical angle too, so
+        # the ray reflects R + T of it -- R exactly where the stack's own
+        # transmittance vanishes, which is every lane beyond the critical
+        # angle; the T term only returns to the reflection what a stack or
+        # a table cell straddling the cutoff still assigns to a transmitted
+        # wave the engine has ruled out -- and the coating's absorptance
+        # 1 - R - T is booked as loss below. An absorbing layer in the
+        # evanescent field absorbs (frustrated total internal reflection); a
+        # lossless stack gives 1 to rounding. A bare face and a side-blind
+        # coating (a stated R and T for the transmitting regime) reflect
+        # R = 1, as before.
         from_substrate = None
+        coated_tir = coating_holds_beyond_critical(self.coating)
         if self.coating is not None:
             from_substrate = from_substrate_mask(
                 self._coating_incident_front(), entering_back
@@ -355,7 +375,10 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
         else:
             R_used = R_fresnel
             T_used = 1.0 - R_fresnel
-        R_used = be.where(tir, be.ones_like(R_used), R_used)
+        if coated_tir:
+            R_used = be.where(tir, R_used + T_used, R_used)
+        else:
+            R_used = be.where(tir, be.ones_like(R_used), R_used)
         T_used = be.where(tir, be.zeros_like(T_used), T_used)
 
         # Stokes mode (the research repository's issue 5): R and T become the
@@ -366,7 +389,7 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             stokes = fresnel_stokes(
                 rays, dirs, normals, n1, n2, cos_theta_i, sin2_t, tir, rs, rp,
                 R_used, T_used, coating=self.coating, wavelength=wl,
-                from_substrate=from_substrate,
+                from_substrate=from_substrate, coated_tir=coated_tir,
             )
             R_used, T_used = stokes.R_eff, stokes.T_eff
 
@@ -413,12 +436,18 @@ class RefractiveComponent(BaseComponent, LedgerBooking):
             # branch regardless of p -- exact flux conservation in
             # expectation, with the shortfall R+T<1 taken up by the
             # deterministic T weight rather than a separate absorption draw.
-            # For TIR rays weight stays 1.0 (full reflection is deterministic).
+            # For TIR rays the reflection is deterministic and the weight is
+            # the reflectance itself: exactly 1 on a bare face or under a
+            # side-blind coating, the coating's R under a side-aware one
+            # (issue 96), with no division by a probability.
             weight_reflect = R_used / (p_det + _tol.tiny_for(p_det))
             weight_transmit = T_used / (1.0 - p_det + _tol.tiny_for(p_det))
             weight = be.where(do_reflect, weight_reflect, weight_transmit)
-            # TIR: weight is exactly 1
-            weight = be.where(tir, be.ones_like(weight), weight)
+            if coated_tir:
+                weight = be.where(tir, R_used, weight)
+            else:
+                # TIR: weight is exactly 1
+                weight = be.where(tir, be.ones_like(weight), weight)
 
         # Ch. 10 (10.1) and (10.2), booked together because they share the
         # same incoming weight. What the surface absorbs is w(1 - R - T),

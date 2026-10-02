@@ -912,7 +912,7 @@ def incidence_frame(rays, dirs, normals):
 
 def fresnel_stokes(
     rays, dirs, normals, n1, n2, cos_i, sin2_t, tir, rs, rp, R_used, T_used,
-    coating=None, wavelength=None, from_substrate=None,
+    coating=None, wavelength=None, from_substrate=None, coated_tir=False,
 ) -> FresnelStokes:
     """The Stokes half of a refractive interface, before the branch is drawn.
 
@@ -940,6 +940,12 @@ def fresnel_stokes(
         wavelength: Per-ray wavelength [um] (for a thin-film coating).
         from_substrate: Per-ray mask of the rays arriving from a side-aware
             coating's substrate side, or ``None`` (issue 83).
+        coated_tir: Whether the coating keeps its own reflectance beyond the
+            critical angle (a side-aware coating, issue 96): its ``M01`` is
+            then kept on the totally reflected lanes, so a polarized ray
+            meeting an absorbing coating in total internal reflection reads
+            ``R_s`` or ``R_p`` rather than their mean. ``False`` (a bare face,
+            a side-blind coating) keeps ``M01 = 0`` there, as before.
 
     Returns:
         A :class:`FresnelStokes`.
@@ -964,12 +970,19 @@ def fresnel_stokes(
         else:
             # a coating table with its phase grids (it refuses without them)
             sp = coating.sp(wavelength, cos_i, from_substrate)
-        m_r = InterfaceMueller(
-            R_used,
-            be.where(tir, zero, 0.5 * (sp.Rp - sp.Rs)),
-            sp.xr_re,
-            sp.xr_im,
-        )
+        if coated_tir:
+            # issue 96: beyond the critical angle the coating keeps its own
+            # s and p reflectances (R_used there is (R_s + T_s + R_p + T_p) / 2,
+            # the transmitted share returned to the reflection; T_s = T_p = 0
+            # on every lane beyond the cutoff)
+            m01 = be.where(
+                tir,
+                0.5 * ((sp.Rp + sp.Tp) - (sp.Rs + sp.Ts)),
+                0.5 * (sp.Rp - sp.Rs),
+            )
+        else:
+            m01 = be.where(tir, zero, 0.5 * (sp.Rp - sp.Rs))
+        m_r = InterfaceMueller(R_used, m01, sp.xr_re, sp.xr_im)
         t = sp.transmission()
         m_t = InterfaceMueller(
             T_used, be.where(tir, zero, t.m01), be.where(tir, zero, t.m22),
