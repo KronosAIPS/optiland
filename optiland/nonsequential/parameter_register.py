@@ -375,7 +375,15 @@ def _scalar_like(value, like):
     import torch  # noqa: PLC0415
 
     if torch.is_tensor(value):
-        return value.to(dtype=like.dtype, device=like.device).reshape(())
+        # Cast on the host, then move (to_device_dtype): the one-call
+        # cast-and-move of a float64 host parameter to the Apple GPU returned a
+        # gradient of 0 (the research repository's issue 102); the bits on the
+        # CPU and CUDA are the same either way.
+        from optiland.backend.torch_backend.capabilities import (  # noqa: PLC0415
+            to_device_dtype,
+        )
+
+        return to_device_dtype(value, like.device, like.dtype).reshape(())
     return torch.tensor(float(np.asarray(value).reshape(())), dtype=like.dtype, device=like.device)
 
 

@@ -353,8 +353,15 @@ def resolve_reflectance(
         # 09_differentiation.md R-09-2: a coating reflectance is attached);
         # float() here detached it silently, which the dead-parameter raise
         # of the parameter register found. A plain number takes the line
-        # below, unchanged.
-        return be.ones_like(wavelength) * reflectance.to(
-            dtype=wavelength.dtype, device=wavelength.device
+        # below, unchanged. The conversion casts on the host before it moves
+        # (to_device_dtype): the one-call cast-and-move of a float64 host
+        # tensor to the Apple GPU returned a gradient of 0 (the research
+        # repository's issue 102); on the CPU and CUDA the bits are the same.
+        from optiland.backend.torch_backend.capabilities import (  # noqa: PLC0415
+            to_device_dtype,
+        )
+
+        return be.ones_like(wavelength) * to_device_dtype(
+            reflectance, wavelength.device, wavelength.dtype
         )
     return be.ones_like(wavelength) * float(reflectance)

@@ -46,6 +46,42 @@ def detached(value):
     return value
 
 
+def onto_apple_gpu(value, like):
+    """``value`` in ``like``'s dtype on ``like``'s device, where that device is mps.
+
+    An attached scalar parameter of a scatter model is often a float64 host
+    tensor. On the CPU and on CUDA it enters the per-ray arithmetic as it is
+    (a 0-dim host tensor combines with device tensors), and those values stay
+    as they always were. Apple's mps holds no float64: a float64 selection
+    there is refused, and the backward of a product with a float64 host
+    tensor converts a device gradient to float64 on the device, which torch
+    refuses too. There the value is rounded to ``like``'s dtype on the host
+    and then moved (the research repository's issue 102: cast on the host,
+    then move, so the gradient comes back as a same-dtype copy and a host
+    cast).
+
+    Args:
+        value: A torch tensor (usually 0-dim, possibly requiring grad).
+        like: The device tensor it is combined with.
+
+    Returns:
+        ``value`` unchanged unless ``like`` is on mps in another dtype or
+        device; then the converted tensor, still on ``value``'s graph.
+    """
+    if (
+        be.is_torch_tensor(value)
+        and be.is_torch_tensor(like)
+        and like.device.type == "mps"
+        and (value.dtype != like.dtype or value.device != like.device)
+    ):
+        from optiland.backend.torch_backend.capabilities import (  # noqa: PLC0415
+            to_device_dtype,
+        )
+
+        return to_device_dtype(value, like.device, like.dtype)
+    return value
+
+
 def scatter_branch(
     scatter_fraction, hit_mask, rng: NSQRng, ray_id, bounce, owner=None
 ):
@@ -91,6 +127,10 @@ def scatter_branch(
         weight_nonscatter_branch = resident_scalar(
             owner, "scatter_weight", weight_nonscatter_branch, u_scatter
         )
+    # An attached fraction is a host tensor; on the Apple GPU its two weights
+    # are rounded to the rays' dtype on the host and moved (onto_apple_gpu).
+    weight_scatter_branch = onto_apple_gpu(weight_scatter_branch, u_scatter)
+    weight_nonscatter_branch = onto_apple_gpu(weight_nonscatter_branch, u_scatter)
     sf_gate = be.where(scatters, weight_scatter_branch, weight_nonscatter_branch)
     return scatters, sf_gate
 
@@ -150,5 +190,10 @@ def lobe_branch_gate(fraction, host: float, transmitted, like):
     """
     if not be.is_torch_tensor(fraction):
         return None
-    gate = be.where(transmitted, fraction / host, (1.0 - fraction) / (1.0 - host))
+    # On the Apple GPU the two shares are rounded to the weights' dtype on the
+    # host first (onto_apple_gpu); everywhere else the selection is made in
+    # the fraction's dtype and cast after, as it always was.
+    through = onto_apple_gpu(fraction / host, like)
+    back = onto_apple_gpu((1.0 - fraction) / (1.0 - host), like)
+    gate = be.where(transmitted, through, back)
     return gate.to(like.dtype)

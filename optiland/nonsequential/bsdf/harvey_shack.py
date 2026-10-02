@@ -25,6 +25,7 @@ from optiland.nonsequential.components.sampling_support import (
     attachable_fraction,
     detached,
     lobe_branch_gate,
+    onto_apple_gpu,
 )
 from optiland.nonsequential.ray_bundle import backend_bool_full
 from optiland.nonsequential.rng import EventSlot
@@ -616,12 +617,12 @@ class HarveyShackBSDF(BaseBSDF):
         if be.is_torch_tensor(self.l0):
             table = resident_table(self, "dlog_tis_l0", self._dlog_tis[0])
             d_l0 = (s / l0) * frac - _lerp(grid, table, g, size)
-            score = score + (self.l0 - detached(self.l0)) * d_l0
+            score = score + onto_apple_gpu(self.l0 - detached(self.l0), d_l0) * d_l0
         if be.is_torch_tensor(self.s):
             table = resident_table(self, "dlog_tis_s", self._dlog_tis[1])
             log_ratio = be.where(pos, be.log(safe / l0), be.zeros_like(delta))
             d_s = -log_ratio * frac - _lerp(grid, table, g, size)
-            score = score + (self.s - detached(self.s)) * d_s
+            score = score + onto_apple_gpu(self.s - detached(self.s), d_s) * d_s
         return score
 
     def reflectance(

@@ -29,6 +29,8 @@ the defect without the test saying so.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 
@@ -541,3 +543,136 @@ class TestReproducibleTraceOnTheAppleGpu:
                 torch.zeros(4096, device="mps").index_add_(0, idx, src)
         finally:
             torch.use_deterministic_algorithms(False)
+
+
+def _mirror_scene(reflectance):
+    """A collimated beam on a plane mirror; the detector in front catches the reflection."""
+    from optiland.coordinate_system import CoordinateSystem
+    from optiland.nonsequential import (
+        CollimatedSourceConfig,
+        IrradianceDetectorConfig,
+        NSQScene,
+        Spectrum,
+    )
+    from optiland.nonsequential.components.geometry.analytic.plane import PlaneGeometry
+    from optiland.nonsequential.components.reflective import ReflectiveComponent
+
+    scene = NSQScene()
+    scene.add_source("S1", CoordinateSystem(z=50.0), CollimatedSourceConfig(
+        spectrum=Spectrum.monochromatic(0.55), total_flux=1.0, aperture_radius=1.0))
+    scene.add_component("M", ReflectiveComponent(
+        CoordinateSystem(z=100.0), PlaneGeometry(), reflectance=reflectance))
+    scene.add_detector("D", CoordinateSystem(z=0.0), IrradianceDetectorConfig(
+        width=20.0, height=20.0, num_pixels_x=4, num_pixels_y=4))
+    return scene
+
+
+class TestAttachedHostParametersOnTheAppleGpu:
+    """A float64 host parameter attached to a trace on the Apple GPU keeps its gradient.
+
+    Measured on 2026-10-02 (torch 2.14.0): with a float64 ``requires_grad``
+    host tensor as the parameter, a mirror's reflectance and a placement gave a
+    gradient of exactly 0 on the Apple GPU (a one-call cast-and-move, issue
+    102's mechanism); a Lambertian lobe's reflectance and the Harvey-Shack
+    lobe's ``l0`` and ``s`` raised in the backward, and a component's
+    ``scatter_fraction`` and a lobe's ``transmissive_fraction`` raised in the
+    forward ("Cannot convert a MPS Tensor to float64"): a float64 0-dim host
+    tensor met float32 device tensors. Each now reaches the device rounded on
+    the host (``onto_apple_gpu``, ``to_device_dtype``); on the CPU and CUDA
+    nothing changes.
+    """
+
+    def test_on_the_cpu_the_helper_returns_the_value_itself(self):
+        from optiland.nonsequential.components.sampling_support import onto_apple_gpu
+
+        p = torch.tensor(0.3, dtype=torch.float64, requires_grad=True)
+        like = torch.zeros(4, dtype=torch.float32)
+        assert onto_apple_gpu(p, like) is p
+        assert onto_apple_gpu(0.3, like) == 0.3
+
+    @needs_mps
+    def test_the_helper_rounds_on_the_host_and_keeps_the_graph(self):
+        from optiland.nonsequential.components.sampling_support import onto_apple_gpu
+
+        p = torch.tensor(0.1, dtype=torch.float64, requires_grad=True)
+        like = torch.ones(8, device="mps")
+        q = onto_apple_gpu(p, like)
+        assert q.device.type == "mps" and q.dtype == torch.float32
+        assert float(q.detach().cpu()) == float(torch.tensor(0.1, dtype=torch.float32))
+        (q * like).sum().backward()
+        assert float(p.grad) == 8.0
+
+    @needs_mps
+    def test_a_placement_scalar_keeps_its_gradient(self):
+        from optiland.nonsequential.parameter_register import _scalar_like
+
+        p = torch.tensor(0.25, dtype=torch.float64, requires_grad=True)
+        like = torch.ones(16, device="mps")
+        (_scalar_like(p, like) * like).sum().backward()
+        assert float(p.grad) == 16.0
+
+    @needs_mps
+    @pytest.mark.parametrize("which", ["lambertian_reflectance", "transmissive_fraction",
+                                       "harvey_shack_l0", "scatter_fraction"])
+    def test_scatter_parameters_trace_and_differentiate(self, torch_backend_state, which):
+        """The scene of the scatter-weight tests, 4,000 rays, d(detected flux)/d(parameter):
+        it runs, and its gradient is not zero (each was a raise before)."""
+        from optiland.coordinate_system import CoordinateSystem
+        from optiland.nonsequential import (
+            VACUUM,
+            CollimatedSourceConfig,
+            IrradianceDetectorConfig,
+            NSQScene,
+            RefractiveComponent,
+            Spectrum,
+        )
+        from optiland.nonsequential.bsdf.harvey_shack import HarveyShackBSDF
+        from optiland.nonsequential.bsdf.lambertian import LambertianBSDF
+        from optiland.nonsequential.components.geometry.analytic.plane import PlaneGeometry
+
+        be.set_backend("torch")
+        be.set_device("cpu")
+        be.set_precision("float32")
+        be.set_device("mps")
+        be.grad_mode.enable()
+        p = torch.tensor({"lambertian_reflectance": 0.8, "transmissive_fraction": 0.3,
+                          "harvey_shack_l0": 0.05, "scatter_fraction": 0.6}[which],
+                         dtype=torch.float64, requires_grad=True)
+        bsdf = {"lambertian_reflectance": lambda: LambertianBSDF(p, 0.3),
+                "transmissive_fraction": lambda: LambertianBSDF(0.8, p),
+                "harvey_shack_l0": lambda: HarveyShackBSDF(1.0, p, 2.0, 0.3),
+                "scatter_fraction": lambda: LambertianBSDF(0.8, 0.3)}[which]()
+        extra = {"scatter_fraction": p} if which == "scatter_fraction" else {}
+        scene = NSQScene()
+        scene.add_source("S1", CoordinateSystem(z=50.0), CollimatedSourceConfig(
+            spectrum=Spectrum.monochromatic(0.55), total_flux=1.0, aperture_radius=1e-6))
+        scene.add_component("P", RefractiveComponent(
+            CoordinateSystem(z=100.0), PlaneGeometry(), VACUUM, VACUUM, bsdf=bsdf, **extra))
+        for name, z in (("far", 200.0), ("near", 0.0)):
+            scene.add_detector(name, CoordinateSystem(z=z), IrradianceDetectorConfig(
+                width=20.0, height=20.0, num_pixels_x=4, num_pixels_y=4))
+        result = scene.trace(num_rays=4000, seed=3, max_depth=8)
+        flux = sum(d.data.sum() for d in result.detectors.values())
+        (g,) = torch.autograd.grad(flux, [p])
+        assert math.isfinite(float(g)) and float(g) != 0.0
+
+    @needs_mps
+    def test_a_mirror_reflectance_gradient_is_the_cpus(self, torch_backend_state):
+        """d(detected flux)/dR = the detected flux over R, a sum of 20,000 non-negative
+        terms: each device is within (64 + ceil(log2 20000) + 1) u32 = 80 u32 of it
+        relative (the catalogue's float32 chain count, the pairwise or float64
+        sum, the addition), so the two within 160 u32. Measured 7 u32."""
+        grads = {}
+        for device in ("cpu", "mps"):
+            be.set_backend("torch")
+            be.set_device("cpu")
+            be.set_precision("float32")
+            be.set_device(device)
+            be.grad_mode.enable()
+            r = torch.tensor(0.9, dtype=torch.float64, requires_grad=True)
+            result = _mirror_scene(r).trace(num_rays=20_000, seed=3, max_depth=4)
+            (g,) = torch.autograd.grad(result.detectors["D"].data.sum(), [r])
+            grads[device] = float(g)
+            be.grad_mode.disable()
+        assert grads["cpu"] > 0.5
+        assert abs(grads["mps"] - grads["cpu"]) <= 160 * _U32 * grads["cpu"]
