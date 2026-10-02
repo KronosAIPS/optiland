@@ -740,9 +740,10 @@ class ArrayBackend(TracerBackend):
             research repository: the top 24 bits times 2**-24, so no draw is
             1.0). At float64 the key is absent: the uniform is the whole
             32-bit output times 2**-32, as in every record made before the
-            key existed. In a Stokes trace also ``polarization: "stokes"``;
-            a scalar trace has no ``polarization`` key (absent means off;
-            see ``SimulationResult.environment``).
+            key existed. Also ``polarization``, the mode that traced:
+            ``"stokes"`` or ``"off"`` (the maintainer's ruling 2 of
+            2026-09-27: a record made before the key existed has no key and
+            reads as off; see ``SimulationResult.environment``).
         """
         try:
             device = str(be.get_device())
@@ -756,12 +757,10 @@ class ArrayBackend(TracerBackend):
         }
         if be.get_precision() == 32:
             env["uniform_bits"] = uniform_bits(32)
-        # R-06-10: a Stokes trace says so. Absent means the scalar trace, as
-        # in every record made before the mode existed (the maintainer's
-        # ruling of 2026-09-27: the key comes for every trace with the
-        # scalar-equivalence conditions of T-06-19; see SimulationResult).
-        if self.polarization != "off":
-            env["polarization"] = self.polarization
+        # R-06-10, T-06-19: the record names the mode that traced, "off"
+        # included. A record made before the key existed has none and reads
+        # as off (the maintainer's ruling 2 of 2026-09-27).
+        env["polarization"] = self.polarization
         return env
 
     # ------------------------------------------------------------------

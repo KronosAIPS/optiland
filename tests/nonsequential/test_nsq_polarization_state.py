@@ -5,7 +5,7 @@ or ``"stokes"``), or :data:`~optiland.nonsequential.polarization.POLARIZATION_EN
 for a harness that builds its own backends. What is pinned:
 
 * **Off is the engine as it was.** No state field exists, the environment block
-  has no ``polarization`` key, and nothing else changes (the fork's suite and the
+  says ``polarization: "off"``, and nothing else changes (the fork's suite and the
   catalogue's fast test, run on both backends and both precisions, are the proof
   of "bit-identical"; this file holds the unit checks).
 * **On carries six fields** -- ``pol_q``, ``pol_u``, ``pol_v`` and the reference
@@ -218,11 +218,11 @@ class TestBundle:
 
 
 class TestSwitch:
-    def test_default_is_off_and_the_record_says_nothing(self):
+    def test_default_is_off_and_the_record_says_off(self):
         backend = NumpyBackend(seed=1)
         assert backend.polarization == "off"
         result = _window_scene().trace(num_rays=200, seed=1, backend=backend, max_depth=8)
-        assert "polarization" not in result.environment
+        assert result.environment["polarization"] == "off"
 
     @pytest.mark.parametrize("kind", ["numpy", "torch"])
     def test_on_is_recorded(self, kind):
