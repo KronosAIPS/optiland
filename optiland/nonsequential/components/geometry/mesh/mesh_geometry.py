@@ -70,11 +70,28 @@ class MeshGeometry(AnalyticGeometry):
         d_np = _to_numpy(directions)
         N = o_np.shape[0]
 
-        # trimesh ray casting
+        # trimesh ray casting (KronosNSRT issue 29). trimesh keeps only the hits
+        # ahead of the origin it is given (down to 1e-6 behind it), and the
+        # threshold this kind is handed may lie behind the origin: the
+        # component advances the origin along the ray to its closest approach
+        # to the local origin and passes the threshold shifted by that advance,
+        # so a face the advance stepped past (a box's entry face) was dropped by
+        # trimesh before the threshold was ever applied. The query therefore
+        # starts behind every point of the mesh along the ray (the bounding
+        # box's half-diagonal beyond the projection of its centre), and the
+        # hits are measured from the true origin below. Every hit, not only the
+        # first: asked for one hit per ray, trimesh returns the nearest, which
+        # for a ray leaving a face is that face itself; the threshold refused
+        # it and the genuine hit beyond it was never returned. The loop below
+        # keeps the nearest hit beyond the threshold.
+        verts = np.asarray(self.mesh.vertices, dtype=np.float64)
+        centre = 0.5 * (verts.min(axis=0) + verts.max(axis=0))
+        half_diag = 0.5 * float(np.linalg.norm(verts.max(axis=0) - verts.min(axis=0)))
+        back = np.maximum(((o_np - centre) * d_np).sum(axis=1) + half_diag, 0.0) if N else np.zeros(0)
         locations, ray_indices, triangle_indices = self.mesh.ray.intersects_location(
-            ray_origins=o_np,
+            ray_origins=o_np - back[:, None] * d_np,
             ray_directions=d_np,
-            multiple_hits=False,
+            multiple_hits=True,
         )
 
         t_out = np.full(N, np.inf, dtype=np.float64)
@@ -84,12 +101,16 @@ class MeshGeometry(AnalyticGeometry):
         # Self-intersection accept threshold, dtype-aware -- this class is
         # numpy float64 only (trimesh requirement), so the coordinate
         # magnitude below is always evaluated at float64 resolution. A
-        # caller-supplied eps may be a backend array/tensor (from a torch
-        # scene); coerce to a plain float since this loop is host Python.
+        # caller-supplied eps may be a scalar or one value per ray (the loop
+        # passes ``(N,)``), and may be a backend array/tensor (from a torch
+        # scene); it is brought to host float64, one value per ray, since this
+        # loop is host Python (a per-ray eps raised here before, issue 29).
         if eps is None:
             origin_scale = np.abs(o_np).max() if N else 1.0
             eps = _tol.accept_t_min(origin_scale)
-        t_min = float(eps)
+        if hasattr(eps, "detach"):
+            eps = eps.detach().cpu().numpy()
+        t_min = np.broadcast_to(np.asarray(_to_numpy(eps), dtype=np.float64), (N,))
 
         if len(ray_indices) > 0:
             # Compute t for each hit
@@ -100,7 +121,7 @@ class MeshGeometry(AnalyticGeometry):
             order = np.argsort(ray_indices)
             for idx, ri in enumerate(ray_indices[order]):
                 tv = t_vals[order[idx]]
-                if tv > t_min and tv < t_out[ri]:
+                if tv > t_min[ri] and tv < t_out[ri]:
                     t_out[ri] = tv
                     tri_idx = triangle_indices[order[idx]]
                     face_normal = self.mesh.face_normals[tri_idx]
