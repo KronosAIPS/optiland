@@ -70,9 +70,7 @@ def _scotopic_table_1nm() -> tuple[np.ndarray, np.ndarray]:
 
     The research repository's issue 89: the 10 nm table below has nodes 500
     and 510 nm (0.982, 0.997) around the peak, so linear interpolation gives
-    V'(507 nm) = 0.9925. This loader is the 1 nm table; switching
-    :func:`_table` to it changes the expectation of one existing test (the
-    scotopic grid's 41 nodes), which waits for the maintainer's ruling.
+    V'(507 nm) = 0.9925. The conversions read this table since 2026-10-02.
     """
     import json  # noqa: PLC0415
     from pathlib import Path  # noqa: PLC0415
@@ -86,62 +84,17 @@ def _scotopic_table_1nm() -> tuple[np.ndarray, np.ndarray]:
 
 
 # CIE photopic V(lambda) at 1 nm (see :func:`_photopic_table`), and CIE 1951
-# scotopic V'(lambda) tabulated at 10 nm from 380-780 nm (standard reference
-# values). optiland.nonsequential uses micrometres everywhere else, so
+# scotopic V'(lambda) at 1 nm (see :func:`_scotopic_table_1nm`; until
+# 2026-10-02 a 10 nm table that put V'(507 nm) at 0.9925). optiland.nonsequential uses micrometres everywhere else, so
 # wavelengths are stored in um to match.
 _PHOTOPIC_WAVELENGTHS_UM, _PHOTOPIC_V = _photopic_table()
 
-_SCOTOPIC_WAVELENGTHS_UM = np.arange(0.380, 0.781, 0.010)
-_SCOTOPIC_V = np.array(
-    [
-        0.000589,
-        0.002209,
-        0.00929,
-        0.03484,
-        0.0966,
-        0.1998,
-        0.3281,
-        0.4550,
-        0.5670,
-        0.6760,
-        0.7930,
-        0.9040,
-        0.9820,
-        0.9970,
-        0.9350,
-        0.8110,
-        0.6500,
-        0.4810,
-        0.3288,
-        0.2076,
-        0.1212,
-        0.0655,
-        0.03315,
-        0.01593,
-        0.00737,
-        0.003335,
-        0.001497,
-        0.000677,
-        0.000313,
-        0.000148,
-        0.0000715,
-        0.0000353,
-        0.0000178,
-        0.00000914,
-        0.00000478,
-        0.00000255,
-        0.00000139,
-        0.000000760,
-        0.000000425,
-        0.000000241,
-        0.000000139,
-    ]
-)
+_SCOTOPIC_WAVELENGTHS_UM, _SCOTOPIC_V = _scotopic_table_1nm()
 
 # Luminous efficacy at the peak of each weighting function (CIE-defined for
 # photopic; the commonly-cited value for scotopic).
 KM_PHOTOPIC = 683.002  # lm/W at 555 nm
-KM_SCOTOPIC = 1700.0  # lm/W at 507 nm
+KM_SCOTOPIC = 1700.06  # lm/W at 507 nm (CIE 018:2019; 683 / V'(555.016 nm))
 
 # Visible band the tables above cover. A wavelength (or an entire spectrum)
 # outside this range has V(lambda) == 0 everywhere it's defined and 0

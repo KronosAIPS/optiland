@@ -57,7 +57,10 @@ def test_the_two_photometric_routes_agree_between_the_nodes():
     assert np.max(np.abs(a - b)) <= 70.0 * U64
 
 
-def test_the_scotopic_table_keeps_its_own_grid():
+def test_the_scotopic_table_is_the_cie_1nm_table():
+    # was test_the_scotopic_table_keeps_its_own_grid (41 nodes at 10 nm); the
+    # research repository's issue 89 replaced the grid, under the maintainer's ruling
     grid, v, km = _table("scotopic")
-    assert grid.size == v.size == 41
+    assert grid.size == v.size == 401
     assert v_lambda(0.500, weighting="scotopic") == pytest.approx(0.982, abs=1e-15)
+    assert v_lambda(0.507, weighting="scotopic") == 1.0
