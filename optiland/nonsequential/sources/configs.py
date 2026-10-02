@@ -54,11 +54,12 @@ class CollimatedSourceConfig:
         gaussian_sigma: Gaussian sigma [mm]. Defaults to aperture_radius / 2.
         medium: Medium the source is embedded in (default: vacuum).
         profile_gradient: How a Gaussian beam's sigma and truncation radius
-            take a gradient: ``"refuse"`` (the default) raises on a
-            gradient-carrying value; ``"implicit"`` attaches the emission
-            points by the implicit reparameterisation of the truncated
-            profile (the research repository's chapter 09 section 9.13.1).
-            A top-hat beam's radius is attached either way.
+            take a gradient: ``"implicit"`` (the default since the
+            maintainer's ruling of 2026-10-01) attaches the emission points
+            by the implicit reparameterisation of the truncated profile (the
+            research repository's chapter 09 section 9.13.1); ``"refuse"``
+            raises on a gradient-carrying value. A top-hat beam's radius is
+            attached either way.
     """
 
     spectrum: Spectrum
@@ -68,7 +69,7 @@ class CollimatedSourceConfig:
     profile: str = "tophat"
     gaussian_sigma: float | None = None
     medium: NSQMaterial | None = field(default=None)
-    profile_gradient: str = "refuse"
+    profile_gradient: str = "implicit"
 
 
 @dataclass

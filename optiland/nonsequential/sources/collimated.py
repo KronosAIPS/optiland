@@ -61,7 +61,7 @@ class CollimatedSource(BaseNSQSource):
         profile: Literal["tophat", "gaussian"] = "tophat",
         gaussian_sigma: float | None = None,
         medium=None,
-        profile_gradient: Literal["refuse", "implicit"] = "refuse",
+        profile_gradient: Literal["refuse", "implicit"] = "implicit",
     ) -> None:
         """Initialize CollimatedSource.
 
@@ -74,13 +74,17 @@ class CollimatedSource(BaseNSQSource):
             gaussian_sigma: Gaussian standard deviation [mm].
                 Defaults to aperture_radius / 2 if None.
             medium: Medium the source is embedded in (default: vacuum).
-            profile_gradient: ``"refuse"`` (the default): a Gaussian beam's
-                sigma and radius raise when they carry a gradient.
-                ``"implicit"``: they are attached by the implicit
-                reparameterisation of the truncated profile
+            profile_gradient: ``"implicit"`` (the default since the
+                maintainer's ruling of 2026-10-01): a Gaussian beam's sigma
+                and radius are attached by the implicit reparameterisation
+                of the truncated profile
                 (:func:`~optiland.nonsequential.parameter_register
                 .truncated_gaussian_tangents`; the research repository's
-                chapter 09 section 9.13.1). A top-hat beam ignores it.
+                chapter 09 section 9.13.1). ``"refuse"``: they raise when
+                they carry a gradient. A top-hat beam's radius is attached
+                either way; a sigma given to a top-hat beam reaches nothing,
+                so with ``"implicit"`` the trace raises it as a dead
+                parameter, and with ``"refuse"`` the constructor refuses it.
         """
         super().__init__(cs, spectrum, total_flux)
         if profile_gradient not in ("refuse", "implicit"):
@@ -89,17 +93,18 @@ class CollimatedSource(BaseNSQSource):
                 f"got {profile_gradient!r}."
             )
         self.profile_gradient = profile_gradient
-        implicit = profile == "gaussian" and profile_gradient == "implicit"
+        implicit = profile_gradient == "implicit"
+        gaussian_refused = profile == "gaussian" and not implicit
         # The aperture radius of a top-hat beam may carry a derivative: the
         # trace attaches the emission points to it by the change of variables
         # (chapter 09 section 9.7, R-09-4). A truncated Gaussian's radius is
         # its truncation edge. Held at a fixed value of the radial
         # distribution function, the edge does not move, and the implicit
         # reparameterisation of chapter 09 section 9.13.1 carries the
-        # derivative in the radius and in sigma; that is taken when the beam
-        # is built with profile_gradient="implicit". By default both refuse a
-        # gradient, as they always have.
-        if profile == "gaussian" and not implicit:
+        # derivative in the radius and in sigma. That is the default
+        # (profile_gradient="implicit", the maintainer's ruling of 2026-10-01);
+        # a beam built with profile_gradient="refuse" refuses both.
+        if gaussian_refused:
             self.aperture_radius = as_detached_param(
                 aperture_radius,
                 "aperture_radius",
@@ -116,7 +121,9 @@ class CollimatedSource(BaseNSQSource):
         self.profile = profile
         # With the implicit reparameterisation a sigma that is not given
         # follows the radius (sigma = R / 2): its value is the float, and the
-        # trace adds the radius' tangent to it (d sigma = d R / 2).
+        # trace adds the radius' tangent to it (d sigma = d R / 2). A sigma
+        # given to a top-hat beam is kept as given and enters nothing; the
+        # trace's dead-parameter check raises on it (R-09-5).
         self._sigma_follows_radius = gaussian_sigma is None
         if gaussian_sigma is None:
             self.gaussian_sigma = host_float(self.aperture_radius) / 2.0

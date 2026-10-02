@@ -63,7 +63,6 @@ from optiland.nonsequential import (
 )
 from optiland.nonsequential.ir.scene_ir import SamplingPolicy
 from optiland.nonsequential.parameter_register import (
-    DETACHED,
     INTERIOR_BOUNDARY,
     DeadParameterError,
     ParameterRefused,
@@ -277,27 +276,76 @@ class TestRegisterAndRaise:
         result = _trace(scene)
         assert result.environment["gradient_boundary_term"] == "absent"
 
-    def test_truncated_gaussian_radius_is_refused(self):
-        """The truncation edge of a Gaussian beam moves samples across it: not attached."""
+    def test_truncated_gaussian_radius_is_attached(self):
+        """A Gaussian beam's truncation radius is attached by default (chapter 09 section 9.13.1).
+
+        Changed under the maintainer's ruling of 2026-10-01 on slide 63,
+        question 2 (with question 5 of the rulings R4 of the same day): the
+        implicit reparameterisation of the truncated profile is the default,
+        so this test, which asserted the refusal, now asserts what the chapter
+        requires: the tensor is kept as given, registered as interior with
+        boundary at the source's change of variables, and the trace carries a
+        finite, non-zero derivative to it. A beam built with
+        ``profile_gradient="refuse"`` still refuses it.
+        """
+        radius = _g(3.0)
         config = CollimatedSourceConfig(
-            spectrum=_SPECTRUM, total_flux=1.0, aperture_radius=_g(3.0), profile="gaussian"
+            spectrum=_SPECTRUM, total_flux=1.0, aperture_radius=radius, profile="gaussian"
+        )
+        scene = _through_the_singlet(config)
+        entry = ParameterRegister.from_scene(scene).find("S1", "aperture_radius")
+        assert entry.tensor is radius
+        assert entry.gradient_class == INTERIOR_BOUNDARY
+        assert "change of variables" in entry.stage
+        (grad,) = torch.autograd.grad(_centroid(_trace(scene).detectors["D1"].data, 40.0), radius)
+        assert torch.isfinite(grad) and grad.item() != 0.0
+        refused = CollimatedSourceConfig(
+            spectrum=_SPECTRUM,
+            total_flux=1.0,
+            aperture_radius=_g(3.0),
+            profile="gaussian",
+            profile_gradient="refuse",
         )
         with pytest.raises(NotImplementedError, match="truncates the Gaussian"):
-            _through_the_singlet(config)
+            _through_the_singlet(refused)
 
-    def test_gaussian_sigma_stays_detached(self):
+    def test_gaussian_sigma_is_attached(self):
+        """A Gaussian beam's sigma is attached by default; given to a top-hat beam it is dead.
+
+        Changed under the maintainer's ruling of 2026-10-01 on slide 63,
+        question 2 (with question 5 of the rulings R4 of the same day): this
+        test asserted that sigma stays detached; it now asserts the chapter's
+        contract for the default implicit reparameterisation (chapter 09
+        section 9.13.1): the tensor kept, the register's fallback row and the
+        kind's rule both interior with boundary, a finite non-zero derivative,
+        and, on a top-hat beam, which never reads sigma, the dead-parameter
+        raise of R-09-5 rather than a returned zero.
+        """
+        sigma = _g(1.0)
         config = CollimatedSourceConfig(
             spectrum=_SPECTRUM,
             total_flux=1.0,
             aperture_radius=3.0,
             profile="gaussian",
-            gaussian_sigma=_g(1.0),
+            gaussian_sigma=sigma,
         )
-        with pytest.raises(NotImplementedError):
-            _through_the_singlet(config)
+        scene = _through_the_singlet(config)
+        entry = ParameterRegister.from_scene(scene).find("S1", "gaussian_sigma")
+        assert entry.tensor is sigma
+        assert entry.gradient_class == INTERIOR_BOUNDARY
+        assert "change of variables" in entry.stage
+        (grad,) = torch.autograd.grad(_centroid(_trace(scene).detectors["D1"].data, 40.0), sigma)
+        assert torch.isfinite(grad) and grad.item() != 0.0
         from optiland.nonsequential.parameter_register import _SOURCE_CONTRACT
 
-        assert _SOURCE_CONTRACT["gaussian_sigma"][0] == DETACHED
+        assert _SOURCE_CONTRACT["gaussian_sigma"][0] == INTERIOR_BOUNDARY
+        tophat = CollimatedSourceConfig(
+            spectrum=_SPECTRUM, total_flux=1.0, aperture_radius=3.0, gaussian_sigma=_g(1.0)
+        )
+        with pytest.raises(DeadParameterError) as info:
+            _trace(_through_the_singlet(tophat))
+        ((owner, name, _stage, _reason),) = info.value.dead
+        assert (owner, name) == ("S1", "gaussian_sigma")
 
     def test_width_of_a_disc_source_is_dead(self):
         """An extended source with a radius ignores its width: the width reaches nothing."""
