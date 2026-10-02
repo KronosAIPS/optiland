@@ -50,7 +50,13 @@ The intersection
    memory already, each pass runs on the lanes still active only (and the
    loop ends when none is): a frozen lane's pass changes none of its values,
    so the results are the fixed-width ones bit for bit, at the cost of the
-   active lanes.
+   active lanes. On the torch backend the fixed-count passes can run as one
+   compiled step (opt-in, off by default: :attr:`compile_refine` or
+   ``OPTILAND_NSQ_COMPILE_REFINE``; :func:`compiled_refinement`): the same
+   function traced by ``torch.compile`` as one graph, its passes fused into
+   generated kernels. On the CPU every output is the eager loop's bit for bit
+   (tested at both precisions); on CUDA the inductor is told to round as the
+   eager kernels do (:data:`EAGER_NUMERICS_CUDA`).
 3. **The residual at a base-conic seed is the polynomial alone.** The seed
    solves the base conic exactly in exact arithmetic, so the first residual is
    taken as ``-P(r)``; the conic part's rounding residual is not re-evaluated
@@ -183,6 +189,96 @@ _COMPACT_ON_HOST = True
 #: over this count can escape the scan and are then left to the conic seeds.
 DEFAULT_SCAN_SAMPLES = 32
 
+#: The environment variable that runs the torch backend's fixed-count
+#: refinement as one compiled step (:func:`compiled_refinement`), the sibling
+#: of the torch backend's ``OPTILAND_NSQ_COMPILE_STEP`` with the same grammar:
+#: ``1``, ``true``, ``yes`` or ``on`` on every device; a device type (``cuda``,
+#: ``cpu``, ``mps``) on that device only; anything else, or unset, off (the
+#: default: every pass runs eagerly, operation by operation).
+COMPILE_REFINE_ENV = "OPTILAND_NSQ_COMPILE_REFINE"
+
+#: Recompilations the compiled refinement may make before torch falls back to
+#: running it uncompiled: one per (surface, lane width, dtype, device) met;
+#: torch's default of 8 would be exhausted by one trace's compaction ladder.
+COMPILE_REFINE_RECOMPILE_LIMIT = 256
+
+#: Inductor options of the compiled refinement on a CUDA device, chosen so the
+#: generated kernels round as the eager kernels do: no contraction of a
+#: product and a sum into one fused multiply-add (``emulate_precision_casts``
+#: turns Triton's ``enable_fp_fusion`` off; torch's eager kernels run each
+#: operation as its own rounding), and a correctly rounded float32 division
+#: (Triton's ``x / y`` is the approximate ``div.full``; eager is ``div.rn``).
+#: The square root is ``sqrt_rn`` in the inductor's Triton code already. On
+#: the CPU the inductor's C++ is compiled with ``-ffp-contract=off`` and
+#: without unsafe math by default, so nothing is set there.
+EAGER_NUMERICS_CUDA = {
+    "emulate_precision_casts": True,
+    "eager_numerics.division_rounding": True,
+}
+
+_COMPILED_REFINES: dict = {}
+_DEVICE_TYPES = ("cuda", "cpu", "mps")
+
+
+def compile_refine_requested(device) -> bool:
+    """Whether :data:`COMPILE_REFINE_ENV` asks for the compiled refinement on
+    ``device`` (a ``torch.device`` or its string)."""
+    import os  # noqa: PLC0415
+
+    value = os.environ.get(COMPILE_REFINE_ENV, "").strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in _DEVICE_TYPES:
+        return str(device).split(":")[0] == value
+    return False
+
+
+def refinement_passes(geometry, lane: dict, st: dict, rmin) -> dict:
+    """Every pass of the fixed-count refinement, in order: the body that
+    :func:`compiled_refinement` compiles. It is the eager loop of
+    :meth:`_AsphereGeometry._refine` itself (the same calls of
+    :meth:`_AsphereGeometry._refine_pass`), so the compiled step and the
+    eager loop state the same operations in the same order."""
+    for it in range(geometry.max_iterations + 1):
+        st = geometry._refine_pass(it, lane, st, rmin)
+    return st
+
+
+def compiled_refinement(options: dict | None = None):
+    """``torch.compile`` of :func:`refinement_passes`, built once per option set.
+
+    The pattern of the torch backend's compiled bounce step: the inductor,
+    static shapes (``dynamic=False``; one program per lane width, surface and
+    dtype, compiled at its first call and reused), no host read inside (the
+    pass count is the fixed ``max_iterations + 1``, so a CUDA graph can record
+    the call). ``options`` are the inductor's (``torch.compile(options=...)``)
+    plus the optional key ``"backend"`` naming the ``torch.compile`` backend
+    (``"eager"`` traces without generating kernels).
+    """
+    import torch  # noqa: PLC0415
+
+    options = dict(options or {})
+    compile_backend = options.pop("backend", "inductor")
+    key = (compile_backend, tuple(sorted(options.items())))
+    step = _COMPILED_REFINES.get(key)
+    if step is None:
+        step = torch.compile(
+            refinement_passes,
+            backend=compile_backend,
+            dynamic=False,
+            options=(options or None) if compile_backend == "inductor" else None,
+        )
+        _COMPILED_REFINES[key] = step
+    return step
+
+
+def _refinement_options(device, options: dict | None) -> dict:
+    """The compile options for ``device``: the caller's, else the eager
+    numerics on CUDA (:data:`EAGER_NUMERICS_CUDA`) and none elsewhere."""
+    if options is not None:
+        return dict(options)
+    return dict(EAGER_NUMERICS_CUDA) if str(device).startswith("cuda") else {}
+
 
 def _no_grad():
     """``torch.no_grad()`` on the torch backend, a null context otherwise."""
@@ -237,6 +333,17 @@ class _AsphereGeometry(AnalyticGeometry):
     """
 
     _odd = False
+
+    #: Run the torch backend's fixed-count refinement as one compiled step
+    #: (:func:`compiled_refinement`): True, False, a device type, or ``None``
+    #: (the default) to follow :data:`COMPILE_REFINE_ENV`, which is off when
+    #: unset. A setting of the run, not of the surface: it is not serialized
+    #: and changes no number on the CPU (tested bit for bit).
+    compile_refine: bool | str | None = None
+
+    #: Inductor options for the compiled refinement, or ``None`` for the
+    #: default (:data:`EAGER_NUMERICS_CUDA` on CUDA, none elsewhere).
+    compile_refine_options: dict | None = None
 
     def __init__(
         self,
@@ -496,6 +603,9 @@ class _AsphereGeometry(AnalyticGeometry):
             "tol_last": ones,
         }
         rmin = _tol.radicand_min(t0)
+        if self._compiles_refine(t0):
+            st = self._compiled_passes(lane, st, rmin, t0)
+            return st["t"], st["status"], st["steps"], st["fp_last"], st["gn_last"], st["tol_last"]
         # NumPy: host arrays, so each pass runs on the active lanes alone (a
         # frozen lane's pass is the identity on every value it carries).
         compact = _COMPACT_ON_HOST and be.get_backend() == "numpy"
@@ -522,6 +632,48 @@ class _AsphereGeometry(AnalyticGeometry):
                     continue
             st = self._refine_pass(it, lane, st, rmin)
         return st["t"], st["status"], st["steps"], st["fp_last"], st["gn_last"], st["tol_last"]
+
+    def _compiles_refine(self, like) -> bool:
+        """Whether this call runs the compiled refinement: the torch backend,
+        not already inside a compiled region (the compiled bounce step inlines
+        the eager loop), and asked for by :attr:`compile_refine` or, when that
+        is ``None``, by :data:`COMPILE_REFINE_ENV` on ``like``'s device."""
+        if not is_tensor(like):
+            return False
+        import torch  # noqa: PLC0415
+
+        if torch.compiler.is_compiling():
+            return False
+        want = self.compile_refine
+        if want is None:
+            return compile_refine_requested(like.device)
+        if isinstance(want, str):
+            return str(like.device).split(":")[0] == want.strip().lower()
+        return bool(want)
+
+    def _compiled_passes(self, lane: dict, st: dict, rmin, like) -> dict:
+        """The fixed-count passes as one compiled step (:func:`compiled_refinement`).
+
+        The status constants the passes read are made here first, so the
+        compiled program finds them in :func:`resident_scalar`'s cache and
+        builds nothing. The program is the eager loop's own function, so the
+        operations and their order are the eager loop's.
+        """
+        import torch  # noqa: PLC0415
+
+        for code in MISS_REASONS:
+            self._code(code, like)
+        step = compiled_refinement(
+            _refinement_options(like.device, self.compile_refine_options)
+        )
+        with (
+            torch._dynamo.config.patch(
+                recompile_limit=COMPILE_REFINE_RECOMPILE_LIMIT,
+                accumulated_recompile_limit=16 * COMPILE_REFINE_RECOMPILE_LIMIT,
+            ),
+            torch.no_grad(),
+        ):
+            return step(self, lane, st, rmin)
 
     def _refine_pass(self, it: int, lane: dict, st: dict, rmin) -> dict:
         """One evaluation of :meth:`_refine` and, before the last, one step.

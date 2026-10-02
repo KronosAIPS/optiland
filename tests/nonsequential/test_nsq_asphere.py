@@ -19,6 +19,9 @@ What each class pins, and the route it uses:
   ``docs/theory/07_geometry.md`` in the research repository.
 - ``TestCompactedPasses``: the NumPy backend's refinement on the active lanes
   only returns the fixed-width passes' bits.
+- ``TestCompiledRefinement``: the torch refinement as one compiled step
+  (opt-in, off by default) returns the eager passes' bits on the CPU, in a
+  call, in a traced scene and through the adjoint, at both precisions.
 - ``TestMissReasons``: every miss reason is reachable and recorded, and a
   miss never reports a distance.
 - ``TestFirstCrossing``: on a strongly aspheric surface (an even and an odd
@@ -399,6 +402,187 @@ class TestCompactedPasses:
         for a, b in zip(list(compact[0]) + compact[1:], list(full[0]) + full[1:]):
             a, b = np.asarray(a), np.asarray(b)
             assert a.dtype == b.dtype and a.tobytes() == b.tobytes()
+
+
+def _inductor_available() -> bool:
+    """Whether torch.compile's inductor builds a CPU kernel on this host (it
+    needs a C++ compiler); probed once."""
+    if not hasattr(_inductor_available, "ok"):
+        try:
+            f = torch.compile(lambda x: x * 2.0 + 1.0, backend="inductor", dynamic=False)
+            _inductor_available.ok = bool(
+                f(torch.ones(4, dtype=torch.float64)).eq(3.0).all()
+            )
+        except Exception:  # noqa: BLE001 - no compiler, no generated kernel
+            _inductor_available.ok = False
+    return _inductor_available.ok
+
+
+def _all_outputs(g, o, d):
+    """Every output of a call as bytes: t, normals, hit mask, the geometric
+    normal, the status and the step count."""
+    out = list(g.ray_intersect(o, d)) + [g.last_status, g.last_steps]
+    return [(str(x.dtype), _np(x).tobytes()) for x in out]
+
+
+class TestCompiledRefinement:
+    """The fixed-count refinement as one compiled step (``compile_refine``,
+    ``OPTILAND_NSQ_COMPILE_REFINE``): off by default; on, the inductor's CPU
+    kernels give the eager passes' bits on every output, both kinds, both
+    precisions, in a call, in a traced scene and through the adjoint."""
+
+    COEFFS = {
+        EvenAsphereGeometry: [1e-3, -2e-5, 1e-7],
+        OddAsphereGeometry: [2e-3, 1e-4, -1e-6],
+    }
+
+    @pytest.fixture(autouse=True)
+    def _no_env(self, monkeypatch):
+        monkeypatch.delenv(A.COMPILE_REFINE_ENV, raising=False)
+
+    def test_off_by_default(self):
+        _set("torch", "float64")
+        g = EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS)
+        assert g.compile_refine is None
+        assert not g._compiles_refine(torch.zeros(3, dtype=torch.float64))
+
+    @pytest.mark.parametrize(
+        "value, cpu, cuda",
+        [("1", True, True), ("on", True, True), ("cuda", False, True),
+         ("cpu", True, False), ("0", False, False), ("", False, False)],
+    )
+    def test_environment_switch(self, value, cpu, cuda, monkeypatch):
+        monkeypatch.setenv(A.COMPILE_REFINE_ENV, value)
+        assert A.compile_refine_requested("cpu") is cpu
+        assert A.compile_refine_requested("cuda:0") is cuda
+
+    def test_attribute_overrides_environment(self, monkeypatch):
+        monkeypatch.setenv(A.COMPILE_REFINE_ENV, "1")
+        g = EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS)
+        like = torch.zeros(3, dtype=torch.float64)
+        assert g._compiles_refine(like)
+        g.compile_refine = False
+        assert not g._compiles_refine(like)
+        g.compile_refine = "cuda"
+        assert not g._compiles_refine(like)
+
+    def test_numpy_backend_never_compiles(self, monkeypatch):
+        monkeypatch.setenv(A.COMPILE_REFINE_ENV, "1")
+        g = EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS)
+        assert not g._compiles_refine(np.zeros(3))
+
+    def test_one_graph_no_break(self, monkeypatch):
+        """Dynamo captures every pass as one graph: no host read, no break."""
+        _set("torch", "float64")
+        be.set_device("cpu")
+        o, d = _fan(500, 14.0)
+        g = EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS)
+        seen = {}
+
+        def capture(self_, lane, st, rmin, like):
+            for code in A.MISS_REASONS:
+                self_._code(code, like)
+            seen.update(lane=lane, st=st, rmin=rmin)
+            return A.refinement_passes(self_, lane, st, rmin)
+
+        monkeypatch.setattr(A._AsphereGeometry, "_compiled_passes", capture)
+        g.compile_refine = True
+        g.ray_intersect(be.array(o), be.array(d))
+        explained = torch._dynamo.explain(A.refinement_passes)(
+            g, seen["lane"], seen["st"], seen["rmin"]
+        )
+        assert explained.graph_count == 1
+        assert explained.graph_break_count == 0
+
+    def test_eager_numerics_on_cuda_only(self):
+        assert A._refinement_options("cuda:0", None) == A.EAGER_NUMERICS_CUDA
+        assert A._refinement_options("cpu", None) == {}
+        assert A._refinement_options("cuda", {"backend": "eager"}) == {"backend": "eager"}
+
+    @pytest.mark.parametrize("precision", ["float64", "float32"])
+    @pytest.mark.parametrize(
+        "cls, surface",
+        [
+            (EvenAsphereGeometry, "prolate"),
+            (EvenAsphereGeometry, "hyperboloid_concave"),
+            (EvenAsphereGeometry, "flat_base"),
+            (EvenAsphereGeometry, "oblate"),
+            (OddAsphereGeometry, "prolate"),
+            (OddAsphereGeometry, "flat_base"),
+        ],
+    )
+    def test_inductor_bits_equal_eager(self, cls, surface, precision):
+        if not _inductor_available():
+            pytest.skip("the inductor cannot build a CPU kernel on this host")
+        _set("torch", precision)
+        be.set_device("cpu")
+        o, d = _fan(3000, 14.0)
+        o, d = be.array(o), be.array(d)
+        g = cls(*SURFACES[surface], coefficients=self.COEFFS[cls])
+        g.compile_refine = False
+        eager = _all_outputs(g, o, d)
+        g.compile_refine = True
+        compiled = _all_outputs(g, o, d)
+        assert compiled == eager
+
+    @pytest.mark.parametrize("precision", ["float64", "float32"])
+    def test_inductor_chapter_surface_aimed(self, precision):
+        """The theory chapter's surface on the T-07-5 fan of aimed rays."""
+        if not _inductor_available():
+            pytest.skip("the inductor cannot build a CPU kernel on this host")
+        _set("torch", precision)
+        be.set_device("cpu")
+        o, d = _fan(2000, 12.0, z0=-8.0, seed=7)
+        o, d = be.array(o), be.array(d)
+        g = EvenAsphereGeometry(**THEORY, coefficients=THEORY_COEFFS)
+        g.compile_refine = False
+        eager = _all_outputs(g, o, d)
+        g.compile_refine = True
+        assert _all_outputs(g, o, d) == eager
+
+    @pytest.mark.parametrize("precision", ["float64", "float32"])
+    def test_traced_scene_bits_equal(self, precision, monkeypatch):
+        """The paraboloid mirror of ``TestTraced`` with the switch set through
+        the environment: every pixel and the flux ledger to the bit."""
+        if not _inductor_available():
+            pytest.skip("the inductor cannot build a CPU kernel on this host")
+        _set("torch", precision)
+        be.set_device("cpu")
+        det = IrradianceDetectorConfig(
+            width=4.0, height=4.0, num_pixels_x=16, num_pixels_y=16, splat="bilinear",
+            absorb=False,
+        )
+
+        def ledger():
+            res = TestTraced()._scene(det).trace(num_rays=6000, seed=11, max_depth=8)
+            return (
+                _np(res.detectors["D"].irradiance).tobytes(),
+                float(res.flux_conservation_error),
+            )
+
+        eager = ledger()
+        monkeypatch.setenv(A.COMPILE_REFINE_ENV, "cpu")
+        assert ledger() == eager
+
+    def test_adjoint_bits_equal(self):
+        """The refinement runs without a gradient; the attached step after it
+        sees the same root, so the gradient is the eager one to the bit."""
+        if not _inductor_available():
+            pytest.skip("the inductor cannot build a CPU kernel on this host")
+        _set("torch", "float64")
+        be.set_device("cpu")
+        o, d = _fan(400, 8.0, z0=-8.0, seed=5)
+
+        def grads(compile_refine):
+            c = torch.tensor(THEORY_COEFFS, dtype=torch.float64, requires_grad=True)
+            g = EvenAsphereGeometry(**THEORY, coefficients=c)
+            g.compile_refine = compile_refine
+            t, _, hit, n = g.ray_intersect(be.array(o), be.array(d))
+            loss = (torch.where(hit, t, torch.zeros_like(t)) + n[:, 0]).sum()
+            (grad,) = torch.autograd.grad(loss, c)
+            return _np(t).tobytes(), _np(grad).tobytes()
+
+        assert grads(True) == grads(False)
 
 
 class TestMissReasons:
