@@ -7,7 +7,6 @@ Kramer Harrison, 2026
 
 from __future__ import annotations
 
-from optiland.nonsequential._utils import refuse_gradients
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -17,7 +16,11 @@ import optiland.backend as be
 from optiland.nonsequential._utils import clamp_int
 from optiland.nonsequential.bsdf.base import BaseBSDF
 from optiland.nonsequential.components.base import resident_table
-from optiland.nonsequential.components.sampling_support import detached
+from optiland.nonsequential.components.sampling_support import (
+    attachable_fraction,
+    detached,
+    lobe_branch_gate,
+)
 from optiland.nonsequential.ray_bundle import backend_bool_full
 from optiland.nonsequential.rng import EventSlot
 
@@ -63,15 +66,14 @@ class TabulatedBSDF(BaseBSDF):
             path: Path to CSV file with columns [theta_i, theta_s, bsdf].
             transmissive_fraction: Probability in [0, 1] that a scatter
                 event lands in the transmissive hemisphere rather than the
-                reflective one.
+                reflective one. A tensor that carries a derivative is kept
+                (the research repository's chapter 09 section 9.14.3) and
+                must lie strictly between 0 and 1.
         """
-        refuse_gradients(
-            "TabulatedBSDF",
-            "the reflect-or-transmit split is read as a number on the host",
-            transmissive_fraction=transmissive_fraction,
+        self.transmissive_fraction, self._tau = attachable_fraction(
+            "TabulatedBSDF", "transmissive_fraction", transmissive_fraction
         )
         self.path = Path(path)
-        self.transmissive_fraction = float(transmissive_fraction)
         self._load(self.path)
 
     def _load(self, path: Path) -> None:
@@ -188,9 +190,9 @@ class TabulatedBSDF(BaseBSDF):
         n_be = detached(normals)
         d_be = detached(incident_dirs)
 
-        if self.transmissive_fraction > 0.0:
+        if self._tau > 0.0:
             u_lobe = rng.uniform(ray_id, bounce, EventSlot.BSDF_LOBE_BRANCH)
-            transmitted = u_lobe < self.transmissive_fraction
+            transmitted = u_lobe < self._tau
             hemisphere = be.where(transmitted[:, None], -n_be, n_be)
         else:
             transmitted = backend_bool_full((n_be.shape[0],), False, like=n_be)
@@ -223,6 +225,13 @@ class TabulatedBSDF(BaseBSDF):
         scattered = scattered / norms
 
         flux_weights = be.clip(be.pi * self._evaluate(theta_i, theta_s), 0.0, 1.0)
+        # The branch's share, attached when the fraction carries a gradient
+        # (exactly 1 in value, so the weight keeps its bits).
+        gate = lobe_branch_gate(
+            self.transmissive_fraction, self._tau, transmitted, flux_weights
+        )
+        if gate is not None:
+            flux_weights = flux_weights * gate
 
         return scattered, flux_weights, transmitted
 
