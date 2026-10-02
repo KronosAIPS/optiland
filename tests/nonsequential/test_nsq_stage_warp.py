@@ -590,3 +590,34 @@ def test_the_kernels_pass_the_capture_safety_check(torch_backend_state, monkeypa
     assert fused.environment["intersect_kernel"] == "warp"
     assert fused.environment["graph_replay"] == "emulate"
     _assert_same_trace(reference, fused)
+
+
+# ---------------------------------------------------------------------------
+# Loading (research repository issue 85)
+# ---------------------------------------------------------------------------
+
+
+def test_each_kernel_is_a_module_of_its_own_with_the_stage_options():
+    """One Warp module per kernel and float type, no contraction, a backward pass only where the tape is used."""
+    stage = _stage()
+    modules = stage.kernel_modules()
+    names = [m.name for m in modules]
+    assert len(names) == len(set(names)) == 2 * (len(stage.KINDS) + 3)
+    for dtype in (torch.float64, torch.float32):
+        for name, kernel in stage._KERNELS[dtype].items():
+            options = kernel.module.options
+            assert options["fuse_fp"] is False
+            assert options["enable_backward"] is (name in stage.TAPE_KINDS)
+            assert len(kernel.module.kernels) == 1
+
+
+def test_a_scene_loads_only_the_kernels_it_uses(torch_backend_state, monkeypatch):
+    """The first bounce loads the kinds of the scene in hand, at the trace's precision, and nothing else."""
+    stage = _stage()
+    monkeypatch.setattr(stage, "SUPPORTED_DEVICE_TYPES", ("cuda", "cpu"))
+    monkeypatch.setattr(stage, "_LOADED", set())
+    monkeypatch.setattr(stage, "_prepared", set())
+    backend = TorchBackend(seed=5, intersect_kernel="warp")
+    _sphere().trace(num_rays=512, seed=5, max_depth=4, batch_size=512, backend=backend)
+    loaded = {(dtype, name) for _, dtype, name in stage._LOADED}
+    assert loaded == {(torch.float64, "mm_probe"), (torch.float32, "mm_probe"), (torch.float64, "cavity")}

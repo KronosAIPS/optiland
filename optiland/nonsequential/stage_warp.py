@@ -88,7 +88,9 @@ SUPPORTED_DEVICE_TYPES: tuple[str, ...] = ("cuda",)
 # No fused multiply-add unless written: the torch stage rounds every product
 # of its elementwise arithmetic before the sum, on the CPU and on CUDA alike.
 # The one place torch does fuse is its matrix product (the frame transform),
-# which is written with an explicit fused multiply-add below.
+# which is written with an explicit fused multiply-add below. The kernels
+# live in modules of their own (:func:`_kernel`), which carry the same
+# option; this module holds the shared functions.
 wp.set_module_options({"fuse_fp": False, "enable_backward": True})
 
 _FMA_SNIPPET = "return fma(a, b, c);"
@@ -182,12 +184,39 @@ MODE_OWN = 0
 MODE_SELECT = 1
 
 
+def _kernel_module_name(name: str, bits: int) -> str:
+    """The Warp module one kernel of the stage lives in (one module per kernel and float type)."""
+    return f"{__name__}.{name}_{bits}"
+
+
+def _kernel(fn, name: str, bits: int, backward: bool = False):
+    """``fn`` as a Warp kernel in a module of its own.
+
+    One module per kernel and float type (research repository issue 85): a
+    module is Warp's unit of compilation, caching and loading, so a scene
+    compiles and loads only the kernels of the kinds it holds, the modules
+    a scene needs compile in parallel (:func:`load_kernels`), and only the
+    kinds that carry the tape's adjoint (:data:`TAPE_KINDS`) generate a
+    backward pass. The expressions, and so the numbers, are the same as in
+    one module: the module options are the stage's (no floating-point
+    contraction).
+    """
+    module = _kernel_module_name(name, bits)
+    wp.set_module_options({"fuse_fp": False, "enable_backward": bool(backward)}, module=module)
+    return wp.kernel(fn, module=wp.get_module(module))
+
+
+#: The kinds whose kernel carries the Warp tape's adjoint.
+TAPE_KINDS = ("cavity", "conic")
+
+
 def _make_kernels(FT, fma, ulp, flipsign):
     """The stage's kernels for one float type.
 
     Every expression mirrors the torch source statement for statement; the
     comments name the torch expression where its operator form matters.
     """
+    bits = 64 if FT is wp.float64 else 32
 
     # -- the orders torch rounds in ------------------------------------------
 
@@ -344,12 +373,13 @@ def _make_kernels(FT, fma, ulp, flipsign):
                 m = FT(_ACCEPT_FLOOR)
         return FT(_ACCEPT_K) * ulp(m)
 
-    @wp.kernel
     def k_mm_probe(a: wp.array2d(dtype=FT), r: wp.array2d(dtype=FT), out: wp.array3d(dtype=FT)):
         # Every candidate order of ``a @ r`` (r already transposed for the
         # second form), for the load-time probe.
         i, j, code = wp.tid()
         out[i, j, code] = _mm(a[i, 0], a[i, 1], a[i, 2], r[0, j], r[1, j], r[2, j], code)
+
+    k_mm_probe = _kernel(k_mm_probe, "mm_probe", bits)
 
     # -- the geometries ---------------------------------------------------------
     #
@@ -1268,8 +1298,7 @@ def _make_kernels(FT, fma, ulp, flipsign):
 
     # -- the kernels ------------------------------------------------------------
 
-    def _stage_kernel(geom):
-        @wp.kernel
+    def _stage_kernel(geom, kind):
         def k(
             x: wp.array(dtype=FT), y: wp.array(dtype=FT), z: wp.array(dtype=FT),
             L: wp.array(dtype=FT), M: wp.array(dtype=FT), N: wp.array(dtype=FT),
@@ -1362,9 +1391,8 @@ def _make_kernels(FT, fma, ulp, flipsign):
                     g_run[i, 2] = qz
                     idx_run[i] = wp.int32(comp_index)
 
-        return k
+        return _kernel(k, kind, bits, backward=kind in TAPE_KINDS)
 
-    @wp.kernel
     def k_absmax(
         x: wp.array(dtype=FT), y: wp.array(dtype=FT), z: wp.array(dtype=FT),
         L: wp.array(dtype=FT), M: wp.array(dtype=FT), N: wp.array(dtype=FT),
@@ -1388,7 +1416,8 @@ def _make_kernels(FT, fma, ulp, flipsign):
         oz = plz + t_adv * dz
         wp.atomic_max(out, 0, wp.max(wp.max(wp.abs(ox), wp.abs(oy)), wp.abs(oz)))
 
-    @wp.kernel
+    k_absmax = _kernel(k_absmax, "absmax", bits)
+
     def k_merge(
         t_c: wp.array(dtype=FT),
         normals_c: wp.array2d(dtype=FT),
@@ -1422,16 +1451,18 @@ def _make_kernels(FT, fma, ulp, flipsign):
             g_run[i, 2] = n_geom_c[i, 2]
             idx_run[i] = wp.int32(comp_index)
 
+    k_merge = _kernel(k_merge, "merge", bits)
+
     kernels = {
-        "cavity": _stage_kernel(g_cavity),
-        "conic": _stage_kernel(g_conic),
-        "plane": _stage_kernel(g_plane),
-        "finite_plane": _stage_kernel(g_finite_plane),
-        "annulus": _stage_kernel(g_annulus),
-        "sphere": _stage_kernel(g_sphere),
-        "frustum": _stage_kernel(g_frustum),
-        "lenslet": _stage_kernel(g_lenslet),
-        "asphere": _stage_kernel(g_asphere),
+        "cavity": _stage_kernel(g_cavity, "cavity"),
+        "conic": _stage_kernel(g_conic, "conic"),
+        "plane": _stage_kernel(g_plane, "plane"),
+        "finite_plane": _stage_kernel(g_finite_plane, "finite_plane"),
+        "annulus": _stage_kernel(g_annulus, "annulus"),
+        "sphere": _stage_kernel(g_sphere, "sphere"),
+        "frustum": _stage_kernel(g_frustum, "frustum"),
+        "lenslet": _stage_kernel(g_lenslet, "lenslet"),
+        "asphere": _stage_kernel(g_asphere, "asphere"),
     }
     kernels["mm_probe"] = k_mm_probe
     kernels["absmax"] = k_absmax
@@ -1755,6 +1786,11 @@ _NP_FLOAT = {torch.float64: np.float64, torch.float32: np.float32}
 
 _prepared: set = set()
 _initialised = [False]
+#: ``(device, dtype, kernel name)`` of the kernels loaded on a device.
+_LOADED: set = set()
+#: How many kernel modules compile at once when a scene's kernels load
+#: (:func:`load_kernels`); None lets Warp choose (up to four threads).
+LOAD_WORKERS: int | None = None
 
 
 def _init() -> None:
@@ -1776,7 +1812,9 @@ def prepare(device: Any) -> None:
     name = str(tdev)
     if name in _prepared:
         return
-    wp.load_module(module=__name__, device=wp.device_from_torch(tdev))
+    # Only the probe's kernels here; a scene's kernels load when it first
+    # needs them (load_kernels), before the bounce a replay records.
+    load_kernels(tdev, kinds=(), extras=("mm_probe",))
     # The probes read values to the host: done here, before any bounce,
     # never inside a recorded one.
     for dtype in (torch.float64, torch.float32):
@@ -1787,6 +1825,109 @@ def prepare(device: Any) -> None:
         # rather than first inside a recorded bounce.
         _placeholders(torch.empty(0, dtype=dtype, device=tdev))
     _prepared.add(name)
+
+
+def _torch_device(device: Any) -> torch.device:
+    tdev = torch.device(device)
+    if tdev.type == "cuda" and tdev.index is None:
+        tdev = torch.device("cuda", torch.cuda.current_device())
+    return tdev
+
+
+def load_kernels(
+    device: Any,
+    kinds=None,
+    dtypes=(torch.float64, torch.float32),
+    extras=("absmax", "merge"),
+    max_workers: int | None = None,
+) -> list:
+    """Compile (or read from Warp's kernel cache) and load the kernels of ``kinds`` on ``device``.
+
+    Each kernel is a module of its own (:func:`_kernel`), so only what is
+    asked for compiles, and the modules not yet loaded compile in parallel
+    (``max_workers`` threads; :data:`LOAD_WORKERS` when None). A kernel
+    already loaded on the device is skipped. Called by :func:`prepare` for
+    the probe's kernel, and by :func:`intersect_scene` for the kinds of the
+    scene in hand, on the first bounce that meets them (an eager bounce, so
+    a CUDA-graph replay records launches only).
+
+    Args:
+        device: The torch device.
+        kinds: The geometry kinds to load (None: every kind of :data:`KINDS`).
+        dtypes: The float types to load them for.
+        extras: Other kernels of the stage to load with them (``"absmax"``,
+            ``"merge"``, ``"mm_probe"``).
+        max_workers: Parallel compilations; None for :data:`LOAD_WORKERS`.
+
+    Returns:
+        The names ``(name, dtype)`` loaded by this call.
+    """
+    _init()
+    tdev = _torch_device(device)
+    names = list(KINDS if kinds is None else kinds) + list(extras)
+    todo, modules = [], []
+    for dtype in dtypes:
+        for name in names:
+            key = (str(tdev), dtype, name)
+            if key in _LOADED:
+                continue
+            todo.append(key)
+            modules.append(_KERNELS[dtype][name].module)
+    if modules:
+        workers = LOAD_WORKERS if max_workers is None else max_workers
+        wp.force_load(device=wp.device_from_torch(tdev), modules=modules, max_workers=workers)
+        _LOADED.update(todo)
+    return [(name, dtype) for _, dtype, name in todo]
+
+
+def _ensure_loaded(kinds, like, merge: bool = False) -> None:
+    """Load, in one parallel call, the kernels a launch on ``like``'s device and dtype is about to use."""
+    names = {k for k in kinds if k is not None}
+    if "frustum" in names:
+        names.add("absmax")
+    if merge:
+        names.add("merge")
+    dev = str(like.device) if like.device.type != "cuda" or like.device.index is not None else str(
+        _torch_device(like.device))
+    if all((dev, like.dtype, name) in _LOADED for name in names):
+        return
+    load_kernels(like.device, kinds=sorted(names), dtypes=(like.dtype,), extras=())
+
+
+def kernel_modules(kinds=None, dtypes=(torch.float64, torch.float32), extras=("absmax", "merge", "mm_probe")) -> list:
+    """The Warp modules of the stage's kernels (one per kernel and float type)."""
+    names = list(KINDS if kinds is None else kinds) + list(extras)
+    return [_KERNELS[dtype][name].module for dtype in dtypes for name in names]
+
+
+def compile_cache(arch, kinds=None, dtypes=(torch.float64, torch.float32)) -> list:
+    """Compile the stage's kernels for a CUDA architecture ahead of time, without a device.
+
+    Writes Warp's kernel cache (``warp.config.kernel_cache_dir``, which the
+    ``WARP_CACHE_PATH`` environment variable sets) for the compute
+    capability ``arch`` (80 for an A100), as CUBIN and as PTX, in the
+    layout a load reads: a later process on a device of that architecture
+    finds every kernel compiled and compiles nothing. Meant for a container
+    image's build step (research repository issue 85: a fresh CUDA
+    container otherwise compiles the stage on its first trace). A module's
+    file names carry a hash of its kernels' source and options only, not of
+    the machine that compiled it.
+
+    Args:
+        arch: A compute capability (e.g. 80) or several.
+        kinds: The geometry kinds (None: every kind).
+        dtypes: The float types.
+
+    Returns:
+        The paths written.
+    """
+    _init()
+    arches = [arch] if isinstance(arch, int) else list(arch)
+    paths = []
+    for module in kernel_modules(kinds, dtypes):
+        for use_ptx in (False, True):
+            paths += wp.compile_aot_module(module, arch=arches, use_ptx=use_ptx)
+    return paths
 
 
 def availability(device: Any) -> str | None:
@@ -1916,8 +2057,6 @@ def _registry() -> list:
     return _REGISTRY
 
 
-#: The kinds whose kernel carries the Warp tape's adjoint.
-TAPE_KINDS = ("cavity", "conic")
 #: Every kind the kernels cover.
 KINDS = ("cavity", "conic", "plane", "finite_plane", "annulus", "sphere", "frustum", "lenslet", "asphere")
 
@@ -2446,6 +2585,7 @@ def intersect_component(component, kind: str, rays, t_min=None):
         _route(reason)
         return component.intersect(rays)
     like = rays.x
+    _ensure_loaded((kind,), like)
     xf, gp, gi, tab = _component_inputs(component, kind, like)
     recip = _recip_flag(kind, component, like)
     if _needs_tape(kind, rays, gp):
@@ -2521,6 +2661,12 @@ def intersect_scene(rays, components):
         getattr(_forward_ad_module(), "_current_level", -1) >= 0
     ):
         return _torch_select(rays, components)
+    # The scene's kernels, compiled in parallel on the first bounce that
+    # meets them (nothing to do afterwards).
+    _ensure_loaded(
+        [k for k, r in zip(kinds, reasons, strict=True) if r is None], like,
+        merge=any(r is not None for r in reasons),
+    )
     t_run = torch.empty(n, dtype=like.dtype, device=like.device)
     n_run = torch.empty((n, 3), dtype=like.dtype, device=like.device)
     g_run = torch.empty((n, 3), dtype=like.dtype, device=like.device)
@@ -2558,8 +2704,11 @@ __all__ = [
     "availability",
     "intersect_component",
     "intersect_scene",
+    "compile_cache",
+    "kernel_modules",
     "kind_of",
     "launch_counts",
+    "load_kernels",
     "matmul_orders",
     "prepare",
     "reset_routed",
