@@ -438,14 +438,21 @@ def _face_sag(face, r: np.ndarray) -> np.ndarray:
             surfaces are rotationally symmetric, so the sag is that at |r|.
 
     Returns:
-        Sag values [mm], shape (N,), float64; ``None`` for a kind with no
-        closed-form sag (a NURBS patch set), which the caller draws as before.
+        Sag values [mm], shape (N,), float64; for a NURBS patch set the
+        surface sampled along the section (:func:`_nurbs_section_sag`, NaN
+        where the section leaves the patches); ``None`` for a kind with
+        neither, which the caller draws from the config as before.
     """
     import optiland.backend as be  # noqa: PLC0415
+    from optiland.nonsequential.components.geometry.nurbs.geometry import (  # noqa: PLC0415
+        NurbsGeometry,
+    )
     from optiland.nonsequential.components.volume import (  # noqa: PLC0415
         _detached_geometry,
     )
 
+    if isinstance(face.geometry, NurbsGeometry):
+        return _nurbs_section_sag(face.geometry, r)
     geom = _detached_geometry(face.geometry)
     if not (hasattr(geom, "sag") or hasattr(geom, "_sag")):
         return None
@@ -458,6 +465,43 @@ def _face_sag(face, r: np.ndarray) -> np.ndarray:
     finally:
         be.set_backend(previous_backend)
     return np.asarray(z, dtype=np.float64)
+
+
+def _nurbs_section_sag(geometry, r: np.ndarray) -> np.ndarray:
+    """A NURBS face sampled along the section plane ``x = 0`` (KronosNSRT issue 88).
+
+    A patch set has no closed-form sag, so each abscissa is shot by the kind's
+    own intersection: a ray parallel to the local ``z`` axis from below the
+    control net's hull (which holds the surface: every weight is positive) at
+    ``(0, r)``, and the drawn ``z`` is its first root. The surface drawn is
+    therefore the surface traced, to the kind's root accuracy. Run on a
+    detached float64 copy on the numpy backend, so a gradient-carrying net is
+    never touched by a plot.
+
+    Args:
+        geometry: A :class:`~optiland.nonsequential.components.geometry.nurbs.geometry.NurbsGeometry`.
+        r: Positions along the local ``y`` axis [mm], shape (N,).
+
+    Returns:
+        ``z`` [mm], shape (N,), float64; NaN where the section misses the patches.
+    """
+    import optiland.backend as be  # noqa: PLC0415
+
+    geom = geometry.detached_copy()
+    y = np.asarray(r, dtype=np.float64).reshape(-1)
+    cp = np.asarray(geom.control_points, dtype=np.float64).reshape(-1, 3)
+    span = float(np.ptp(cp[:, 2])) + float(np.abs(cp).max()) + 1.0
+    z0 = float(cp[:, 2].min()) - span
+    o = np.column_stack([np.zeros_like(y), y, np.full_like(y, z0)])
+    d = np.tile([0.0, 0.0, 1.0], (y.shape[0], 1))
+    previous_backend = be.get_backend()
+    try:
+        be.set_backend("numpy")
+        t, _, hit, _ = geom.ray_intersect(o, d)
+    finally:
+        be.set_backend(previous_backend)
+    t = np.asarray(t, dtype=np.float64)
+    return np.where(np.asarray(hit, dtype=bool), z0 + t, np.nan)
 
 
 def _sag_array(radius: float, conic: float, r: np.ndarray) -> np.ndarray:

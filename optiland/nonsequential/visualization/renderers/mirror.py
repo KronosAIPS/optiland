@@ -25,6 +25,32 @@ if TYPE_CHECKING:
     from optiland.nonsequential.components.compound import CompoundComponent
 
 
+#: Abscissae of the probe that finds where a NURBS mirror's section meets its patches.
+_PROBE_PTS = 513
+
+
+def _drawn_range(component) -> tuple[float, float]:
+    """The interval of the local ``y`` axis the mirror is drawn over.
+
+    The config's aperture, or for a NURBS face (which does not use it) the
+    part of the section that meets the patches: probed at ``_PROBE_PTS``
+    abscissae across the control net's hull, from the first to the last that
+    the kind's intersection hits (issue 88).
+    """
+    cfg = component._config
+    if getattr(cfg, "nurbs", None) is None:
+        return -float(cfg.aperture_radius), float(cfg.aperture_radius)
+    geom = component.surfaces[0].geometry
+    cp = np.asarray(geom.detached_copy().control_points, dtype=np.float64)
+    hull = float(np.hypot(cp[:, 0], cp[:, 1]).max())
+    y = np.linspace(-hull, hull, _PROBE_PTS)
+    z = _face_sag(component.surfaces[0], y)
+    on = y[np.isfinite(z)]
+    if on.size == 0:
+        return 0.0, 0.0
+    return float(on.min()), float(on.max())
+
+
 class MirrorRenderer2D(ComponentRenderer2D):
     """Renders a Mirror as a thick arc/curve in 2D."""
 
@@ -57,10 +83,12 @@ class MirrorRenderer2D(ComponentRenderer2D):
         h_idx, v_idx = _projection_indices(projection)
 
         n_pts = 128
-        y = np.linspace(-cfg.aperture_radius, cfg.aperture_radius, n_pts)
+        lo, hi = _drawn_range(component)
+        y = np.linspace(lo, hi, n_pts)
         # The face's own sag (an asphere mirror's polynomial included,
-        # KronosNSRT issue 81); the base conic only for a kind with no
-        # closed-form sag.
+        # KronosNSRT issue 81; a NURBS face sampled along the section by its
+        # own intersection, issue 88, NaN off the patches, which the line
+        # leaves as a gap); the base conic only for a kind with neither.
         z = _face_sag(component.surfaces[0], y)
         if z is None:
             z = _sag_array(cfg.radius, cfg.conic, y)
@@ -114,10 +142,14 @@ class MirrorRenderer3D(ComponentRenderer3D):
         translation, rot = _get_transform(component._cs)
 
         n_pts = 128
-        r = np.linspace(0.0, cfg.aperture_radius, n_pts)
+        r = np.linspace(0.0, _drawn_range(component)[1], n_pts)
         z = _face_sag(component.surfaces[0], r)
         if z is None:
             z = _sag_array(cfg.radius, cfg.conic, r)
+        # a NURBS face sampled along its section: only the abscissae on the patches
+        # (the contour is revolved, which is exact for a surface of revolution)
+        keep = np.isfinite(z)
+        r, z = r[keep], z[keep]
 
         pts_local = np.stack([np.zeros_like(r), r, z], axis=1)
         pts_global = pts_local @ rot.T + translation
