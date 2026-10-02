@@ -41,7 +41,7 @@ def test_complex_tensors_keep_their_imaginary_part(torch_precision):
         out = be.stack([a, b])
     assert out.dtype == _complex_dtype(torch_precision)
     np.testing.assert_array_equal(
-        out.cpu().numpy(), np.array([[1 + 2j, 3 - 4j], [0.5j, -1 + 0j]])
+        be.to_numpy(out), np.array([[1 + 2j, 3 - 4j], [0.5j, -1 + 0j]])
     )
 
 
@@ -51,16 +51,16 @@ def test_mixed_real_and_complex_promote_like_numpy(torch_precision):
     out = be.stack([real, cplx], axis=1)
     expected = np.stack([np.array([1.0, 2.0]), np.array([1j, 2 + 1j])], axis=1)
     assert out.dtype == _complex_dtype(torch_precision)
-    np.testing.assert_array_equal(out.cpu().numpy(), expected)
+    np.testing.assert_array_equal(be.to_numpy(out), expected)
 
 
 def test_python_and_numpy_complex_inputs(torch_precision):
     out = be.stack([1 + 1j, 2.0, np.complex128(-3j)])
     assert out.dtype == _complex_dtype(torch_precision)
-    np.testing.assert_array_equal(out.cpu().numpy(), np.array([1 + 1j, 2.0, -3j]))
+    np.testing.assert_array_equal(be.to_numpy(out), np.array([1 + 1j, 2.0, -3j]))
     arr = be.stack([np.array([1j, 2.0]), np.array([3.0, 4.0])])
     np.testing.assert_array_equal(
-        arr.cpu().numpy(), np.array([[1j, 2.0], [3.0, 4.0]])
+        be.to_numpy(arr), np.array([[1j, 2.0], [3.0, 4.0]])
     )
 
 
@@ -70,7 +70,7 @@ def test_real_stack_is_unchanged(torch_precision):
     b = torch.tensor([3, 4])  # an integer tensor is cast to the working dtype
     out = be.stack([a, b])
     assert out.dtype == working
-    np.testing.assert_array_equal(out.cpu().numpy(), [[1.0, 2.0], [3.0, 4.0]])
+    np.testing.assert_array_equal(be.to_numpy(out), [[1.0, 2.0], [3.0, 4.0]])
 
 
 def test_gradient_flows_through_a_complex_stack():
