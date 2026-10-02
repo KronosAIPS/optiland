@@ -25,6 +25,7 @@ The mapping (schema ``nsq-material-record/1``)::
          "resonance_um": [lambda_i]}          # or "resonance_um2": [C_i]
         {"kind": "buchdahl", "n0": n_d, "nu": [nu1, nu2, nu3],
          "lambda0_um": 0.5875618, "alpha": 2.5}
+        {"kind": "rii_formula_4", "coefficients": [C1, C2, ...]}
         {"kind": "table", "wavelength_m": [...], "values": [...]},
       "k_model": {"kind": "constant", "k": 0.0} or
                  {"kind": "table", "wavelength_m": [...], "values": [...]}
@@ -47,6 +48,13 @@ or float32, on the device the wavelengths live on):
   ``x = d / (1 + alpha d)``, ``d = w - lambda0`` (the three-term Buchdahl form
   of Robb and Mercado, Applied Optics 22(8), 1198, 1983, which ``kmat.abbe``
   produces from a d-line index and an Abbe number).
+- ``rii_formula_4``: refractiveindex.info's formula 4, ``n^2 = C1 +
+  C2 w^C3 / (w^2 - C4^C5) + C6 w^C7 / (w^2 - C8^C9) + sum_i C_i w^C_(i+1)``
+  (the two resonant terms present when the list is long enough, then the
+  polynomial tail from C10), the page's coefficients as stated and the terms
+  in the library's order (``kmat.rii``'s formula 4). Zinc sulfide's default
+  page (Debenham, Applied Optics 23, 2238, 1984) is of this form, with C3 = C7
+  = 0: a permittivity with two resonances and no Sellmeier numerator.
 - ``table``: linear interpolation in wavelength on the record's own breakpoints
   (metres, untouched), queried at ``w * 1e-6``; the rule ``kmat.nk`` applies
   to a ``table_1d`` property with ``interpolation="linear"`` (``np.interp``).
@@ -70,7 +78,7 @@ traced.
 
 **Gradients.** The model's coefficients are public attributes
 (``sellmeier_eps_inf``, ``sellmeier_strengths``, ``sellmeier_resonance_um`` or
-``sellmeier_resonance_um2``, ``buchdahl_n0``, ``buchdahl_nu``, ``constant_n``,
+``sellmeier_resonance_um2``, ``buchdahl_n0``, ``buchdahl_nu``, ``formula4_coefficients``, ``constant_n``,
 ``constant_k``, ``table_n``, ``table_k``). A torch tensor with
 ``requires_grad=True`` placed there is evaluated by torch operations on the
 graph, and the parameter register of chapter 09 lists it under the material's
@@ -96,7 +104,7 @@ RECORD_SCHEMA = "nsq-material-record/1"
 #: 2 pi c in metres per second, for a pole's angular frequency (kmat.poles).
 _TWO_PI_C = 2.0 * math.pi * 299792458.0
 
-_N_KINDS = ("constant", "sellmeier", "buchdahl", "table")
+_N_KINDS = ("constant", "sellmeier", "buchdahl", "rii_formula_4", "table")
 _K_KINDS = ("constant", "table")
 
 
@@ -190,6 +198,14 @@ class RecordMaterial(BaseMaterial):
             self.buchdahl_nu = n_model["nu"]
             self.buchdahl_lambda0_um = float(n_model["lambda0_um"])
             self.buchdahl_alpha = float(n_model["alpha"])
+        elif self.n_kind == "rii_formula_4":
+            self.formula4_coefficients = n_model["coefficients"]
+            count = len(self.formula4_coefficients)
+            if count % 2 == 0 or count in (3, 7):
+                raise ValueError(
+                    "a rii_formula_4 n_model is a constant, then whole resonant terms of four "
+                    f"coefficients and tail pairs (an odd count, not 3 or 7); got {count}"
+                )
         else:
             self.table_n_wavelength_m = _floats(n_model["wavelength_m"])
             self.table_n = n_model["values"]
@@ -207,8 +223,8 @@ class RecordMaterial(BaseMaterial):
         """The material of a ``kmat.MaterialRecord``, read without importing kmat.
 
         Reads ``record.identity``, ``record.content_hash()`` and
-        ``record.optical``: the permittivity model (``rii_formula`` families 1
-        and 2, ``sellmeier``, ``buchdahl``, or ``poles`` whose every pole is a
+        ``record.optical``: the permittivity model (``rii_formula`` families 1,
+        2 and 4, ``sellmeier``, ``buchdahl``, or ``poles`` whose every pole is a
         lossless Lorentz term) or a stated ``n`` (``constant`` or a linear
         ``table_1d``), and the ``k`` property (absent: 0, the library's rule
         for an index-only page; ``constant``; a linear ``table_1d``). Any other
@@ -291,6 +307,8 @@ class RecordMaterial(BaseMaterial):
                 "lambda0_um": self.buchdahl_lambda0_um,
                 "alpha": self.buchdahl_alpha,
             }
+        elif self.n_kind == "rii_formula_4":
+            n_model = {"kind": "rii_formula_4", "coefficients": _plain(self.formula4_coefficients)}
         else:
             n_model = {
                 "kind": "table",
@@ -326,7 +344,8 @@ class RecordMaterial(BaseMaterial):
     def _parameters(self) -> tuple:
         names = [
             "constant_n", "sellmeier_eps_inf", "sellmeier_strengths", "sellmeier_resonance_um",
-            "sellmeier_resonance_um2", "buchdahl_n0", "buchdahl_nu", "table_n", "constant_k", "table_k",
+            "sellmeier_resonance_um2", "buchdahl_n0", "buchdahl_nu", "formula4_coefficients", "table_n",
+            "constant_k", "table_k",
         ]
         return tuple(getattr(self, n) for n in names if hasattr(self, n))
 
@@ -387,6 +406,8 @@ class RecordMaterial(BaseMaterial):
             d = wavelength - self.buchdahl_lambda0_um
             x = d / (1.0 + self.buchdahl_alpha * d)
             return n0 + nu[0] * x + nu[1] * x**2 + nu[2] * x**3
+        if self.n_kind == "rii_formula_4":
+            return be.sqrt(self._formula4_eps(wavelength))
         return self._interp(self.table_n_wavelength_m, self.table_n, wavelength)
 
     def _calculate_k(self, wavelength, **kwargs):
@@ -397,6 +418,24 @@ class RecordMaterial(BaseMaterial):
                 return self._broadcast_like(k, wavelength)
             return k
         return self._interp(self.table_k_wavelength_m, self.table_k, wavelength)
+
+    def _formula4_eps(self, w):
+        """n^2 of refractiveindex.info's formula 4, term for term in ``kmat.rii``'s order.
+
+        Plain coefficients stay Python floats (the library's own scalars, so
+        ``C4^C5`` is the same double and a numpy float64 trace gives the
+        library's bits); a tensor of coefficients is indexed on its graph.
+        """
+        c = self.formula4_coefficients
+        c = [c[i] for i in range(len(c))] if hasattr(c, "requires_grad") else [float(v) for v in c]
+        eps = c[0]
+        if len(c) > 4:
+            eps = eps + c[1] * w ** c[2] / (w**2 - c[3] ** c[4])
+        if len(c) > 8:
+            eps = eps + c[5] * w ** c[6] / (w**2 - c[7] ** c[8])
+        for i in range(9, len(c) - 1, 2):
+            eps = eps + c[i] * w ** c[i + 1]
+        return eps
 
     def _interp(self, grid_m, values, wavelength):
         query = wavelength * 1e-6
@@ -460,12 +499,21 @@ def record_mapping(record, *, extrapolate: bool = False) -> dict:
         band = _validity(eps)
         if model.kind == "rii_formula":
             c = _floats(model.coefficients)
-            if model.family not in (1, 2):
-                raise RecordRefused(f"{name}: refractiveindex.info formula {model.family} is not a "
-                                    "Sellmeier form; the engine evaluates families 1 and 2")
-            key = "resonance_um" if model.family == 1 else "resonance_um2"
-            n_model = {"kind": "sellmeier", "eps_inf": 1.0 + c[0],
-                       "strengths": c[1::2], key: c[2::2]}
+            if model.family not in (1, 2, 4):
+                raise RecordRefused(f"{name}: refractiveindex.info formula {model.family} is not one "
+                                    "the engine evaluates (families 1, 2 and 4)")
+            if model.family == 4:
+                if len(c) % 2 == 0 or len(c) in (3, 7):
+                    raise RecordRefused(
+                        f"{name}: refractiveindex.info formula 4 with {len(c)} coefficients leaves a term "
+                        "incomplete (a constant, then resonant terms of four and tail pairs); the engine "
+                        "evaluates the whole formula or none of it"
+                    )
+                n_model = {"kind": "rii_formula_4", "coefficients": c}
+            else:
+                key = "resonance_um" if model.family == 1 else "resonance_um2"
+                n_model = {"kind": "sellmeier", "eps_inf": 1.0 + c[0],
+                           "strengths": c[1::2], key: c[2::2]}
         elif model.kind == "sellmeier":
             n_model = {"kind": "sellmeier", "eps_inf": 1.0 + float(model.constant),
                        "strengths": _floats(model.B), "resonance_um2": _floats(model.C)}
