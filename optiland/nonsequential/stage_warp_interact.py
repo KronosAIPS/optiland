@@ -577,13 +577,12 @@ def _route_reason(component, rays, t, normals, hit_mask, bsdf_ir, n_geom) -> str
 
 def _constants(component, cov: dict, like: torch.Tensor) -> tuple:
     """The kernel's scalar arguments, each cast on the host as torch casts the Python number."""
-    from optiland.nonsequential.components.sampling_support import _SF_EPS  # noqa: PLC0415
+    from optiland.nonsequential.components.sampling_support import (  # noqa: PLC0415
+        scatter_branch_constants,
+    )
 
     ft = _NP_FLOAT[like.dtype]
-    sf = cov["sf"]
-    sf_det = min(max(sf, _SF_EPS), 1.0 - _SF_EPS)
-    w_s = sf / sf_det
-    w_ns = (1.0 - sf) / (1.0 - sf_det)
+    sf_det, w_s, w_ns = scatter_branch_constants(cov["sf"])
     tiny = _tol.tiny_for(like)
     return (
         ft(cov["refl"]), ft(tiny), int(cov["lobe"]), ft(cov["tau"]), int(cov["tau"] > 0.0), ft(sf_det),

@@ -31,6 +31,40 @@ if TYPE_CHECKING:
 _SF_EPS = 1e-6
 
 
+def scatter_branch_constants(sf: float) -> tuple[float, float, float]:
+    """``(sf_det, w_scatter, w_nonscatter)`` of the scatter branch for a plain number.
+
+    For ``0 < sf < 1``: the probability clamped to ``[_SF_EPS, 1 - _SF_EPS]``
+    and the two compensating weights ``sf / sf_det`` and
+    ``(1 - sf) / (1 - sf_det)``. For ``sf`` exactly 1 (every hit scatters,
+    the default) or exactly 0 (none does) there is no branch: the threshold
+    is 1.0 or 0.0, which every uniform draw (in ``[0, 1)``) is below or not,
+    and the drawn branch's weight is exactly 1. The clamp used to run there
+    too, and at float32 its two constants round inconsistently:
+    ``1 - 1e-6`` becomes ``1 - 17 * 2**-24`` (the probability a 24-bit draw
+    is below it, exactly) while ``1 / (1 - 1e-6)`` becomes ``1 + 8 * 2**-23``,
+    so the expected gate was ``1 - 2**-24`` per scattering event, a
+    systematic loss booked to the sampling residual: about 49 events of
+    6e-8 on a closed sphere of reflectance 0.98, 2.9e-6 of its multiplier
+    (the research repository's issue 55). At float64 the clamp was unbiased
+    to 2e-10 per event but culled one hit in a million and boosted the rest
+    by ``1 + 1e-6``. The keyed draw is still made (it moves no other draw).
+
+    Args:
+        sf: The scatter fraction, a host float.
+
+    Returns:
+        The threshold the draw is compared with, and the weights of the
+        scatter and non-scatter branches.
+    """
+    if sf >= 1.0:
+        return 1.0, 1.0, 0.0
+    if sf <= 0.0:
+        return 0.0, 0.0, 1.0
+    sf_det = min(max(sf, _SF_EPS), 1.0 - _SF_EPS)
+    return sf_det, sf / sf_det, (1.0 - sf) / (1.0 - sf_det)
+
+
 def detached(value):
     """Return ``value`` with no gradient attached, on its own device.
 
@@ -77,13 +111,16 @@ def scatter_branch(
     sf_val = detached(sf)
     if be.is_torch_tensor(sf_val):
         sf_det = be.clip(sf_val, _SF_EPS, 1.0 - _SF_EPS)
+        weight_scatter_branch = sf / sf_det
+        weight_nonscatter_branch = (1.0 - sf) / (1.0 - sf_det)
     else:
-        sf_det = min(max(float(sf_val), _SF_EPS), 1.0 - _SF_EPS)
+        # A plain number: exactly 0 or 1 draws no branch (see
+        # scatter_branch_constants, the research repository's issue 55).
+        sf_det, weight_scatter_branch, weight_nonscatter_branch = (
+            scatter_branch_constants(float(sf_val))
+        )
     u_scatter = rng.uniform(ray_id, bounce, EventSlot.SCATTER_BRANCH)
     scatters = hit_mask & (u_scatter < sf_det)
-
-    weight_scatter_branch = sf / sf_det
-    weight_nonscatter_branch = (1.0 - sf) / (1.0 - sf_det)
     if owner is not None and not be.is_torch_tensor(weight_scatter_branch):
         weight_scatter_branch = resident_scalar(
             owner, "scatter_weight", weight_scatter_branch, u_scatter
