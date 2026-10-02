@@ -244,9 +244,9 @@ def _abg_region(l0: float, s: float, dlog_t0: tuple[float, float]):
 
 
 #: d log T / d l0 and d log T / d s at incidences 0, 30 and 60 degrees, from
-#: 30-digit quadrature of the lobe's integrals (the research repository's build
-#: log G4_gradients_4, record ``ref_dlogT.py``; mathematics only, no engine
-#: code). At normal incidence and s = 2 the l0 value also equals the closed
+#: 30-digit quadrature of the lobe's integrals (the research repository's
+#: ``docs/theory/checks_09_scatter.py``, check C9.6; mathematics only, no
+#: engine code). At normal incidence and s = 2 the l0 value also equals the closed
 #: form 2 / l0 - 2 / (l0 (l0^2 + 1) ln(1 + l0^-2)).
 _DLOG_T = {
     (0.05, 2.0, 0): (33.343258901402695, -1.3629372192037657),
