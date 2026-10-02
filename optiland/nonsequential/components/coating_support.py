@@ -32,9 +32,10 @@ if TYPE_CHECKING:
 def reject_polarized_coating(coating: object, *, surface_name: str) -> None:
     """Raise if ``coating`` is a Jones-matrix (polarized) coating.
 
-    NSQ rays carry no polarization state, so a polarized coating cannot be
-    evaluated correctly. Rather than silently falling back to some scalar
-    average of its Jones matrix, refuse it outright.
+    The scalar mode reads a coating's R and T, and the Stokes mode the s and
+    p terms and relative phases of a thin-film stack or a coating table
+    (``polarization.coating_sp``); neither reads a Jones matrix. Rather than
+    silently falling back to some scalar average of it, refuse it outright.
 
     ``UnpolarizedThinFilmCoating`` is not a ``BaseCoatingPolarized`` (it does
     not subclass the sequential-engine coating hierarchy at all), so it never
@@ -55,8 +56,10 @@ def reject_polarized_coating(coating: object, *, surface_name: str) -> None:
     if isinstance(coating, BaseCoatingPolarized):
         raise NotImplementedError(
             f"Surface {surface_name!r} was given a polarized coating "
-            f"({type(coating).__name__}); NSQ rays carry no polarization "
-            "state, so Jones-matrix coatings cannot be evaluated. Use an "
+            f"({type(coating).__name__}); the non-sequential engine reads R "
+            "and T, or in its Stokes mode the s and p terms of a thin-film "
+            "stack or a table, never a Jones matrix, so Jones-matrix "
+            "coatings cannot be evaluated. Use an "
             "unpolarized coating such as optiland.coatings.SimpleCoating, "
             "optiland.nonsequential.components.coating_support"
             ".UnpolarizedThinFilmCoating (angle- and wavelength-dependent, "
@@ -69,8 +72,8 @@ class UnpolarizedThinFilmCoating:
     """Unpolarized, angle-dependent NSQ adapter around a ``ThinFilmStack``.
 
     ``optiland.coatings.ThinFilmCoating`` builds a Jones matrix from the same
-    stack and is rejected by :func:`reject_polarized_coating` -- NSQ rays
-    carry no polarization state. This adapter evaluates the stack's
+    stack and is rejected by :func:`reject_polarized_coating`. This adapter
+    evaluates the stack's
     characteristic-matrix (R, T) at each ray's own wavelength and angle of
     incidence and reduces s/p to the unpolarized average the theory chapter
     uses, :math:`\\bar R=(R_s+R_p)/2` (and the matching T), which is exactly
@@ -79,6 +82,11 @@ class UnpolarizedThinFilmCoating:
     ``RefractiveComponent.interact`` has on hand (a per-ray cosine of the
     angle of incidence, not an angle in radians) and gives the dispatch in
     :func:`evaluate_transmissive_coating` an ``evaluate`` method to find.
+
+    In the engine's Stokes mode a refractive face reads the same stack's s and
+    p terms and relative phases instead (``polarization.coating_sp``), and its
+    scalar (R, T) are their means, the values :meth:`evaluate` returns, bit
+    for bit.
 
     An empty stack (no layers) reduces to the bare unpolarized Fresnel
     reflectance of the incident/substrate interface, since the
@@ -222,6 +230,28 @@ def coating_incident_is_front(
     n_inc, n_sub = _index_at(incident, wl), _index_at(substrate, wl)
     n_f, n_b = _index_at(material_front, wl), _index_at(material_back, wl)
     return abs(n_f - n_inc) + abs(n_b - n_sub) <= abs(n_f - n_sub) + abs(n_b - n_inc)
+
+
+def coating_holds_beyond_critical(coating: object) -> bool:
+    """Whether a coating's own R and T hold beyond the critical angle (issue 96).
+
+    A side-aware coating (one with ``media()``: a thin-film stack, a table)
+    describes the whole interface, its two media included, so its reflectance
+    beyond the bare interface's critical angle is its own: a lossless stack
+    gives ``R = 1`` there to rounding, an absorbing layer in the evanescent
+    field gives ``R < 1`` (frustrated total internal reflection, the research
+    repository's chapter 06 section 6.15). A side-blind coating (a
+    ``SimpleCoating``, a constant) states one ``R`` and ``T`` for the
+    transmitting regime and says nothing about total internal reflection, so
+    the bare interface's ``R = 1`` stands for it.
+
+    Args:
+        coating: The attached coating, or None.
+
+    Returns:
+        True for a side-aware coating, False otherwise.
+    """
+    return coating is not None and callable(getattr(coating, "media", None))
 
 
 def from_substrate_mask(incident_is_front: bool | None, entering_back):
