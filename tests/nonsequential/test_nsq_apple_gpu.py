@@ -307,3 +307,102 @@ class TestHostCopy:
         buf = torch.zeros(len(_KNOWN), dtype=torch.float64)
         _accumulate_into(buf, np.arange(len(_KNOWN)), x)
         assert torch.equal(buf, expected)
+
+
+# Float64 values whose float32 roundings exercise the rounding rule: ties to
+# even both ways, a value rounding up across a binade, a float32 subnormal, a
+# value below half the smallest float32 subnormal (rounds to zero), negatives.
+_ROUNDING = [
+    0.1,
+    -0.2,
+    1.0 + 2.0**-24,
+    1.0 + 3 * 2.0**-24,
+    2.0 - 2.0**-26,
+    2.0**-140,
+    2.0**-151,
+    -3.0e38,
+]
+
+
+class TestHostToDeviceGradient:
+    """A float64 host tensor sent to a device in another dtype keeps its gradient.
+
+    Research repository issue 102. The backward of the one-call
+    ``x_cpu_f64.to(device="mps", dtype=torch.float32)`` is issue 54's
+    device-to-host float64 copy, which writes zeros: the gradient reaching
+    ``x`` is ``[0, 0, 0]``. ``to_device_dtype`` casts such a tensor on the host
+    and then moves it, so its backward is a same-dtype copy and a host cast.
+    The paths through the helper: ``to_tensor``, ``cast``, ``asarray``,
+    ``atleast_1d``/``atleast_2d``, ``full_like`` with a tensor fill value,
+    ``interp``.
+    """
+
+    def test_on_the_cpu_the_helper_is_the_plain_conversion_forward_and_backward(self):
+        from optiland.backend.torch_backend.capabilities import to_device_dtype
+
+        for dtype in (torch.float32, torch.float64, torch.complex64):
+            x = torch.tensor(_ROUNDING, dtype=torch.float64, requires_grad=True)
+            ref = torch.tensor(_ROUNDING, dtype=torch.float64, requires_grad=True)
+            y, y_ref = to_device_dtype(x, "cpu", dtype), ref.to(device="cpu", dtype=dtype)
+            assert y.dtype == dtype and torch.equal(y, y_ref)
+            w = torch.arange(1.0, len(_ROUNDING) + 1, dtype=torch.float64).to(dtype)
+            (y * w).real.sum().backward()
+            (y_ref * w).real.sum().backward()
+            assert torch.equal(x.grad, ref.grad), dtype
+
+    def test_a_host_cast_rounds_as_the_one_call_conversion(self):
+        """The rule the CUDA path relies on: casting before the copy gives the
+        bits of the one-call conversion (round to nearest even, subnormals kept)."""
+        x = torch.tensor(_ROUNDING, dtype=torch.float64)
+        one_call = torch.as_tensor(x, dtype=torch.float32)
+        assert torch.equal(x.to(torch.float32), one_call)
+        widened = torch.tensor(_ROUNDING, dtype=torch.float32).to(torch.float64)
+        assert widened[5] == 2.0**-140 and widened[6] == 0.0
+        assert widened[2] == 1.0 and widened[3] == 1.0 + 2.0**-22
+
+    @needs_mps
+    def test_the_gradient_reaches_a_float64_host_tensor(self):
+        from optiland.backend.torch_backend.capabilities import to_device_dtype
+
+        w = torch.arange(1.0, len(_ROUNDING) + 1, dtype=torch.float32)
+        x = torch.tensor(_ROUNDING, dtype=torch.float64, requires_grad=True)
+        y = to_device_dtype(x, "mps", torch.float32)
+        assert y.device.type == "mps" and y.dtype == torch.float32
+        assert torch.equal(y.cpu(), torch.tensor(_ROUNDING, dtype=torch.float32))
+        (y * w.to("mps")).sum().backward()
+        assert torch.equal(x.grad, w.to(torch.float64))
+
+    @needs_mps
+    def test_every_backend_path_keeps_the_gradient(self, torch_backend_state):
+        be.set_backend("torch")
+        be.set_device("cpu")
+        be.set_precision("float32")
+        be.set_device("mps")
+
+        def grad_through(fn):
+            x = torch.tensor([0.25, 1.5, 2.75], dtype=torch.float64, requires_grad=True)
+            out = fn(x)
+            assert out.device.type == "mps", fn
+            (out * torch.tensor([1.0, 2.0, 3.0], device="mps")).sum().backward()
+            return x.grad
+
+        want = torch.tensor([1.0, 2.0, 3.0], dtype=torch.float64)
+        for fn in (be.to_tensor, be.cast, be.asarray, be.atleast_1d, lambda x: be.atleast_2d(x)[0]):
+            assert torch.equal(grad_through(fn), want), fn
+        # A tensor fill value: the result is attached to it.
+        f = torch.tensor(0.5, dtype=torch.float64, requires_grad=True)
+        (be.full_like(torch.zeros(3), f) * 2.0).sum().backward()
+        assert float(f.grad) == 6.0
+        # interp: the gradient of the values at the nodes is the weights.
+        fp = torch.tensor([0.0, 1.0, 4.0], dtype=torch.float64, requires_grad=True)
+        grid = torch.tensor([0.0, 1.0, 2.0], dtype=torch.float64)
+        be.interp(torch.tensor([0.5, 1.5]), grid, fp).sum().backward()
+        assert torch.equal(fp.grad, torch.tensor([0.5, 1.0, 0.5], dtype=torch.float64))
+
+    @needs_mps
+    def test_control_the_one_call_conversion_loses_the_gradient(self):
+        """The defect itself, on this torch. If this starts failing, torch has
+        fixed it and the host cast (and this control) can be dated and retired."""
+        x = torch.tensor([0.1, 0.2, 0.3], dtype=torch.float64, requires_grad=True)
+        x.to(device="mps", dtype=torch.float32).sum().backward()
+        assert float(x.grad.abs().sum()) == 0.0
