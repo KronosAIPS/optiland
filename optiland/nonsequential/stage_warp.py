@@ -1886,7 +1886,9 @@ def load_kernels(
             modules.append(_KERNELS[dtype][name].module)
     if modules:
         workers = LOAD_WORKERS if max_workers is None else max_workers
-        wp.force_load(device=wp.device_from_torch(tdev), modules=modules, max_workers=workers)
+        # A launch on the CPU runs one thread per block, a variant of its own.
+        block_dim = 1 if tdev.type == "cpu" else None
+        wp.force_load(device=wp.device_from_torch(tdev), modules=modules, block_dim=block_dim, max_workers=workers)
         _LOADED.update(todo)
     return [(name, dtype) for _, dtype, name in todo]
 
