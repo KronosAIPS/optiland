@@ -305,7 +305,11 @@ class NurbsGeometry(ComponentGeometry):
             torch = ops.torch
 
             def to_array(x):
-                return torch.as_tensor(np.asarray(x, dtype=np.float64), device=like.device).to(like.dtype)
+                # Rounded to the working dtype on the host, then moved: the Apple GPU
+                # holds no float64 tensor, so a float64 upload followed by a cast there
+                # raises (issue 99). The cast is the same round-to-nearest conversion
+                # wherever it runs, so the CPU and CUDA values are unchanged.
+                return torch.as_tensor(np.asarray(x, dtype=np.float64)).to(like.dtype).to(like.device)
 
             def to_index(x):
                 return torch.as_tensor(np.asarray(x, dtype=np.int64), device=like.device)
@@ -406,8 +410,12 @@ class NurbsGeometry(ComponentGeometry):
         hit = out["hit"]
         cp = self.control_points
         w = self.weights
-        cp = cp.to(dtype=dtype, device=device) if is_tensor(cp) else torch.as_tensor(cp, dtype=dtype, device=device)
-        w = w.to(dtype=dtype, device=device) if is_tensor(w) else torch.as_tensor(w, dtype=dtype, device=device)
+        # Cast where the parameter lives, then move: the backward of a combined
+        # cast-and-move from a float64 host tensor to the Apple GPU is the device
+        # to host float64 copy of issue 54, which writes zeros (issue 99). The two
+        # forms give the same values and gradients on the CPU and on CUDA.
+        cp = cp.to(dtype=dtype).to(device=device) if is_tensor(cp) else torch.as_tensor(cp, dtype=dtype, device=device)
+        w = w.to(dtype=dtype).to(device=device) if is_tensor(w) else torch.as_tensor(w, dtype=dtype, device=device)
         pw = torch.cat([cp * w[:, None], w[:, None]], dim=1)
         blk = adj["block"][leaf]
         pw_blk = pw[blk]
