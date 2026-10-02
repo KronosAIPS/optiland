@@ -443,8 +443,13 @@ class TestDifferentiableParameterContract:
 
         Superseded by chapter 09 R-09-4 (the research repository's issue 31):
         a top-hat beam's radius is now attached by the change of variables
-        (``test_nsq_source_jacobians.py``), so it is kept as the tensor given;
-        a truncated Gaussian's radius, the truncation edge, still raises.
+        (``test_nsq_source_jacobians.py``), so it is kept as the tensor given.
+        The ``profile="gaussian"`` half changed under the maintainer's ruling
+        of 2026-10-01 on slide 63, question 2 (with question 5 of the rulings
+        R4 of the same day): a truncated Gaussian's radius is attached by
+        default by the implicit reparameterisation (chapter 09 section
+        9.13.1), so it too is kept as the tensor given; it raises only when
+        the beam is built with ``profile_gradient="refuse"``.
         """
         from optiland.nonsequential.sources.collimated import CollimatedSource
 
@@ -456,6 +461,14 @@ class TestDifferentiableParameterContract:
             aperture_radius=r,
         )
         assert source.aperture_radius is r
+        gaussian = CollimatedSource(
+            CoordinateSystem(),
+            Spectrum.monochromatic(0.55),
+            total_flux=1.0,
+            aperture_radius=r,
+            profile="gaussian",
+        )
+        assert gaussian.aperture_radius is r
         with pytest.raises(NotImplementedError, match="cannot be differentiated"):
             CollimatedSource(
                 CoordinateSystem(),
@@ -463,6 +476,7 @@ class TestDifferentiableParameterContract:
                 total_flux=1.0,
                 aperture_radius=r,
                 profile="gaussian",
+                profile_gradient="refuse",
             )
 
     def test_point_source_half_angle_rejects_grad_tensor(self):

@@ -380,8 +380,9 @@ _SOURCE_ATTACHED = ("total_flux", "total_flux_lumens")
 # Source geometry attached by the change of variables of chapter 09 section
 # 9.7 (R-09-4; parameter_register.attach_source_geometry), per kind.
 _POINT_ATTACHED = (*_SOURCE_ATTACHED, "half_angle_deg")
-# A Gaussian beam's sigma reaches the constructor, which attaches it only when
-# the beam is built with profile_gradient="implicit" and refuses it otherwise.
+# A Gaussian beam's sigma reaches the constructor, which attaches it by default
+# (profile_gradient="implicit") and refuses it when the beam is built with
+# profile_gradient="refuse".
 _COLLIMATED_ATTACHED = (*_SOURCE_ATTACHED, "aperture_radius", "gaussian_sigma")
 _EXTENDED_ATTACHED = (*_SOURCE_ATTACHED, "width", "height", "aperture_radius", "half_angle_deg")
 _TABULATED_ATTACHED = (*_SOURCE_ATTACHED, "width", "height", "aperture_radius")

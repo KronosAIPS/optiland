@@ -195,9 +195,10 @@ _GEOMETRY_EXTENT = {"width", "height"}
 #: :func:`attach_source_geometry`): the pathwise gradient through the emission
 #: points and directions is exact on the interior, and moving the emitted rays
 #: moves them across every downstream edge as a placement does (the boundary
-#: term, absent). A truncated Gaussian's sigma (and its radius, the truncation
-#: edge) is refused by its constructor unless the beam is built with
-#: profile_gradient="implicit" (chapter 09 section 9.13.1); this table is the
+#: term, absent). A truncated Gaussian's sigma and its radius, the truncation
+#: edge, are attached by the implicit reparameterisation of chapter 09 section
+#: 9.13.1 (the default; a beam built with profile_gradient="refuse" refuses
+#: them at construction); this table is the
 #: fallback for a source whose kind declares no rules, and the built-in kinds'
 #: rules (:mod:`optiland.nonsequential._builtin_gradients`) take precedence.
 _SOURCE_CONTRACT: dict[str, tuple[str, str]] = {
@@ -205,7 +206,11 @@ _SOURCE_CONTRACT: dict[str, tuple[str, str]] = {
         INTERIOR_BOUNDARY,
         "the source's change of variables (emission points, R-09-4)",
     ),
-    "gaussian_sigma": (DETACHED, "the truncated Gaussian's rejection sampling on the host"),
+    "gaussian_sigma": (
+        INTERIOR_BOUNDARY,
+        "the source's change of variables (emission points, R-09-4): the truncated "
+        "Gaussian's implicit reparameterisation",
+    ),
     "half_angle_deg": (
         INTERIOR_BOUNDARY,
         "the source's change of variables (emission directions, R-09-4)",

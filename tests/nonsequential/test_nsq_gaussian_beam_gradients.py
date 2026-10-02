@@ -6,9 +6,9 @@ repository's issue 31. The beam's radial coordinate, held at a fixed value
 ``u = F(r)`` of its truncated distribution, is a smooth function of sigma and
 of the truncation radius ``R``; its derivative is the implicit one,
 ``-dF/dtheta / (dF/dr)``, evaluated at the value the engine's rejection
-sampler drew. The derivative is taken only when the beam is built with
-``profile_gradient="implicit"``; by default both parameters refuse a gradient,
-as the existing tests assert.
+sampler drew. The derivative is the default (``profile_gradient="implicit"``,
+the maintainer's ruling of 2026-10-01); a beam built with
+``profile_gradient="refuse"`` refuses a gradient on either parameter.
 
 The bounds, each derived in the chapter before the run:
 
@@ -350,13 +350,30 @@ class TestAttachingMovesNoValue:
 
 
 class TestTheSwitch:
-    """``profile_gradient`` is validated, reaches the source through the scene, and defaults to refusing."""
+    """``profile_gradient`` is validated, reaches the source through the scene, and defaults to attaching."""
 
-    def test_default_refuses(self):
+    def test_default_attaches_and_refuse_refuses(self):
+        """The default attaches sigma; ``profile_gradient="refuse"`` refuses it.
+
+        Changed under the maintainer's ruling of 2026-10-01 on slide 63,
+        question 2 (with question 5 of the rulings R4 of the same day): this
+        test asserted that the default refuses. The implicit
+        reparameterisation is now the default, so the test asserts that the
+        default keeps the tensor given, and that the refusal it guarded is
+        still what ``profile_gradient="refuse"`` does.
+        """
+        sigma = _g(1.5)
+        source = CollimatedSource(
+            CoordinateSystem(), _SPECTRUM, aperture_radius=3.0, profile="gaussian",
+            gaussian_sigma=sigma,
+        )
+        assert source.profile_gradient == "implicit"
+        assert source.gaussian_sigma is sigma
+        assert CollimatedSourceConfig(spectrum=_SPECTRUM).profile_gradient == "implicit"
         with pytest.raises(NotImplementedError, match="profile_gradient='implicit'"):
             CollimatedSource(
                 CoordinateSystem(), _SPECTRUM, aperture_radius=3.0, profile="gaussian",
-                gaussian_sigma=_g(1.5),
+                gaussian_sigma=_g(1.5), profile_gradient="refuse",
             )
 
     def test_unknown_value(self):

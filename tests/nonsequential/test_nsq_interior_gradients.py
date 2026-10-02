@@ -760,17 +760,21 @@ class TestForwardModeAgainstAbsoluteSum:
     """T-09-6, second form: ``64 u`` relative to the sum of absolute contributions.
 
     The derivative is a sum of contributions c[e, i] over the detector hits i
-    and the entry elements e of the parameter. The maintainer's ruling 3 names
-    the sum of absolute per-ray contributions; the measurement behind it (the
-    research repository's build log B6_gradients_2) found the cancellation
-    between the entry elements inside one ray -- the front and the back
-    surface of a tilted lens -- and none between rays in these scenes, so the
-    sum runs over both. Measured on the development machine (Apple silicon,
-    CPU, float64, 2,000 rays): at most 15 u of that sum at seed 3 and 33 u at
-    seed 5 over the 20 placement scenes, where the gap in units of the
-    derivative itself reaches 881 u and 1,971 u. The three scenes here are the
-    three with the largest such gap; the split costs one forward trace per
-    live entry element (14 or 15 for a lens tilt).
+    and the entry elements e of the parameter, and the bound is taken against
+    the sum of their absolute values over both: the form the maintainer
+    confirmed on 2026-10-01 (chapter 09, T-09-6; the research repository's
+    issue 75). The measurement behind it (the research repository's build log
+    B6_gradients_2) found the cancellation between the entry elements inside
+    one ray -- the front and the back surface of a tilted lens -- and none
+    between rays in these scenes; a sum over rays alone equals the derivative
+    there. Measured on the development machine (Apple silicon, CPU, float64,
+    2,000 rays): at most 15 u of that sum at seed 3 and 33 u at seed 5 over
+    the 20 placement scenes, where the gap in units of the derivative itself
+    reaches 881 u and 1,971 u. The three scenes here are the three with the
+    largest such gap; the split costs one forward trace per live entry element
+    (20 or 21 for a lens tilt, of which 14 or 15 contribute to the detector).
+    ``parameter_register.entry_split`` gives the same contributions without
+    replacing engine functions (``test_nsq_entry_split.py``).
     """
 
     @pytest.mark.parametrize("seed", [_SEED, 5])

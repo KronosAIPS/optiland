@@ -71,8 +71,8 @@ SOURCES = {
         "gaussian_sigma": attached(
             IB,
             "the source's change of variables (emission points, R-09-4): the truncated "
-            "Gaussian's implicit reparameterisation, taken with profile_gradient='implicit' "
-            "and refused at construction otherwise",
+            "Gaussian's implicit reparameterisation, the default (profile_gradient='implicit'); "
+            "refused at construction when the beam is built with profile_gradient='refuse'",
         ),
         "medium": _MEDIUM,
         "profile_gradient": _SWITCH,
